@@ -38,6 +38,15 @@ appliance-specific hardware code, exposing its attributes and functions through
 these interfaces, and replacing its ad hoc networking and prior surface
 enumeration with the kernel's common node behavior.
 
+The shared [`lattice-ir`](https://github.com/zacharytomlinson/lattice-ir) crate
+defines the mathematical surface of those attributes and transformations.
+Firmware can expose these definitions as static data. The nucleus owns proof,
+synthesis, and compilation, and delegates compiled fragments to participating
+vertices. The shared crate contains definitions, not an interpreter or solver;
+vertices execute the delegated fragments without hosting an IR interpreter.
+Mathematical effect outputs describe post-state for reasoning. Runtime changes
+are communicated through the node's change messages, not program return values.
+
 ## Cooperation produces the distributed kernel
 
 The kernel exists collectively across participating nodes. Each node responds to
@@ -46,7 +55,7 @@ a local hardware change or an incoming message by doing the part assigned to it:
 - Expose and enumerate its attributes and state-transforming functions.
 - Broadcast changes and pass activation messages upstream toward the relevant
   program head through its resident dependencies.
-- Evaluate its resident IR conditional and pass the continuation downstream.
+- Execute its assigned compiled conditional and pass the continuation downstream.
 - Invoke a reached local state-transforming function.
 - Offer relay participation and forward peer messages.
 
@@ -90,9 +99,10 @@ add the local mechanics that lattice participation actually requires.
 ## Implementation approach
 
 ESP32 is the initial platform. The flashed firmware will include this kernel.
-Existing ESP Rust HAL code and nearby firmware are platform references. The
-formal IR is being developed in parallel; the nearby IR implementations are
-references, not a requirement to adopt one wholesale.
+Existing ESP Rust HAL code and nearby firmware are platform references.
+`lattice-ir` starts with the shared mathematical definitions extracted from
+Jarvis's `zmt/rewrite` branch. Its formal development continues with the nucleus;
+the kernel can use the shared definitions to build surface exposure independently.
 
 Build working kernel code in meaningful increments, compile as we go, and learn
 from concrete failures. Use focused checks where they answer a real question.
