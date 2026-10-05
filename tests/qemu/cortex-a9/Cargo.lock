@@ -3,17 +3,25 @@
 version = 4
 
 [[package]]
-name = "lattice-vertex"
-version = "0.3.0"
-
-[[package]]
 name = "freertos-qemu-cortex-a9"
 version = "0.0.0"
 dependencies = [
- "lattice-vertex",
  "freertos-qemu-test-common",
+ "lattice-vertex",
 ]
 
 [[package]]
 name = "freertos-qemu-test-common"
 version = "0.0.0"
+
+[[package]]
+name = "lattice-ir"
+version = "0.1.0"
+source = "git+ssh://git@github.com/zacharytomlinson/lattice-ir.git?rev=8cc8629fc6b94f32848d0fc0336db8cbcea79596#8cc8629fc6b94f32848d0fc0336db8cbcea79596"
+
+[[package]]
+name = "lattice-vertex"
+version = "0.3.0"
+dependencies = [
+ "lattice-ir",
+]

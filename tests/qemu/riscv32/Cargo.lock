@@ -15,25 +15,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "361a90feb7004eca4019fb28352a9465666b24f840f5c3cddf0ff13920590b89"
 
 [[package]]
-name = "lattice-vertex"
-version = "0.3.0"
-dependencies = [
- "riscv",
- "riscv-rt",
-]
-
-[[package]]
 name = "freertos-qemu-riscv32"
 version = "0.0.0"
 dependencies = [
- "lattice-vertex",
  "freertos-qemu-test-common",
+ "lattice-vertex",
  "riscv-rt",
 ]
 
 [[package]]
 name = "freertos-qemu-test-common"
 version = "0.0.0"
+
+[[package]]
+name = "lattice-ir"
+version = "0.1.0"
+source = "git+ssh://git@github.com/zacharytomlinson/lattice-ir.git?rev=8cc8629fc6b94f32848d0fc0336db8cbcea79596#8cc8629fc6b94f32848d0fc0336db8cbcea79596"
+
+[[package]]
+name = "lattice-vertex"
+version = "0.3.0"
+dependencies = [
+ "lattice-ir",
+ "riscv",
+ "riscv-rt",
+]
 
 [[package]]
 name = "paste"

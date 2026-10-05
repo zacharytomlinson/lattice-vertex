@@ -112,6 +112,8 @@ tickless-idle = []            # configUSE_TICKLESS_IDLE
 # mini-list-item = []  # configUSE_MINI_LIST_ITEM optimization
 
 [dependencies]
+lattice-ir = { git = "ssh://git@github.com/zacharytomlinson/lattice-ir.git", rev = "8cc8629fc6b94f32848d0fc0336db8cbcea79596" }
+
 # Cortex-M support (optional, for port-cortex-m*)
 cortex-m = { version = "0.7", optional = true }
 cortex-m-rt = { version = "0.7", optional = true }
@@ -119,3 +121,10 @@ cortex-m-rt = { version = "0.7", optional = true }
 # RISC-V support (optional, for port-riscv32)
 riscv = { version = "0.12", optional = true }
 riscv-rt = { version = "0.13", optional = true }
+
+[dev-dependencies]
+# Existing appliance contracts are used only by the formalization examples/tests.
+s3-control = { git = "ssh://git@github.com/zacharytomlinson/diffuser-fw.git", rev = "e78cbe3eb31f977222a97acd6f628534462d7ab5" }
+hal-protocol = { git = "ssh://git@github.com/zacharytomlinson/diffuser-fw.git", rev = "e78cbe3eb31f977222a97acd6f628534462d7ab5" }
+matter-topology = { git = "ssh://git@github.com/zacharytomlinson/diffuser-fw.git", rev = "e78cbe3eb31f977222a97acd6f628534462d7ab5" }
+mhz-radio-surface = { git = "ssh://git@github.com/zacharytomlinson/mhz-radio-fw.git", rev = "846da6acc2cf2980d2b14d5162cc76a5c775e9b6" }

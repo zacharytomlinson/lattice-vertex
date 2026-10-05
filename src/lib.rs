@@ -171,6 +171,11 @@ pub mod memory;
 // Kernel modules
 pub mod kernel;
 
+// Appliance surfaces and their shared mathematical definitions.
+pub mod observation;
+pub mod surface;
+pub use lattice_ir as ir;
+
 // Safe synchronization wrappers. Individual capabilities such as Mutex,
 // streams, and timers retain their own feature gates.
 pub mod sync;

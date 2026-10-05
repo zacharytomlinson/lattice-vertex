@@ -1,0 +1,97 @@
+//! Register local observation changes and activate their resident dependents.
+//!
+//! Dependency links live with the state they depend on. Activation is immediate
+//! in the caller's context; there is no graph work queue, polling task, retained
+//! observation cache, or IR interpreter. A callback represents a compiled local
+//! activation entrypoint. Remote delivery and loadable fragment installation are
+//! separate work; this is not their wire format or final executable ABI.
+//! The resident pointer is only local fanout-list linkage. It is not a DAG entry
+//! reference, an upstream peer reference, or a distributed continuation.
+
+#![warn(missing_docs)]
+
+use core::{
+    ptr,
+    sync::atomic::{AtomicPtr, Ordering},
+};
+
+use crate::surface::StateHandle;
+
+/// One resident local activation binding for a state, with its next sibling link.
+///
+/// Links are immutable and statically resident. Installation code supplies an
+/// acyclic list in dispatch order. The callback reads current appliance state
+/// when reached; it receives the originating state handle, not cached values.
+pub struct Dependent<Appliance: 'static> {
+    /// Compiled/native activation entrypoint. It returns without a graph result.
+    pub activate: fn(&mut Appliance, &StateHandle<Appliance>),
+    /// The next local dependent of this state, not the next edge of a DAG traversal.
+    pub next: Option<&'static Self>,
+}
+
+/// The state's pointer to its first local dependent.
+pub(crate) struct Dependents<Appliance: 'static> {
+    first: AtomicPtr<Dependent<Appliance>>,
+}
+
+impl<Appliance: 'static> Dependents<Appliance> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            first: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    pub(crate) fn set(&self, first: Option<&'static Dependent<Appliance>>) {
+        let first = first.map_or(ptr::null_mut(), |link| ptr::from_ref(link).cast_mut());
+        self.first.store(first, Ordering::Release);
+    }
+
+    pub(crate) fn dispatch(&self, appliance: &mut Appliance, source: &StateHandle<Appliance>) {
+        let first = self.first.load(Ordering::Acquire);
+        // SAFETY: the private atomic is either null or was installed from an
+        // immutable 'static reference by set(). Replacement never frees a link.
+        // Acquire observes publication, and the loaded list stays valid through
+        // every callback even if a callback installs another list for future deltas.
+        let mut next = unsafe { first.as_ref() };
+        while let Some(dependent) = next {
+            (dependent.activate)(appliance, source);
+            next = dependent.next;
+        }
+    }
+}
+
+/// Apply a local state update, compare before/after values, and notify dependents.
+///
+/// The caller supplies the update closure. State readers compare the appliance's
+/// values around that update; the kernel then handles local notification.
+///
+/// The array length is inferred from the supplied group: no fixed slot capacity
+/// is imposed. Include each affected state once, including derived states. Old
+/// values and changed flags exist only on this call's stack. This is a group of
+/// states affected by one report, not a snapshot of the distributed graph.
+///
+/// All updates and comparisons complete before callbacks run. Once detected,
+/// a delta is delivered even if an earlier callback changes that state again.
+/// Callbacks obtain fresh values themselves; none receive a captured old value.
+/// `None` becoming available or unavailable also counts as a change.
+///
+/// The update's return value is preserved, including an error after a partial
+/// update: actual observed changes still produce notifications. Call separately
+/// for successive observations whose intermediate changes must be represented.
+/// Callers must use a context in which their installed callbacks may execute.
+pub fn update<Appliance: 'static, R, const N: usize>(
+    appliance: &mut Appliance,
+    states: &[&StateHandle<Appliance>; N],
+    update: impl FnOnce(&mut Appliance) -> R,
+) -> R {
+    let before = states.map(|state| state.read(appliance));
+    let result = update(appliance);
+    let changed: [bool; N] =
+        core::array::from_fn(|index| states[index].read(appliance) != before[index]);
+    for (state, changed) in states.iter().zip(changed) {
+        if changed {
+            state.changed(appliance);
+        }
+    }
+    result
+}

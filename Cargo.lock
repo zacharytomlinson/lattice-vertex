@@ -46,7 +46,7 @@ checksum = "e37549a379a9e0e6e576fd208ee60394ccb8be963889eebba3ffe0980364f472"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.111",
 ]
 
 [[package]]
@@ -72,13 +72,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "361a90feb7004eca4019fb28352a9465666b24f840f5c3cddf0ff13920590b89"
 
 [[package]]
+name = "hal-protocol"
+version = "0.1.0"
+source = "git+ssh://git@github.com/zacharytomlinson/diffuser-fw.git?rev=e78cbe3eb31f977222a97acd6f628534462d7ab5#e78cbe3eb31f977222a97acd6f628534462d7ab5"
+dependencies = [
+ "matter-topology",
+]
+
+[[package]]
+name = "lattice-ir"
+version = "0.1.0"
+source = "git+ssh://git@github.com/zacharytomlinson/lattice-ir.git?rev=8cc8629fc6b94f32848d0fc0336db8cbcea79596#8cc8629fc6b94f32848d0fc0336db8cbcea79596"
+
+[[package]]
 name = "lattice-vertex"
 version = "0.3.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
+ "hal-protocol",
+ "lattice-ir",
+ "matter-topology",
+ "mhz-radio-surface",
  "riscv",
  "riscv-rt",
+ "s3-control",
+]
+
+[[package]]
+name = "matter-topology"
+version = "0.1.0"
+source = "git+ssh://git@github.com/zacharytomlinson/diffuser-fw.git?rev=e78cbe3eb31f977222a97acd6f628534462d7ab5#e78cbe3eb31f977222a97acd6f628534462d7ab5"
+
+[[package]]
+name = "mhz-radio-core"
+version = "0.1.0"
+source = "git+ssh://git@github.com/zacharytomlinson/mhz-radio-fw.git?rev=846da6acc2cf2980d2b14d5162cc76a5c775e9b6#846da6acc2cf2980d2b14d5162cc76a5c775e9b6"
+
+[[package]]
+name = "mhz-radio-surface"
+version = "0.1.0"
+source = "git+ssh://git@github.com/zacharytomlinson/mhz-radio-fw.git?rev=846da6acc2cf2980d2b14d5162cc76a5c775e9b6#846da6acc2cf2980d2b14d5162cc76a5c775e9b6"
+dependencies = [
+ "mhz-radio-core",
+ "serde",
 ]
 
 [[package]]
@@ -141,7 +178,7 @@ checksum = "f265be5d634272320a7de94cea15c22a3bfdd4eb42eb43edc528415f066a1f25"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.111",
 ]
 
 [[package]]
@@ -169,7 +206,7 @@ checksum = "30f19a85fe107b65031e0ba8ec60c34c2494069fe910d6c297f5e7cb5a6f76d0"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.111",
 ]
 
 [[package]]
@@ -179,6 +216,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "138e3e0acb6c9fb258b19b67cb8abd63c00679d2851805ea151465464fe9030a"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "s3-control"
+version = "0.1.0"
+source = "git+ssh://git@github.com/zacharytomlinson/diffuser-fw.git?rev=e78cbe3eb31f977222a97acd6f628534462d7ab5#e78cbe3eb31f977222a97acd6f628534462d7ab5"
+dependencies = [
+ "hal-protocol",
+ "matter-topology",
 ]
 
 [[package]]
@@ -197,10 +243,51 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "388a1df253eca08550bef6c72392cfe7c30914bf41df5269b68cbd6ff8f570a3"
 
 [[package]]
+name = "serde"
+version = "1.0.229"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
+dependencies = [
+ "serde_core",
+ "serde_derive",
+]
+
+[[package]]
+name = "serde_core"
+version = "1.0.229"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
+dependencies = [
+ "serde_derive",
+]
+
+[[package]]
+name = "serde_derive"
+version = "1.0.229"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.111"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "390cc9a294ab71bdb1aa2e99d13be9c753cd2d7bd6560c77118597410c4d2e87"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "syn"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
 dependencies = [
  "proc-macro2",
  "quote",
