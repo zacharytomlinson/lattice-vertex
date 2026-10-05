@@ -171,8 +171,9 @@ pub mod memory;
 // Kernel modules
 pub mod kernel;
 
-// Appliance surfaces and their shared mathematical definitions.
+// Appliance exposure, state changes, and peer radio communication.
 pub mod observation;
+pub mod radio;
 pub mod surface;
 pub use lattice_ir as ir;
 

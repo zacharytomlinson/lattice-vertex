@@ -1,0 +1,38 @@
+diff --git a/examples/ieee802154/ieee802154_cli/components/cmd_ieee802154/ieee802154_cmd.c b/examples/ieee802154/ieee802154_cli/components/cmd_ieee802154/ieee802154_cmd.c
+index bf3ad97b..fb5f1b99 100644
+--- a/examples/ieee802154/ieee802154_cli/components/cmd_ieee802154/ieee802154_cmd.c
++++ b/examples/ieee802154/ieee802154_cli/components/cmd_ieee802154/ieee802154_cmd.c
+@@ -829,7 +829,7 @@ void esp_ieee802154_transmit_done(const uint8_t *frame, const uint8_t *ack, esp_
+ 
+ void esp_ieee802154_receive_done(uint8_t *frame, esp_ieee802154_frame_info_t *frame_info)
+ {
+-    ESP_EARLY_LOGI(TAG, "Rx Done %d bytes", frame[0]);
++    ESP_EARLY_LOGI(TAG, "Rx Done %d bytes rssi=%d lqi=%u", frame[0], frame_info->rssi, frame_info->lqi);
+     esp_ieee802154_frame_print(frame);
+     esp_ieee802154_receive_handle_done(frame);
+ }
+diff --git a/examples/ieee802154/ieee802154_cli/main/esp_ieee802154_cli.c b/examples/ieee802154/ieee802154_cli/main/esp_ieee802154_cli.c
+index 70ee037e..70133950 100644
+--- a/examples/ieee802154/ieee802154_cli/main/esp_ieee802154_cli.c
++++ b/examples/ieee802154/ieee802154_cli/main/esp_ieee802154_cli.c
+@@ -51,8 +51,8 @@ void app_main(void)
+     register_ieee802154_debug_cmd();
+ #endif
+ 
+-    esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+-    ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
++    esp_console_dev_usb_serial_jtag_config_t hw_config = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
++    ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&hw_config, &repl_config, &repl));
+ 
+     ESP_ERROR_CHECK(esp_console_start_repl(repl));
+ }
+diff --git a/examples/ieee802154/ieee802154_cli/sdkconfig.defaults b/examples/ieee802154/ieee802154_cli/sdkconfig.defaults
+index e69de29b..38744aa3 100644
+--- a/examples/ieee802154/ieee802154_cli/sdkconfig.defaults
++++ b/examples/ieee802154/ieee802154_cli/sdkconfig.defaults
+@@ -0,0 +1,5 @@
++CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
++CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
++CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
++CONFIG_LOG_COLORS=n
++CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=n
