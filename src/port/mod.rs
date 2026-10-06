@@ -26,13 +26,15 @@
 //! - `port-cortex-m3` - ARM Cortex-M3 (ARMv7-M, no FPU, BASEPRI)
 //! - `port-cortex-m4f` - ARM Cortex-M4F with FPU (ARMv7E-M, BASEPRI)
 //! - `port-cortex-m7` - ARM Cortex-M7 (same as CM4F per FreeRTOS docs)
+//! - `port-nrf52840` - Nordic nRF52840, Cortex-M4F with automatic kernel vectors
+//! - `port-esp32c6` - ESP32-C6, esp-hal startup and interrupts, SYSTIMER tick
 //! - `port-riscv32` - RISC-V RV32 (standard CLINT timer)
 //! - `port-cortex-a9` - ARM Cortex-A9 (ARMv7-A, GIC, SWI for context switch)
 //! - `port-cortex-a53` - ARM Cortex-A53 (ARMv8-A/AArch64, GIC, SMC for context switch)
 //! - `port-test` - Deterministic host-only test port
 
 // Port selection - only one can be active at a time
-// Priority: CM0 > CM3 > CM4F > CM7 > RISCV32 > A9 > A53 > test > dummy
+// Priority: CM0 > CM3 > CM4F > CM7 > RISCV32 > A9 > A53 > nRF52840 > C6 > test > dummy
 
 #[cfg(feature = "port-cortex-m0")]
 mod cortex_m0;
@@ -45,7 +47,11 @@ mod cortex_m3;
 pub use cortex_m3::*;
 
 #[cfg(all(
-    any(feature = "port-cortex-m4f", feature = "port-cortex-m7"),
+    any(
+        feature = "port-cortex-m4f",
+        feature = "port-cortex-m7",
+        feature = "port-nrf52840"
+    ),
     not(feature = "port-cortex-m0"),
     not(feature = "port-cortex-m3")
 ))]
@@ -131,6 +137,8 @@ pub use cortex_a53::*;
 
 #[cfg(all(
     feature = "port-test",
+    not(feature = "port-nrf52840"),
+    not(feature = "port-esp32c6"),
     not(feature = "port-cortex-m0"),
     not(feature = "port-cortex-m3"),
     not(feature = "port-cortex-m4f"),
@@ -142,6 +150,8 @@ pub use cortex_a53::*;
 mod test;
 #[cfg(all(
     feature = "port-test",
+    not(feature = "port-nrf52840"),
+    not(feature = "port-esp32c6"),
     not(feature = "port-cortex-m0"),
     not(feature = "port-cortex-m3"),
     not(feature = "port-cortex-m4f"),
@@ -154,6 +164,8 @@ pub use test::*;
 
 #[cfg(all(
     feature = "port-dummy",
+    not(feature = "port-nrf52840"),
+    not(feature = "port-esp32c6"),
     not(feature = "port-cortex-m0"),
     not(feature = "port-cortex-m3"),
     not(feature = "port-cortex-m4f"),
@@ -166,6 +178,8 @@ pub use test::*;
 mod dummy;
 #[cfg(all(
     feature = "port-dummy",
+    not(feature = "port-nrf52840"),
+    not(feature = "port-esp32c6"),
     not(feature = "port-cortex-m0"),
     not(feature = "port-cortex-m3"),
     not(feature = "port-cortex-m4f"),
@@ -176,6 +190,64 @@ mod dummy;
     not(feature = "port-test")
 ))]
 pub use dummy::*;
+
+/// Nordic nRF52840 clock setup and kernel exception integration.
+#[cfg(all(
+    feature = "port-nrf52840",
+    not(any(
+        feature = "port-cortex-m0",
+        feature = "port-cortex-m3",
+        feature = "port-cortex-m4f",
+        feature = "port-cortex-m7",
+        feature = "port-riscv32",
+        feature = "port-cortex-a9",
+        feature = "port-cortex-a53"
+    ))
+))]
+pub mod nrf52840;
+#[cfg(all(
+    feature = "port-nrf52840",
+    not(any(
+        feature = "port-cortex-m0",
+        feature = "port-cortex-m3",
+        feature = "port-cortex-m4f",
+        feature = "port-cortex-m7",
+        feature = "port-riscv32",
+        feature = "port-cortex-a9",
+        feature = "port-cortex-a53"
+    ))
+))]
+pub use nrf52840::*;
+
+/// ESP32-C6 hardware integration; consumes the kernel's timer and software IRQ.
+#[cfg(all(
+    feature = "port-esp32c6",
+    not(feature = "port-nrf52840"),
+    not(any(
+        feature = "port-cortex-m0",
+        feature = "port-cortex-m3",
+        feature = "port-cortex-m4f",
+        feature = "port-cortex-m7",
+        feature = "port-riscv32",
+        feature = "port-cortex-a9",
+        feature = "port-cortex-a53"
+    ))
+))]
+pub mod esp32c6;
+#[cfg(all(
+    feature = "port-esp32c6",
+    not(feature = "port-nrf52840"),
+    not(any(
+        feature = "port-cortex-m0",
+        feature = "port-cortex-m3",
+        feature = "port-cortex-m4f",
+        feature = "port-cortex-m7",
+        feature = "port-riscv32",
+        feature = "port-cortex-a9",
+        feature = "port-cortex-a53"
+    ))
+))]
+pub use esp32c6::*;
 
 // =============================================================================
 // Port-independent constants (from portable.h)

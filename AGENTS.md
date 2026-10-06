@@ -33,6 +33,10 @@ Memory efficiency and readability are both requirements.
 - Use Redox and Bitcoin as references for clear responsibility-based organization.
   Let Lattice's implemented responsibilities determine its modules; add structure
   as the code needs it.
+- Treat `experiments/` as temporary bring-up scaffolding. Move reusable code into
+  platform ports and useful checks into kernel tests as integration proceeds,
+  then remove the directory. It is not part of the permanent kernel layout or
+  an acceptable dependency of the kernel runtime.
 
 ## Review after each meaningful change
 

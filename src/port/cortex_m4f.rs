@@ -29,8 +29,9 @@
 //!
 //! ## Vector Table
 //!
-//! The application must ensure that `PendSV`, `SVCall`, and `SysTick` handlers
-//! in the vector table point to the handlers exported by this module.
+//! This module supplies `PendSV`, `SVCall`, and `SysTick` assembly aliases for
+//! cortex-m-rt. Generic-port applications must retain the exported handlers in
+//! their image. The nRF52840 port owns that retention for Nordic applications.
 
 use core::arch::naked_asm;
 use core::ffi::c_void;
@@ -223,7 +224,7 @@ pub unsafe fn pxPortInitialiseStack(
         pxStack = pxStack.sub(1);
 
         // LR - return address (prvTaskExitError would go here)
-        *pxStack = prvTaskExitError as StackType_t;
+        *pxStack = prvTaskExitError as *const () as StackType_t;
         pxStack = pxStack.sub(1);
 
         // R12 - skip initialization

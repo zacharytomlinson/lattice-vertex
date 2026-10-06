@@ -65,6 +65,8 @@
     feature = "port-cortex-m4f",
     feature = "port-cortex-m7",
     feature = "port-riscv32",
+    feature = "port-esp32c6",
+    feature = "port-nrf52840",
     feature = "port-cortex-a9",
     feature = "port-cortex-a53",
     feature = "port-test",
@@ -141,6 +143,39 @@ compile_error!("select exactly one FreeRTOS-in-Rust port feature");
         any(feature = "port-test", feature = "port-dummy")
     ),
     all(feature = "port-test", feature = "port-dummy")
+))]
+compile_error!("FreeRTOS-in-Rust port features are mutually exclusive");
+
+#[cfg(all(
+    feature = "port-esp32c6",
+    any(
+        feature = "port-dummy",
+        feature = "port-test",
+        feature = "port-riscv32",
+        feature = "port-cortex-m0",
+        feature = "port-cortex-m3",
+        feature = "port-cortex-m4f",
+        feature = "port-cortex-m7",
+        feature = "port-cortex-a9",
+        feature = "port-cortex-a53"
+    )
+))]
+compile_error!("FreeRTOS-in-Rust port features are mutually exclusive");
+
+#[cfg(all(
+    feature = "port-nrf52840",
+    any(
+        feature = "port-dummy",
+        feature = "port-test",
+        feature = "port-riscv32",
+        feature = "port-cortex-m0",
+        feature = "port-cortex-m3",
+        feature = "port-cortex-m4f",
+        feature = "port-cortex-m7",
+        feature = "port-cortex-a9",
+        feature = "port-cortex-a53",
+        feature = "port-esp32c6"
+    )
 ))]
 compile_error!("FreeRTOS-in-Rust port features are mutually exclusive");
 

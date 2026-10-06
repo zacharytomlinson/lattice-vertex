@@ -36,7 +36,7 @@ struct Port {
     target: Option<&'static str>,
 }
 
-const PORTS: [Port; 9] = [
+const PORTS: [Port; 11] = [
     Port {
         feature: "port-test",
         target: None,
@@ -64,6 +64,14 @@ const PORTS: [Port; 9] = [
     Port {
         feature: "port-riscv32",
         target: Some("riscv32imac-unknown-none-elf"),
+    },
+    Port {
+        feature: "port-esp32c6",
+        target: Some("riscv32imac-unknown-none-elf"),
+    },
+    Port {
+        feature: "port-nrf52840",
+        target: Some("thumbv7em-none-eabihf"),
     },
     Port {
         feature: "port-cortex-a9",

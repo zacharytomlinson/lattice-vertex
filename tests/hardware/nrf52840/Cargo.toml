@@ -1,0 +1,19 @@
+[package]
+name = "lattice-nrf52840-kernel-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+lattice-vertex = { path = "../../..", default-features = false, features = ["port-nrf52840"] }
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+rtt-target = "=0.6.2"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = 2

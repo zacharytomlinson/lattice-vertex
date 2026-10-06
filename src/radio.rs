@@ -20,16 +20,22 @@ pub const BROADCAST: u16 = 0xffff;
 const DATA_CONTROL: u16 = 0x8841;
 const REQUEST_ACK: u16 = 0x0020;
 
-/// Common radio settings. Board-specific antenna/pin setup stays in the adapter.
+/// Radio settings to be supplied by Lattice's common network startup/join code.
+/// The adapter applies them; appliance implementations do not select network
+/// membership. That startup/join path is not implemented yet, and the hardware
+/// probe supplies fixed test values. Board-specific antenna/pin setup stays in
+/// the adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
     /// 2.4 GHz IEEE 802.15.4 channel, 11 through 26.
     pub channel: u8,
     /// Requested transmit power in dBm, subject to the chip's supported settings.
     pub tx_power_dbm: i8,
-    /// PAN used for local frame filtering; does not imply a coordinator or router.
+    /// Shared network PAN used for local frame filtering, selected by Lattice.
+    /// This is not a per-vertex identity or an authentication credential.
     pub pan_id: u16,
-    /// Local short radio address. Assignment/discovery is separate protocol work.
+    /// Local short radio address. Lattice owns its assignment/discovery; that
+    /// common behavior is not implemented by this low-level radio interface.
     pub address: u16,
 }
 

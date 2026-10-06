@@ -17,11 +17,11 @@
 //!
 //! # Hardware-Specific Configuration
 //!
-//! **WARNING**: By default, this crate uses a placeholder CPU clock frequency
-//! (80MHz) which is almost certainly WRONG for your hardware! SysTick timing
-//! will be incorrect without proper configuration.
+//! Generic CPU ports use a placeholder 80 MHz clock unless `user-config` is
+//! enabled. SysTick-based generic ports need the actual target clock to keep
+//! time correctly. Chip-specific ports supply their own hardware configuration.
 //!
-//! To provide the correct CPU clock for your hardware, enable the `user-config`
+//! To configure a generic port, enable the `user-config`
 //! feature and define the required symbol in your crate:
 //!
 //! ```ignore
@@ -36,6 +36,10 @@
 //!
 //! The tick rate (`configTICK_RATE_HZ`) is fixed at 1000Hz (1ms ticks), which is
 //! standard for most FreeRTOS applications.
+//!
+//! The ESP32-C6 port uses esp-hal's SYSTIMER configuration and does not require
+//! `user-config` or a supplied CPU clock to establish the kernel tick.
+//! The nRF52840 port supplies its fixed 64 MHz core clock itself.
 
 use crate::types::*;
 
@@ -50,7 +54,12 @@ pub const configUSE_PREEMPTION: BaseType_t = 1;
 pub const configMAX_PRIORITIES: UBaseType_t = 5;
 
 /// Stack size for the idle task (in words, not bytes)
+#[cfg(not(feature = "port-esp32c6"))]
 pub const configMINIMAL_STACK_SIZE: usize = 128;
+
+/// C6 peripheral handlers run on the interrupted task's stack through esp-hal.
+#[cfg(feature = "port-esp32c6")]
+pub const configMINIMAL_STACK_SIZE: usize = 512;
 
 /// Tick rate in Hz (1000 = 1ms ticks, standard for most applications)
 pub const configTICK_RATE_HZ: TickType_t = 1000;
@@ -62,11 +71,15 @@ pub const configTICK_RATE_HZ: TickType_t = 1000;
 /// CPU clock frequency in Hz
 /// \[AMENDMENT\] Default: 80 MHz - almost certainly WRONG for your hardware!
 /// Enable `user-config` feature and provide FREERTOS_CONFIG_CPU_CLOCK_HZ.
-#[cfg(not(feature = "user-config"))]
+#[cfg(all(not(feature = "user-config"), not(feature = "port-nrf52840")))]
 pub const configCPU_CLOCK_HZ: u32 = 80_000_000;
 
+/// nRF52840 has a fixed 64 MHz Cortex-M4F core clock.
+#[cfg(feature = "port-nrf52840")]
+pub const configCPU_CLOCK_HZ: u32 = 64_000_000;
+
 // When user-config is enabled, CPU clock comes from user-provided symbol
-#[cfg(feature = "user-config")]
+#[cfg(all(feature = "user-config", not(feature = "port-nrf52840")))]
 extern "Rust" {
     /// User-provided CPU clock frequency in Hz.
     /// Define in your crate: `#[no_mangle] pub static FREERTOS_CONFIG_CPU_CLOCK_HZ: u32 = ...;`
@@ -93,7 +106,13 @@ extern "Rust" {
 /// Interrupts with priority >= this value can call FreeRTOS "FromISR" APIs.
 /// Lower values = higher priority on Cortex-M (0 = highest).
 /// This is typically set to leave some high-priority interrupts always enabled.
+#[cfg(not(feature = "port-nrf52840"))]
 pub const configMAX_SYSCALL_INTERRUPT_PRIORITY: u32 = 191; // 0xBF = priority 11 (of 0-15)
+
+/// nRF52840 implements three priority bits: logical priorities 5..=7 may
+/// access the kernel, while 0..=4 remain available for non-kernel ISRs.
+#[cfg(feature = "port-nrf52840")]
+pub const configMAX_SYSCALL_INTERRUPT_PRIORITY: u32 = 5 << 5;
 
 /// Maximum length of task names
 pub const configMAX_TASK_NAME_LEN: usize = 16;
