@@ -1,0 +1,63 @@
+--- upstream/esp_ot_cli.c
++++ bench/esp_ot_cli.c
+@@ -13,6 +13,8 @@
+ */
+ 
+ #include <stdio.h>
++#include <stdint.h>
++#include "esp_console.h"
+ #include <unistd.h>
+ #include <string.h>
+ 
+@@ -40,6 +42,40 @@
+ #endif // CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
+ 
+ #define TAG "ot_esp_cli"
++
++
++/* Bench-only observation command. No radio state is changed. */
++static int rfregs(int argc, char **argv)
++{
++    (void)argv;
++    if (argc != 1) return 1;
++    const uint32_t mac_offsets[] = {
++        0x004,0x008,0x00c,0x010,0x014,0x018,0x01c,0x020,0x024,
++        0x048,0x04c,0x050,0x054,0x058,0x05c,0x060,0x068,0x070,0x078,
++        0x080,0x084,0x088,0x090,0x0c4,0x0c8,0x0cc,0x0d4,0x0d8,0x0e4,0x0e8,0x0f0,
++        0x100,0x104,0x108,0x10c,0x110,0x114,0x118,0x11c,
++        0x144,0x148,0x14c,0x150,0x154,0x158,0x15c,0x160,0x174,0x17c,0x184,
++    };
++    const uint32_t clock_addresses[] = {
++        0x600a9804,0x600a9808,0x600a980c,0x600a9814,0x600a9818,0x600a981c,0x600a9820,
++        0x600af008,0x600af00c,0x600af010,0x600af014,0x600af018,0x600af01c,0x600af020,
++        0x600af028,0x60096108,0x60096110,0x60096118,0x6009611c,0x60096120,
++        0x600b000c,0x600b0040,0x600b0074,0x600b0154,0x600b0400,0x600b0420,
++    };
++    puts("REG_BEGIN");
++    for (unsigned i = 0; i < sizeof(mac_offsets)/sizeof(mac_offsets[0]); ++i) {
++        uint32_t address = 0x600a3000 + mac_offsets[i];
++        printf("REG 0x%08lx 0x%08lx\n", (unsigned long)address,
++               (unsigned long)*(volatile uint32_t *)(uintptr_t)address);
++    }
++    for (unsigned i = 0; i < sizeof(clock_addresses)/sizeof(clock_addresses[0]); ++i) {
++        uint32_t address = clock_addresses[i];
++        printf("REG 0x%08lx 0x%08lx\n", (unsigned long)address,
++               (unsigned long)*(volatile uint32_t *)(uintptr_t)address);
++    }
++    puts("REG_END");
++    return 0;
++}
+ 
+ void app_main(void)
+ {
+@@ -71,6 +107,10 @@
+     };
+ 
+     ESP_ERROR_CHECK(esp_openthread_start(&config));
++    const esp_console_cmd_t registers = {
++        .command = "rfregs", .help = "Read RF configuration registers", .func = rfregs,
++    };
++    ESP_ERROR_CHECK(esp_console_cmd_register(&registers));
+ #if CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
+     esp_cli_custom_command_init();
+ #endif

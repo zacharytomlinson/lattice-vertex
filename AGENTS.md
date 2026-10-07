@@ -12,6 +12,18 @@ Keep changes concrete and small. Follow the development approach in the kernel
 direction document; do not import workflow gates or architectural assumptions
 from neighboring reference repositories.
 
+## C6 RF investigation
+
+Keep ESP32-C6 transmit power fixed at **20 dBm** for all runs, including vendor
+reference comparisons. Do not lower or sweep TX power as a diagnostic step.
+All three boards and their pairings have already produced similar RSSI; pursue
+shared PHY, receiver, clock, coexistence, and initialization issues rather than
+repeating board substitution or treating the selected power as an open choice.
+
+Capture through USB serial. Do not scan or reconfigure the laptop's Wi-Fi adapter
+for these RF tests; it carries the active internet connection, which an earlier
+host scan interrupted.
+
 ## Naming and organization
 
 Data-oriented code depends on precise names and a legible module structure.

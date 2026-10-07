@@ -208,7 +208,7 @@ pub mod kernel;
 
 // Appliance exposure, state changes, and peer radio communication.
 pub mod observation;
-pub mod radio;
+pub use kernel::radio;
 pub mod surface;
 pub use lattice_ir as ir;
 

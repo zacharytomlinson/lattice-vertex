@@ -1,0 +1,16 @@
+[package]
+name = "lattice-radio-test"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+# Board fixtures select the kernel port. Codec tests require no kernel/runtime.
+runtime = ["dep:lattice-vertex"]
+
+[dependencies]
+lattice-vertex = { path = "../../../..", default-features = false, features = ["test-support"], optional = true }
+ieee802154 = "=0.6.1"
+byte = { version = "0.2.7", default-features = false }

@@ -16,6 +16,11 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use cortex_m::peripheral::SYST;
 
+mod radio;
+pub(crate) use radio::Radio;
+/// Transfer this peripheral to [`crate::kernel::start`].
+pub type RadioPeripheral = hal::Peri<'static, hal::peripherals::RADIO>;
+
 pub use super::cortex_m4f::*;
 pub use embassy_nrf as hal;
 

@@ -24,6 +24,11 @@
 
 use core::{arch::asm, ffi::c_void};
 
+mod radio;
+pub(crate) use radio::Radio;
+/// Transfer this peripheral to [`crate::kernel::start`].
+pub type RadioPeripheral = esp_hal::peripherals::IEEE802154<'static>;
+
 use esp_hal::{
     interrupt::{
         self, software::SoftwareInterrupt, DirectBindableCpuInterrupt, Priority, RunLevel,

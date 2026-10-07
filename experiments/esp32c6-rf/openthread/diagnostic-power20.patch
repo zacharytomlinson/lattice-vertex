@@ -1,0 +1,13 @@
+diff --git a/src/core/diags/factory_diags.cpp b/src/core/diags/factory_diags.cpp
+index f9658e5..8e9a673 100644
+--- a/src/core/diags/factory_diags.cpp
++++ b/src/core/diags/factory_diags.cpp
+@@ -197,7 +197,7 @@ Diags::Diags(Instance &aInstance)
+     , mTxPeriod(0)
+     , mTxPackets(0)
+     , mChannel(20)
+-    , mTxPower(0)
++    , mTxPower(20)
+     , mTxLen(0)
+     , mCurTxCmd(kTxCmdNone)
+     , mIsTxPacketSet(false)

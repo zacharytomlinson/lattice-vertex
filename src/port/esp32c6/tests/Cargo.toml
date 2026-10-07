@@ -1,0 +1,30 @@
+[package]
+name = "lattice-c6-kernel-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+radio-probe = ["dep:lattice-radio-test"]
+peer-discovery = ["dep:lattice-radio-test"]
+
+[[bin]]
+name = "radio"
+path = "src/bin/radio.rs"
+
+[dependencies]
+lattice-radio-test = { path = "../../../kernel/radio/tests", optional = true, features = ["runtime"] }
+lattice-vertex = { path = "../../../..", default-features = false, features = ["port-esp32c6"] }
+esp-hal = { version = "=1.1.2", features = ["esp32c6", "unstable"] }
+esp-bootloader-esp-idf = { version = "=0.5.0", features = ["esp32c6"] }
+# Only the reporter prints during normal task execution. Do not mask radio
+# interrupts while formatting a line or waiting for USB FIFO space.
+esp-println = { version = "=0.17.0", default-features = false, features = ["esp32c6", "auto"] }
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = 2

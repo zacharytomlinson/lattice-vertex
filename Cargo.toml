@@ -29,12 +29,15 @@ port-cortex-m0 = ["dep:cortex-m", "dep:cortex-m-rt", "arch-32bit", "tick-32bit"]
 port-cortex-m3 = ["dep:cortex-m", "dep:cortex-m-rt", "arch-32bit", "tick-32bit"]
 port-cortex-m4f = ["dep:cortex-m", "dep:cortex-m-rt", "arch-32bit", "tick-32bit"]
 port-cortex-m7 = ["dep:cortex-m", "dep:cortex-m-rt", "arch-32bit", "tick-32bit"]
-port-nrf52840 = ["dep:cortex-m", "dep:cortex-m-rt", "cortex-m/critical-section-single-core", "dep:embassy-nrf", "arch-32bit", "tick-32bit"]
+port-nrf52840 = ["dep:cortex-m", "dep:cortex-m-rt", "cortex-m/critical-section-single-core", "dep:embassy-nrf", "dep:embassy-sync", "arch-32bit", "tick-32bit"]
 port-riscv32 = ["dep:riscv", "dep:riscv-rt", "arch-32bit", "tick-32bit"]
-port-esp32c6 = ["dep:esp-hal", "arch-32bit", "tick-32bit"]
+port-esp32c6 = ["dep:esp-hal", "dep:esp-phy", "dep:esp-sync", "dep:esp-wifi-sys-esp32c6", "dep:embassy-sync", "dep:heapless", "arch-32bit", "tick-32bit"]
 port-cortex-a9 = ["arch-32bit", "tick-32bit"]
 port-cortex-a53 = ["arch-64bit", "tick-64bit"]
 port-test = ["std", "arch-32bit", "tick-32bit"]  # Deterministic host test port
+
+# Hardware-test access to the resident radio task; contains no test workload.
+test-support = []
 
 # Architecture width for BaseType_t, UBaseType_t, StackType_t
 arch-32bit = []
@@ -115,6 +118,9 @@ tickless-idle = []            # configUSE_TICKLESS_IDLE
 
 [dependencies]
 lattice-ir = { git = "ssh://git@github.com/zacharytomlinson/lattice-ir.git", rev = "8cc8629fc6b94f32848d0fc0336db8cbcea79596" }
+# Portable MAC framing for common peer discovery; no allocator or radio driver.
+ieee802154 = "=0.6.1"
+byte = { version = "0.2.7", default-features = false }
 
 # Cortex-M support (optional, for port-cortex-m*)
 cortex-m = { version = "0.7", optional = true }
@@ -128,7 +134,14 @@ riscv-rt = { version = "0.16", optional = true }
 esp-hal = { version = "=1.1.2", optional = true, features = ["esp32c6", "unstable"] }
 
 # Nordic peripheral support without the Embassy executor or time driver.
-embassy-nrf = { version = "=0.11.0", optional = true, default-features = false, features = ["nrf52840", "rt"] }
+embassy-nrf = { version = "=0.11.0", optional = true, default-features = false, features = ["nrf52840", "rt", "unstable-pac"] }
+
+# C6 PHY support for the extracted, statically buffered 802.15.4 driver.
+esp-phy = { version = "=0.2.0", optional = true, features = ["esp32c6"] }
+esp-sync = { version = "=0.2.1", optional = true, features = ["esp32c6"] }
+esp-wifi-sys-esp32c6 = { version = "=0.2.0", optional = true }
+embassy-sync = { version = "0.8", optional = true }
+heapless = { version = "0.9", optional = true }
 
 [dev-dependencies]
 # Existing appliance contracts are used only by the formalization examples/tests.
