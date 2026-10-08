@@ -69,14 +69,14 @@ fn retain_proposal(current: &mut Option<Network>, proposed: Network) {
 
 /// Established residents take precedence over uncommitted proposals, regardless
 /// of address order. Proposal ties use the same order on every participating MCU.
-fn consider(content: Content, proposal: &mut Option<Network>) -> Option<Network> {
+fn consider(content: Content<'_>, proposal: &mut Option<Network>) -> Option<Network> {
     match content {
-        Content::Present(network) => Some(network),
+        Content::Present(network) | Content::Arrive(network) => Some(network),
         Content::Propose(network) => {
             retain_proposal(proposal, network);
             None
         }
-        Content::Discover => None,
+        Content::Discover | Content::SurfacePart { .. } => None,
     }
 }
 
@@ -85,7 +85,7 @@ pub(super) use runtime::join_or_form;
 
 #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
 mod runtime {
-    use super::super::{receive, response, send, Message, PAN_ID};
+    use super::super::{discovery_response, receive, send, Message, PAN_ID};
     use super::*;
     use crate::{
         kernel::{
@@ -298,7 +298,7 @@ mod runtime {
                     );
                     return selected(radio, preferred, false);
                 }
-                if let Some(reply) = response(local, &message, preferred, false) {
+                if let Some(reply) = discovery_response(local, &message, preferred, false) {
                     send(radio, reply, sequence, buffer);
                 }
             }

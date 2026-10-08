@@ -7,6 +7,9 @@ This crate owns the diagnostic workload used by both board fixtures:
 - `statistics.rs`: counters and activity reported by the board logger.
 - `discovery.rs`: passive counters for ordinary kernel peer discovery; it provides
   no workload, radio settings, or packet handling.
+- `surface.rs`: switch/dimmer definitions and transient header/checksum tracking
+  for arrival-triggered publication. It emits no packets and retains no full
+  remote mathematical surface.
 
 The `runtime` feature is enabled by the board fixtures, which also select a
 kernel port. Without it, the codec tests run on the host without depending on

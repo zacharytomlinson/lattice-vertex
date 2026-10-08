@@ -11,6 +11,7 @@ code lives beside `kernel::radio`, and discovery notes beside `kernel::peer`.
 | [C6](esp32c6/tests/README.md) and [Nordic](nrf52840/tests/README.md) smoke binaries | Static tasks, critical sections, interrupt wakeups, preemption, and register preservation |
 | [Radio probe](../kernel/radio/TESTING.md) | Selected radio port, resident kernel task, IRQ notifications, receive/transmit handling, and bounded buffers |
 | [Peer discovery](../kernel/peer/TESTING.md) | Ordinary kernel channel selection, rendezvous, discovery, and founder-independent participation |
+| [Surface publication](../kernel/peer/EXPOSURE.md) | Symmetric publication on arrival, complete IR descriptors, and no periodic publication loop |
 | [Shared radio fixture](../kernel/radio/tests/README.md) | Controlled probe workload and passive discovery counters used by both MCU test images |
 
 The radio probe replaces only the resident task's message workload through the

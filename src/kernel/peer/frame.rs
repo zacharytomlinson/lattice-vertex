@@ -1,4 +1,4 @@
-//! Version-2 discovery envelope over standard 802.15.4 data frames.
+//! Discovery, arrival, and surface-publication envelopes over 802.15.4.
 //! PHY length/FCS belong to the port. Network tags are not credentials.
 
 use super::{Network, PAN_ID};
@@ -11,39 +11,66 @@ use ieee802154::mac::{
 
 const PAN: PanId = PanId(PAN_ID);
 const MAGIC: &[u8; 4] = b"LVT\x02";
+pub(super) const SURFACE_BYTES: usize = MAX_FRAME_SIZE - 21 - 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Content {
+pub(super) enum Content<'a> {
     Discover,
     Present(Network),
     Propose(Network),
+    Arrive(Network),
+    SurfacePart {
+        network: Network,
+        sequence: u16,
+        offset: u16,
+        total: u16,
+        bytes: &'a [u8],
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct Message {
+pub(super) struct Message<'a> {
     pub source: u64,
     pub destination: Option<u64>,
-    pub content: Content,
+    pub content: Content<'a>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct InvalidFrame;
 
-impl Message {
+impl<'a> Message<'a> {
     pub fn encode(&self, sequence: u8, out: &mut [u8; MAX_FRAME_SIZE]) -> usize {
-        let mut payload = [0; 14];
+        let mut payload = [0; 20 + SURFACE_BYTES];
         payload[..4].copy_from_slice(MAGIC);
         let size = match self.content {
             Content::Discover => 5,
-            Content::Present(network) | Content::Propose(network) => {
-                payload[4] = if matches!(self.content, Content::Present(_)) {
-                    1
-                } else {
-                    2
+            Content::Present(network) | Content::Propose(network) | Content::Arrive(network) => {
+                payload[4] = match self.content {
+                    Content::Present(_) => 1,
+                    Content::Propose(_) => 2,
+                    _ => 3,
                 };
                 payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
                 payload[13] = network.channel;
                 14
+            }
+            Content::SurfacePart {
+                network,
+                sequence,
+                offset,
+                total,
+                bytes,
+            } => {
+                assert!(!bytes.is_empty() && bytes.len() <= SURFACE_BYTES);
+                assert!(usize::from(offset) + bytes.len() <= usize::from(total));
+                payload[4] = 4;
+                payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
+                payload[13] = network.channel;
+                payload[14..16].copy_from_slice(&sequence.to_le_bytes());
+                payload[16..18].copy_from_slice(&offset.to_le_bytes());
+                payload[18..20].copy_from_slice(&total.to_le_bytes());
+                payload[20..20 + bytes.len()].copy_from_slice(bytes);
+                20 + bytes.len()
             }
         };
         let destination = match self.destination {
@@ -78,7 +105,7 @@ impl Message {
         length
     }
 
-    pub fn decode(bytes: &[u8], local: u64, channel: u8) -> Result<Self, InvalidFrame> {
+    pub fn decode(bytes: &'a [u8], local: u64, channel: u8) -> Result<Self, InvalidFrame> {
         if bytes.len() > MAX_FRAME_SIZE || bytes.len() < 3 {
             return Err(InvalidFrame);
         }
@@ -109,7 +136,7 @@ impl Message {
         }
         let content = match (p[4], p.len(), destination) {
             (0, 5, None) => Content::Discover,
-            (1 | 2, 14, _) => {
+            (1 | 2 | 3, 14, _) => {
                 let network = Network {
                     founder: u64::from_le_bytes(p[5..13].try_into().unwrap()),
                     channel: p[13],
@@ -118,13 +145,39 @@ impl Message {
                 // also advertises its proposed channel while sweeping others.
                 if !network.valid()
                     || (p[4] == 1 && (network.channel != channel || destination.is_none()))
+                    || (p[4] == 3 && (network.channel != channel || destination.is_some()))
                 {
                     return Err(InvalidFrame);
                 }
-                if p[4] == 1 {
-                    Content::Present(network)
-                } else {
-                    Content::Propose(network)
+                match p[4] {
+                    1 => Content::Present(network),
+                    2 => Content::Propose(network),
+                    _ => Content::Arrive(network),
+                }
+            }
+            (4, n, None) if n > 20 && n <= 20 + SURFACE_BYTES => {
+                let network = Network {
+                    founder: u64::from_le_bytes(p[5..13].try_into().unwrap()),
+                    channel: p[13],
+                };
+                let sequence = u16::from_le_bytes(p[14..16].try_into().unwrap());
+                let offset = u16::from_le_bytes(p[16..18].try_into().unwrap());
+                let total = u16::from_le_bytes(p[18..20].try_into().unwrap());
+                if !network.valid()
+                    || network.channel != channel
+                    || total < 13
+                    || offset >= total
+                    || offset as usize % SURFACE_BYTES != 0
+                    || n - 20 != SURFACE_BYTES.min(usize::from(total - offset))
+                {
+                    return Err(InvalidFrame);
+                }
+                Content::SurfacePart {
+                    network,
+                    sequence,
+                    offset,
+                    total,
+                    bytes: &p[20..],
                 }
             }
             _ => return Err(InvalidFrame),
@@ -142,6 +195,62 @@ mod tests {
     use super::*;
     const A: u64 = 0x0102_0304_0506_0708;
     const B: u64 = 0x1112_1314_1516_1718;
+
+    #[test]
+    fn publication_fragments_are_bounded_broadcasts_with_exact_offsets() {
+        let network = Network {
+            founder: 99,
+            channel: 23,
+        };
+        let bytes = [0x5a; SURFACE_BYTES];
+        for (offset, total, length) in [
+            (0, 100, SURFACE_BYTES),
+            (SURFACE_BYTES as u16, 100, 100 - SURFACE_BYTES),
+            (0, 13, 13),
+        ] {
+            let message = Message {
+                source: A,
+                destination: None,
+                content: Content::SurfacePart {
+                    network,
+                    sequence: 7,
+                    offset,
+                    total,
+                    bytes: &bytes[..length],
+                },
+            };
+            let mut out = [0; MAX_FRAME_SIZE];
+            let n = message.encode(1, &mut out);
+            assert_eq!(Message::decode(&out[..n], B, 23).unwrap(), message);
+            assert!(Message::decode(&out[..n], B, 22).is_err());
+            for end in 0..n {
+                assert!(
+                    Message::decode(&out[..end], B, 23).is_err(),
+                    "truncated {end}/{n}"
+                );
+            }
+            for (field, value) in [(31, 1), (33, 0), (28, 10)] {
+                let mut bad = out;
+                bad[field] = value;
+                assert!(Message::decode(&bad[..n], B, 23).is_err());
+            }
+            let directed = Message {
+                destination: Some(B),
+                ..message
+            };
+            let n = directed.encode(1, &mut out);
+            assert!(Message::decode(&out[..n], B, 23).is_err());
+        }
+        let arrival = Message {
+            source: A,
+            destination: None,
+            content: Content::Arrive(network),
+        };
+        let mut out = [0; MAX_FRAME_SIZE];
+        let n = arrival.encode(0, &mut out);
+        assert_eq!(Message::decode(&out[..n], B, 23).unwrap(), arrival);
+        assert!(Message::decode(&out[..n], B, 22).is_err());
+    }
 
     #[test]
     fn wire_vectors_and_rejection_boundaries() {
@@ -215,7 +324,7 @@ mod tests {
                 (payload, b'X'),
                 (payload + 2, b'D'),
                 (payload + 3, 1),
-                (payload + 4, 3),
+                (payload + 4, 255),
             ] {
                 let mut bad = out;
                 bad[offset] = value;

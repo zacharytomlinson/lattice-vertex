@@ -4,7 +4,7 @@ pub use super::task::Transport;
 use crate::{kernel, port::RadioPeripheral, sync::TaskContext};
 
 #[derive(Clone, Copy)]
-pub enum Event {
+pub enum Event<'a> {
     NotificationWait,
     InterruptWake,
     ReceiveEvicted,
@@ -38,6 +38,23 @@ pub enum Event {
     FrameIgnored,
     ReceiveFailed,
     TransmitFailed,
+    ArrivalSent,
+    ArrivalReceived,
+    /// Borrowed encoded bytes, emitted only in the resident task after TX completes.
+    SurfacePartSent {
+        sequence: u16,
+        offset: u16,
+        total: u16,
+        bytes: &'a [u8],
+    },
+    /// Borrowed packet bytes, emitted only in the resident task. No retention is implied.
+    SurfacePartReceived {
+        source: u64,
+        sequence: u16,
+        offset: u16,
+        total: u16,
+        bytes: &'a [u8],
+    },
 }
 
 static mut WORKLOAD: Option<fn(&mut Transport) -> !> = None;
@@ -77,7 +94,7 @@ pub fn start(
         WORKLOAD = Some(workload);
     }
     observe(events);
-    kernel::start(context, radio)
+    kernel::start(context, radio, &crate::surface::EMPTY)
 }
 
 pub(super) fn run(transport: &mut Transport) {

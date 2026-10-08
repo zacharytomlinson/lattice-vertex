@@ -108,7 +108,7 @@ fn event(event: Event) {
         Event::TransmitFailed => {
             TX_ERRORS.fetch_add(1, Relaxed);
         }
-        _ => {}
+        other => super::surface::event(other),
     }
 }
 

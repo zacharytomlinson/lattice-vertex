@@ -174,7 +174,7 @@ The ordinary dependency graph must have neither `lattice-radio-test` nor
 `test-support`. Its ELF must have no `lattice_radio_test` or radio-testing symbols.
 It initializes the radio and runs common peer discovery, including broadcasts
 and directed presence responses. It does not answer `LVD` diagnostic probes.
-The `peer-discovery` fixture feature observes the normal handler without replacing
+The `peer-observer` fixture feature observes the normal handler without replacing
 it; see [the discovery check](../peer/TESTING.md).
 
 The portable codec tests run without an MCU target or kernel port:

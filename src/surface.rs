@@ -4,6 +4,8 @@
 //! Their native types determine the scalar boundary; static handles make those
 //! implementations enumerable alongside their IR without an allocator or registry.
 //! Device-wide axioms and invariants remain visible mathematical predicates.
+//! Pass the static [`Surface`] to `kernel::start` on an MCU port to let
+//! the kernel publish these definitions on arrival; no packet handling is required.
 //!
 //! This module exposes local definitions, invocation, and state change hooks.
 //! It does not interpret IR, prove an appliance model, or install executable
@@ -248,6 +250,14 @@ pub struct Surface<'a, Appliance: 'static, Error> {
     /// Device-wide properties that synthesis must preserve.
     pub invariants: &'a [&'a Predicate<Appliance>],
 }
+
+/// An explicitly empty appliance surface, useful for radio-only port checks.
+pub static EMPTY: Surface<'static, (), core::convert::Infallible> = Surface {
+    states: &[],
+    transformers: &[],
+    axioms: &[],
+    invariants: &[],
+};
 
 impl<Appliance: 'static, Error> ir::Surface for Surface<'_, Appliance, Error> {
     type Location = Read<Appliance>;

@@ -20,8 +20,13 @@ use core::{
 static mut STACK: [StackType_t; 1536] = [0; 1536];
 static mut CONTROL: tasks::StaticTask_t = tasks::StaticTask_t::new();
 static mut PERIPHERAL: Option<port::RadioPeripheral> = None;
+static mut PUBLICATION: Option<crate::kernel::peer::exposure::Publication> = None;
 
-pub(crate) fn start(context: &TaskContext, peripheral: port::RadioPeripheral) {
+pub(crate) fn start(
+    context: &TaskContext,
+    peripheral: port::RadioPeripheral,
+    publication: crate::kernel::peer::exposure::Publication,
+) {
     assert_eq!(
         tasks::xTaskGetSchedulerState(),
         tasks::taskSCHEDULER_NOT_STARTED
@@ -29,6 +34,7 @@ pub(crate) fn start(context: &TaskContext, peripheral: port::RadioPeripheral) {
     unsafe {
         assert!(PERIPHERAL.is_none(), "radio task already installed");
         PERIPHERAL = Some(peripheral);
+        PUBLICATION = Some(publication);
         TaskHandle::spawn_static(context, b"radio", &mut STACK, &mut CONTROL, 3, run).unwrap();
     }
 }
@@ -153,5 +159,5 @@ extern "C" fn run(_: *mut c_void) {
     #[cfg(feature = "test-support")]
     super::testing::run(&mut transport);
 
-    crate::kernel::peer::run(&mut transport)
+    crate::kernel::peer::run(&mut transport, unsafe { PUBLICATION.take().unwrap() })
 }

@@ -3,6 +3,8 @@
 
 #[cfg(feature = "runtime")]
 pub mod discovery;
+#[cfg(feature = "runtime")]
+pub mod surface;
 
 #[cfg(any(test, feature = "runtime"))]
 mod frame;

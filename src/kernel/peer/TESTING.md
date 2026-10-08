@@ -1,8 +1,9 @@
-# Common kernel discovery check
+# Common kernel peer checks
 
 This checks `kernel::start` → resident radio task → `kernel::peer`, without
-installing a replacement workload. The optional `peer-discovery` board feature
-adds only a passive callback, fixed counters, and a low-priority reporter.
+installing a replacement workload. The optional `peer-observer` board feature
+supplies an authored test surface, a passive callback, fixed counters, and a
+low-priority reporter. It was previously named `peer-discovery`.
 Configuration, broadcasts, packet parsing, and directed responses belong to the
 ordinary kernel. The RF probe remains separately selectable through `radio-probe`;
 the two fixture features are mutually exclusive.
@@ -10,7 +11,7 @@ the two fixture features are mutually exclusive.
 From `src/port/esp32c6/tests`:
 
 ```sh
-cargo +stable build --release --locked --features peer-discovery --bin radio --target-dir target/discovery
+cargo +stable build --release --locked --features peer-observer --bin radio --target-dir target/discovery
 espflash flash --port /dev/ttyACM0 target/discovery/riscv32imac-unknown-none-elf/release/radio
 ```
 
@@ -30,7 +31,8 @@ heard from other starters use a deterministic founding-address/channel tie-break
 The PAN is a common discovery filter and the founding address a network tag.
 Neither authenticates a peer. Startup currently adopts the first established
 network it hears; ownership selection between nearby deployments is not
-implemented. No surface, state mutation, or compiled-fragment messages exist yet.
+implemented. [Surface publication](EXPOSURE.md) now follows arrival automatically.
+State-mutation and compiled-fragment messages are not implemented yet.
 
 The on-air discovery profile is:
 
@@ -40,9 +42,13 @@ The on-air discovery profile is:
 | Discovery destination | PAN `0x4c56`, short broadcast `0xffff` |
 | Presence destination | PAN `0x4c56`, requesting peer's extended address |
 | Proposal destination | Broadcast solicits an answer; directed reply carries the candidate's preferred record |
-| Payload | `4c 56 54 02` (`LVT`, version 2), then kind 0 (discover), 1 (present), or 2 (propose) |
+| Discovery payload | `4c 56 54 02` (`LVT`, version 2), then kind 0 (discover), 1 (present), or 2 (propose) |
 | Present/propose fields | Founding address: 8 bytes little-endian; channel: 1 byte |
 | Size before hardware FCS | 20 bytes discovery; 35 bytes directed presence/proposal; 29 bytes broadcast proposal |
+
+The same envelope adds arrival (3) and surface part (4), specified in
+[the exposure format](EXPOSURE.md#publication-envelope). These publish static
+definitions and do not turn discovery into a polling surface query.
 
 Startup scans actively: each channel gets a 4,096-us energy window, a discovery
 request, and 60–90 ms of listening. Formation has no fixed control channel.
@@ -97,6 +103,9 @@ Build without either fixture feature in a separate `target/normal` directory to
 produce ordinary firmware. It retains discovery but has no observer/probe crate,
 test event callback, statistics, or recurring serial logs. Pairing this ordinary
 image with an observed peer checks that test code is not implementing discovery.
+Ordinary port-test firmware supplies `surface::EMPTY`; the observer image supplies
+a switch or dimmer definition. See [the exposure checks](EXPOSURE.md#checks) for
+the reciprocal publication and checksum comparison.
 
 ## Formation validation status — 2026-10-07
 
@@ -223,7 +232,7 @@ Both boards were left running the discovery observer image.
 
 Both host framing/response tests pass. C6 ordinary, observed discovery, and RF
 probe images build; the nRF52840 observed discovery image builds using
-`cargo +nightly build -Z build-std=core --release --locked --features peer-discovery --bin radio`.
+`cargo +nightly build -Z build-std=core --release --locked --features peer-observer --bin radio`.
 Nordic hardware execution remains untested. Naming/ownership review leaves one
 transport owner, one common discovery handler, and passive fixture-owned counters;
 no appliance networking API or neighbor registry was introduced.

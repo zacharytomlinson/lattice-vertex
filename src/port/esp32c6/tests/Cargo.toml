@@ -8,7 +8,7 @@ publish = false
 
 [features]
 radio-probe = ["dep:lattice-radio-test"]
-peer-discovery = ["dep:lattice-radio-test"]
+peer-observer = ["dep:lattice-radio-test"]
 
 [[bin]]
 name = "radio"

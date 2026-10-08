@@ -132,12 +132,15 @@ scheduler has valid task storage. Driver futures register a waker for that task;
 when pending, the task blocks on a notification. The IRQ wakes it to resume the
 same operation. There is no additional executor task or graph work queue.
 
-`kernel::start(context, radio_peripheral)` owns the static radio stack/control
+`kernel::start(context, radio_peripheral, &surface)` owns the static radio stack/control
 block and starts the existing scheduler. The resident transport owns its selected
 driver and task waker, then runs `kernel::peer` on the same task. Common discovery
 selects the rendezvous radio settings, broadcasts discovery, and answers a peer
-with directed presence. State changes, surface exposure, authorization, and installed
-fragments still need to be connected to common peer handling.
+with directed presence. It borrows and encodes the supplied static surface, then
+publishes it when arriving or encountering another arrival. The same behavior
+runs on every vertex, with no enumeration administrator or polling catalog.
+State changes, authorization, and installed fragments still need to be connected
+to common peer handling.
 
 Hardware tests opt into `test-support` to observe the ordinary path or replace
 its handler with a supplied RF-probe workload. Both use the same resident task,
@@ -295,11 +298,17 @@ repeats every 2–3 seconds after selection. Presence never causes an echo. MAC 
 are not requested for these frames. No peer table, appliance formation/join knob,
 graph work queue, or repeated transformer invocation is introduced.
 
-The board fixture's `peer-discovery` feature only observes this normal path. It
-registers a test event callback and reports counters; it supplies no settings,
-messages, or handler. Both C6 and Nordic use the same common discovery code.
-Surface exchange and authorization of operations remain to be implemented.
-Discovery alone grants no permission to install fragments or mutate appliance state.
+The board fixture's `peer-observer` feature observes this normal path. It supplies
+an authored test surface, registers a passive event callback, and reports counters;
+it supplies no radio settings, message generator, or handler. Both C6 and Nordic
+use the same common discovery and [surface publication](../src/kernel/peer/EXPOSURE.md).
+One arrival announcement triggers reciprocal publication of local definitions.
+Periodic discovery and received descriptions do not trigger exposure. Parts are
+generated from immutable IR without invoking native readers/transformers or
+retaining another vertex's definitions. Interested consumers own any reassembly;
+the ordinary receiver currently discards descriptions after frame validation.
+Transport receipts, forwarding, consumer integration, and authorization remain
+open. Discovery or a description grants no permission to install or mutate.
 
 C6 RF investigation keeps TX power fixed at 20 dBm, including reference runs.
 Similar results across the three tested boards make the shared PHY setup the
@@ -378,7 +387,8 @@ flowchart TB
     startup["kernel::start: static radio task and scheduler startup"]
     state["Integrated state and fragment handling: to build"]
     peers["Authorization, surface messages, and graph dispatch: to build"]
-    discovery["kernel::peer: channel survey, computed rendezvous, retained network, discovery, MAC codec"]
+    discovery["kernel::peer: channel survey, computed rendezvous, arrival and message dispatch"]
+    exposure["peer::exposure: borrowed local IR, bounded encoding, publication progress"]
     radio["Nordic/C6 radio ports: fixed buffers, energy detection, hardware IRQs"]
     transport["kernel::radio: resident driver and notification waits"]
     probe["src/kernel/radio/tests: RF probe workload and passive discovery observer"]
@@ -394,6 +404,7 @@ flowchart TB
 
     surface -->|native access| appliance
     surface -->|mathematical descriptions| ir
+    surface -->|static reference supplied at startup| exposure
     sync -->|uses| tasks
     tasks -->|context switching and timer setup| cpu
     cpu -->|ticks and ISR wakeups| tasks
@@ -402,7 +413,7 @@ flowchart TB
     cpu -->|C6 hardware support| hal
     smoke -->|initializes selected chip resources| cpu
     smoke -->|creates static tasks and starts scheduler| tasks
-    smoke -->|radio-probe or peer-discovery feature includes| probe
+    smoke -->|radio-probe or peer-observer feature includes| probe
     rfexperiments -->|kernel-based RF trials reuse| probe
     rfexperiments -->|kernel-based RF trials inspect hardware configuration| radio
     probe -->|installs RF workload or only observes discovery| testentry
@@ -415,8 +426,11 @@ flowchart TB
     startup -.->|establishes kernel communication| peers
     startup -->|creates static radio task| tasks
     startup -->|creates resident transport| transport
+    startup -->|checks and transfers local publication| exposure
     transport -->|owns selected driver| radio
     transport -->|ordinary resident task runs| discovery
+    discovery -->|arrival triggers local publication| exposure
+    exposure -->|encoded parts through resident transport| transport
     discovery -->|surveys energy, selects channel, exchanges frames through| transport
     transport -->|receives and transmits frames| radio
     transport -->|blocks on notifications while hardware works| tasks
@@ -490,11 +504,13 @@ boards were restored to Lattice; their short follow-up answered 19/19 and 20/20
 probes with sampled RSSI from -70 to -63 dBm. No kernel change accompanied this
 comparison, and the earlier intermittent loss remains unexplained.
 
-Typed surface/IR definitions and local change comparison/callback dispatch remain
-separate from radio message handling. The local callback list is not the vertex's
-installed distributed DAG structure. Common discovery now runs in `kernel::peer`;
-surface messages and fragment installation remain unimplemented. The diagnostic
-probe/reply handler provides none of those production behaviors.
+Typed surface/IR definitions now enter kernel startup and feed arrival-triggered
+surface messages through `kernel::peer`. Publication carries states, transformer
+preconditions/effects, axioms, and invariants without executing them. There is no
+foreign-surface catalog. The local observation callback list is still separate
+from distributed message handling and is not the installed distributed DAG.
+State-change messages and fragment installation remain unimplemented. The
+diagnostic probe/reply handler provides none of these production behaviors.
 
 The [common discovery capture](../src/kernel/peer/TESTING.md#c6-result--2026-10-06)
 identified both C6 peers and exchanged directed presence responses. Replacing
@@ -532,17 +548,19 @@ the kernel; a separate scheduler-only test is not a prerequisite to further work
    are implemented. The C6 pair has completed the hardware receive → wakeup →
    reply run using the separated test workload; Nordic hardware execution remains
    pending. The fixture supplies diagnostic traffic and settings through a
-   test-only entry on the real kernel transport. Full appliance surface installation
-   and surface exchange are the next common participation work. The initial
-   rendezvous/discovery path is now implemented in the ordinary kernel.
+   test-only entry on the real kernel transport. Native appliance-instance binding
+   and distributed state-change handling remain separate from these task checks.
+   Rendezvous/discovery and arrival-triggered surface publication now run through
+   ordinary kernel startup.
 2. **Implement automatic peer participation.** Put radio configuration, bootstrap,
    discovery, and surface-exposure handling in the common kernel. Use the provided
    platform port to perform the hardware operations. Completion means two appliance
    implementations can enter the network and expose their surfaces through the
    same kernel behavior, without choosing PANs or writing packet handlers.
    Channel survey/formation and directed discovery responses are implemented.
-   Surface installation/enumeration and authorization remain open; discovering an
-   address does not yet expose an appliance's mathematical surface.
+   Arrival-triggered mathematical surface publication is implemented. Reliable
+   delivery/consumer integration and authorization remain open. Surface descriptions
+   do not establish physical appliance state or permission to mutate it.
 3. **Complete the state-change communication path.** An appliance establishes a
    state change; the kernel detects/registers the delta, emits the required peer
    message, and the receiving kernel performs its prescribed local handling.

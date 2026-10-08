@@ -42,8 +42,21 @@ pub mod timers;
 /// Hardware clocks/CPU-port initialization and any appliance tasks must be ready.
 /// The resident radio enters common peer discovery. Appliance code supplies no
 /// channel, PAN, discovery loop, or diagnostic workload.
+/// `surface` borrows the appliance's static states, transformers, and IR predicates.
+/// It is encoded without reading live state and published when this vertex arrives
+/// or hears another arrival. No foreign-surface registry is created.
+///
+/// # Panics
+/// Before scheduler startup, rejects an encoded surface over 65,535 bytes or
+/// expression nesting reaching the encoder's depth limit (32).
 #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
-pub fn start(context: crate::sync::TaskContext, radio: crate::port::RadioPeripheral) -> ! {
-    radio::start(&context, radio);
+pub fn start<A: 'static, E: 'static>(
+    context: crate::sync::TaskContext,
+    radio: crate::port::RadioPeripheral,
+    surface: &'static crate::surface::Surface<'static, A, E>,
+) -> ! {
+    let publication =
+        peer::exposure::Publication::new(surface).expect("surface exceeds publication limits");
+    radio::start(&context, radio, publication);
     crate::start_scheduler(context)
 }
