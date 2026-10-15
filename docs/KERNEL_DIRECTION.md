@@ -153,8 +153,9 @@ appliance code supplies its actual device behavior and observations.
 Startup owns the static radio stack/control block and starts the existing scheduler.
 The resident transport owns its selected driver and task waker, then runs
 `kernel::peer` on the same task. It surveys/selects a channel, discovers peers,
-serves borrowed description ranges, forwards compact arrival/owner messages,
-invokes exposed native transformers, and propagates registered state changes.
+serves borrowed description ranges and current-state reads, forwards compact
+arrival/owner messages, invokes exposed native transformers, and propagates
+registered state changes.
 Responses establish bounded owner directions; every vertex runs the same behavior,
 without an enumeration administrator or foreign-surface catalog.
 
@@ -362,6 +363,44 @@ same appliance definition should work on another supported platform without a
 new networking implementation. Platform-specific capabilities or limitations
 should be handled by that port and the common kernel policy.
 
+## Maintained peer links and progressive discovery
+
+Every vertex is responsible for maintaining a bounded set of reciprocal peer
+links when neighbors are available. Joining includes establishing relationships
+that both participants retain; an announcement alone does not establish a link.
+The kernel owns admission, confirmation, refresh, expiry, and rediscovery. A
+solitary vertex can operate locally and continue looking for neighbors.
+
+These maintained links are distinct from learned destination paths. Links describe
+which adjacent participants are available for forwarding and traversal. Destination
+paths describe preferred or alternative directions toward a farther owner. Both
+are communication relationships; neither is an installed executable edge or a
+copy of another appliance's surface. The intended relay behavior combines this
+local network memory with cost-based selection and bounded redundant delivery.
+Multiple next hops do not automatically imply independent end-to-end paths.
+
+Link enumeration is a standard kernel protocol operation, `ReadLinks`. Its numeric
+format is shared by all participants and requires no appliance IR definition or
+firmware callback. A tablet or other peer starts with one reachable vertex,
+enumerates its maintained links, and follows references outward. It can read the
+encountered owner's surface or current state when useful. The consumer retains
+its own visited set; there is no mandatory global inventory or compulsory
+whole-network state report on arrival.
+
+A discovered handle must retain a usable direction through the vertex that
+provided it. Traversal therefore needs an explicit way to approach a newly named
+neighbor through that already-reachable vertex. A successfully returned read can
+teach the ordinary destination path used by later surface reads and commands.
+The walk remains bounded by transport scope and may observe topology changes;
+it is not an atomic census or evidence that an unreachable vertex ceased to exist.
+
+**Implementation status:** maintained peer links, standard `ReadLinks`, and guided
+traversal through an advertising vertex now run in the common peer task. The
+[link protocol](../src/kernel/peer/LINKS.md) defines admission/refresh, enumeration,
+and the route hint. Host tests exercise a chained walk followed by a surface read;
+both MCU ports build. Cost ranking and redundant-path delivery remain subsequent
+work; the destination cache still retains one next hop per owner.
+
 ## Forwarding learned from communication
 
 Use directed diffusion as the design basis for common peer delivery: explore
@@ -380,8 +419,8 @@ separate things. Neither routing nor duplicate suppression may merge independent
 deltas or invent additional transformer invocations. A cached mathematical
 surface cannot stand in for its owner's physical state or execute its operation.
 
-The first implemented slice is `peer::forwarding`: a bounded surface read to a
-known owner explores by broadcast when no confirmed next hop is available. Each
+`peer::forwarding` carries bounded surface and current-state reads to an owner,
+exploring by broadcast when no confirmed next hop is available. Each
 relay retains the first incoming neighbor for that request. A matching reply
 returns through those records and installs a direction toward the owner. Later
 reads use that direction. Local TX failure, unanswered-read expiry, and stale
@@ -396,18 +435,21 @@ with its own address/description length and relays the query within its remainin
 scope. Multiple owners' responses can follow the same return path. A matching
 reply teaches a direction; an unsolicited announcement alone does not.
 
-On entry, a vertex announces itself, listens for one ordinary discovery interval,
-then searches once for preexisting owners. Subsequent periodic discovery remains
-link-local. An incoming arrival never triggers a new query or surface transfer.
-Results are consumed transiently; ordinary vertices retain no complete owner list.
-The tablet/nucleus consumer can initiate further queries with fresh request tokens.
+The runtime announces itself and maintains local relationships after joining.
+There is no automatic owner search. `FindOwners` remains an explicit bounded search operation; it is not
+a compulsory startup census. An incoming arrival does not trigger surface transfer.
+Interested peers progressively follow maintained links and fetch only the data they
+need. Ordinary vertices retain no complete owner list.
 
-The current fixed forwarder budget is three learned directions, eight recent read
-paths, four owner-query return paths, eight recent owner notices, four call paths,
-and eight delta duplicate keys, with a compile-time 1,536-byte ceiling. All return
+The current fixed forwarder budget is three learned directions, eight recent paths
+shared by surface, current-state, and link reads, four owner-query return paths,
+eight recent owner notices, four call paths, and eight delta duplicate keys. Eight
+adjacent-peer records are maintained separately from destination paths, inside a
+combined compile-time 2,048-byte ceiling. All return
 paths and duplicate keys expire after 10 seconds;
-confirmed routes after 60 seconds without another matching response. Full storage
-evicts its oldest record. Eviction can lose a response or shorten duplicate
+confirmed routes after 60 seconds without another matching response. Path/history
+storage evicts its oldest record; the adjacent-peer records reject new admissions
+when full and expire unconfirmed/unrefreshed entries rather than evict healthy links. Eviction can lose a response or shorten duplicate
 suppression; hop limits remain necessary. Neither these paths nor a TX completion prove native execution. The limits are explicit starting capacities.
 
 Host checks cover arrival propagation, cyclic/duplicate paths, several owners
@@ -438,6 +480,15 @@ The kernel preserves distinct changes, including unavailable state, and relays
 accepted messages within the same scope with recent duplicate suppression.
 Receiving another appliance's delta never overwrites local state. No global state
 mirror, periodic state polling, or learned model is introduced.
+
+An interested peer can read one exposed current value from its owner without
+waiting for a change. The owner matches the attribute, reads it under the existing
+appliance mutex, and includes the latest registered change sequence in the reply.
+Busy, unknown attribute, and unavailable observation are distinct. The read does
+not emit a delta or invoke dependents. It reuses the surface-read path budget and
+token namespace; there is no periodic poller or foreign-state mirror. A consumer
+can compare that attribute's read watermark against later deltas within a boot;
+this is not an atomic multi-attribute snapshot or a reboot ordering mechanism.
 
 ## Structured memory and resident relationships
 
@@ -492,6 +543,7 @@ flowchart TB
     peers["Authorization and installed compiled-fragment dispatch: to build"]
     discovery["kernel::peer: channel survey, computed rendezvous, arrival and message dispatch"]
     exposure["peer::exposure: borrowed local IR and bounded range encoding"]
+    links["peer::links: maintained adjacent peers, confirmation, refresh and cursor enumeration"]
     forwarding["peer::forwarding: bounded arrivals, owner discovery/read/call return paths, learned directions, delta duplicates"]
     radio["Nordic/C6 radio ports: fixed buffers, energy/CCA setup, hardware IRQs"]
     transport["kernel::radio: resident driver and notification waits"]
@@ -533,6 +585,8 @@ flowchart TB
     surface -->|typed updates and explicit changes| observation
     observation -->|registered deltas before local callbacks| state
     discovery -->|validated native call at owner| invocation
+    discovery -->|owner reads exposed current state under mutex| binding
+    binding -->|samples change watermark while holding mutex| state
     invocation -->|typed adapter under mutex| binding
     state -->|notifies resident radio task| transport
     discovery -->|drains pending deltas| state
@@ -541,7 +595,9 @@ flowchart TB
     startup -->|checks and borrows local description| exposure
     transport -->|owns selected driver| radio
     transport -->|ordinary resident task runs| discovery
-    discovery -->|validated discovery, reads, calls, and deltas| forwarding
+    discovery -->|local exchanges, maintenance, and validated peer messages| forwarding
+    forwarding -->|retains neighbors, enumerates and follows advertised links| links
+    links -->|expired neighbors invalidate directions| forwarding
     forwarding -->|owner encodes requested range| exposure
     forwarding -->|bounded announcements, exploration, and reverse replies| transport
     discovery -->|surveys energy, selects channel, exchanges frames through| transport
@@ -580,18 +636,24 @@ is paused. Historical captures used older wire revisions and live in the externa
 lab; they do not establish current protocol delivery or general loss-free operation.
 
 The current LVT v5 path has host tests and both MCU builds: borrowed surface range
-reads, compact owner discovery, bounded relay directions, native appliance binding,
-owner-directed invocation/results, and registered observation deltas. Tests cover
-argument/reference rejection, retained command replay, actual observation timing,
+reads, maintained adjacent links and guided traversal, bounded relay directions,
+native appliance binding,
+owner-directed invocation/results, current-state reads, and registered observation
+deltas. Tests cover argument/reference rejection, retained command replay, actual observation timing,
 and grouped-delta ordering. Kernel task/protocol behavior remains in common source;
 portable codecs, fixture counters, and hardware logging live in separate test crates.
 
-Authentication, tablet consumer integration, initial live-state reads, installed
-compiled fragments, and their distributed activation remain open. Local dependents
-are immediate native callbacks, not an installed distributed DAG. The current
+Authentication, tablet consumer integration, installed compiled fragments, and
+their distributed activation remain open. Local dependents are immediate native callbacks, not an installed distributed DAG. The current
 manual-control message path has not yet had an end-to-end hardware run.
 
 ## Next implementation sequence
+
+Maintained reciprocal links, built-in `ReadLinks`, and guided traversal are now
+implemented using the existing read return paths and resident task. Next, develop
+cost-based retention/selection of alternative destination paths and bounded
+redundant delivery. Preserve message identity and native duplicate handling.
+Tablet-daemon integration and hardware validation of the current protocol remain open.
 
 1. **Establish the integrated boot path across Nordic and ESP.** Provide
    the timer, interrupt, and context-switch integration needed by the existing scheduler. Establish the
@@ -614,8 +676,8 @@ manual-control message path has not yet had an end-to-end hardware run.
    platform port to perform the hardware operations. Completion means two appliance
    implementations can enter the network and expose their surfaces through the
    same kernel behavior, without choosing PANs or writing packet handlers.
-   Channel survey/formation and directed discovery responses are implemented.
-   Owner-directed surface reads, bounded exploration, reverse replies, and learned
+   Channel survey/formation, directed discovery, reciprocal link maintenance,
+   `ReadLinks`, and guided traversal are implemented. Owner-directed surface reads, bounded exploration, reverse replies, and learned
    directions are implemented. Compact arrivals and owner discovery now cross relays
    using the same route cache. Consumer integration, adaptive relay selection,
    and authorization remain open. Surface descriptions
@@ -626,9 +688,9 @@ manual-control message path has not yet had an end-to-end hardware run.
    Completion means this path works through the common runtime, with the examples
    reduced to appliance definitions and physical I/O.
    Native binding, owner-directed calls/results, registered observation capture,
-   and scoped delta forwarding are implemented and checked on the host. Both MCU
-   images build. The tablet daemon, initial live-state reads, hardware exercise of
-   this path, and installed conditional activation remain open.
+   scoped delta forwarding, and on-demand current-state reads are implemented and
+   checked on the host. Both MCU images build. The tablet daemon, hardware exercise
+   of this path, and installed conditional activation remain open.
 
 Extend that working path into compiled-fragment installation, conditional
 activation, and their forwarding semantics. Native transformer invocation is now

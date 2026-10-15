@@ -1,4 +1,4 @@
-//! Discovery, surface reads, native invocation, and state deltas over 802.15.4.
+//! Peer links, traversal, surface/state reads, and native control over 802.15.4.
 //! PHY length/FCS belong to the port. Network tags are not credentials.
 
 use super::{Network, PAN_ID};
@@ -64,6 +64,50 @@ pub(super) struct SurfaceRead {
     pub offset: u16,
 }
 
+/// Read one exposed attribute. Read tokens share the surface-read namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct StateRead {
+    pub reader: u64,
+    pub owner: u64,
+    pub request: u16,
+    pub attribute: u64,
+}
+
+/// Established state and the owner's change watermark, or a distinct read failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StateReadResult {
+    Value { sequence: u32, value: Option<Value> },
+    UnknownAttribute,
+    Busy,
+}
+
+/// One-hop admission/refresh exchange. These messages are never relayed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum LinkPhase {
+    Offer = 0,
+    Accept = 1,
+    Confirm = 2,
+    Reject = 3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PeerLink {
+    pub peer: u64,
+    pub round_trip_ms: u16,
+}
+
+/// Enumerate an owner's resident links after a peer-address cursor. A nonzero
+/// via names the already-reachable vertex that advertised this owner as a neighbor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LinkRead {
+    pub reader: u64,
+    pub owner: u64,
+    pub request: u16,
+    pub after: u64,
+    pub via: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Content<'a> {
     Discover,
@@ -115,6 +159,34 @@ pub(super) enum Content<'a> {
     StateChanged {
         network: Network,
         delta: StateDelta,
+        hops: u8,
+    },
+    ReadState {
+        network: Network,
+        read: StateRead,
+        remaining: u8,
+    },
+    StateValue {
+        network: Network,
+        read: StateRead,
+        result: StateReadResult,
+        hops: u8,
+    },
+    LinkExchange {
+        network: Network,
+        phase: LinkPhase,
+        token: u32,
+    },
+    ReadLinks {
+        network: Network,
+        read: LinkRead,
+        remaining: u8,
+    },
+    LinkEntry {
+        network: Network,
+        read: LinkRead,
+        revision: u32,
+        link: Option<PeerLink>,
         hops: u8,
     },
 }
@@ -251,6 +323,97 @@ impl<'a> Message<'a> {
                 payload[42] = status as u8;
                 payload[43] = hops;
                 44
+            }
+            Content::LinkExchange {
+                network,
+                phase,
+                token,
+            } => {
+                payload[4] = 13;
+                payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
+                payload[13] = network.channel;
+                payload[14] = phase as u8;
+                payload[15..19].copy_from_slice(&token.to_le_bytes());
+                19
+            }
+            Content::ReadLinks {
+                network,
+                read,
+                remaining,
+            } => {
+                payload[4] = 14;
+                payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
+                payload[13] = network.channel;
+                read.encode(&mut payload[14..48]);
+                payload[48] = remaining;
+                49
+            }
+            Content::LinkEntry {
+                network,
+                read,
+                revision,
+                link,
+                hops,
+            } => {
+                payload[4] = 15;
+                payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
+                payload[13] = network.channel;
+                read.encode(&mut payload[14..48]);
+                payload[48] = hops;
+                payload[49..53].copy_from_slice(&revision.to_le_bytes());
+                if let Some(link) = link {
+                    payload[53] = 1;
+                    payload[54..62].copy_from_slice(&link.peer.to_le_bytes());
+                    payload[62..64].copy_from_slice(&link.round_trip_ms.to_le_bytes());
+                    64
+                } else {
+                    payload[53] = 0;
+                    54
+                }
+            }
+            Content::ReadState {
+                network,
+                read,
+                remaining,
+            } => {
+                payload[4] = 11;
+                payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
+                payload[13] = network.channel;
+                read.encode(&mut payload[14..40]);
+                payload[40] = remaining;
+                41
+            }
+            Content::StateValue {
+                network,
+                read,
+                result,
+                hops,
+            } => {
+                payload[4] = 12;
+                payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
+                payload[13] = network.channel;
+                read.encode(&mut payload[14..40]);
+                payload[40] = hops;
+                match result {
+                    StateReadResult::Value { sequence, value } => {
+                        payload[41] = 0;
+                        payload[42..46].copy_from_slice(&sequence.to_le_bytes());
+                        if let Some(value) = value {
+                            46 + encode_value(value, &mut payload[46..])
+                        } else {
+                            payload[46] = 255;
+                            47
+                        }
+                    }
+                    StateReadResult::UnknownAttribute => {
+                        payload[41] = 1;
+                        42
+                    }
+                    StateReadResult::Busy => {
+                        payload[41] = 2;
+                        42
+                    }
+                }
             }
             Content::StateChanged {
                 network,
@@ -561,6 +724,149 @@ impl<'a> Message<'a> {
                     hops,
                 }
             }
+            (11, 41, _) | (12, 42..=55, Some(_)) => {
+                let network = Network {
+                    founder: u64::from_le_bytes(p[5..13].try_into().unwrap()),
+                    channel: p[13],
+                };
+                let read = StateRead::decode(&p[14..40]);
+                let scope = p[40];
+                if !network.valid()
+                    || network.channel != channel
+                    || !valid_address(read.reader)
+                    || !valid_address(read.owner)
+                    || !valid_address(read.attribute)
+                    || read.reader == read.owner
+                    || !(1..=MAX_HOPS).contains(&scope)
+                {
+                    return Err(InvalidFrame);
+                }
+                if p[4] == 11 {
+                    if scope == MAX_HOPS && source != read.reader {
+                        return Err(InvalidFrame);
+                    }
+                    Content::ReadState {
+                        network,
+                        read,
+                        remaining: scope,
+                    }
+                } else {
+                    if scope == 1 && source != read.owner {
+                        return Err(InvalidFrame);
+                    }
+                    let result = match (p[41], p.len()) {
+                        (0, 47..=55) => {
+                            let sequence = u32::from_le_bytes(p[42..46].try_into().unwrap());
+                            let value = if p[46] == 255 && p.len() == 47 {
+                                None
+                            } else {
+                                let (value, n) = decode_value(&p[46..]).ok_or(InvalidFrame)?;
+                                if n != p.len() - 46 {
+                                    return Err(InvalidFrame);
+                                }
+                                Some(value)
+                            };
+                            StateReadResult::Value { sequence, value }
+                        }
+                        (1, 42) => StateReadResult::UnknownAttribute,
+                        (2, 42) => StateReadResult::Busy,
+                        _ => return Err(InvalidFrame),
+                    };
+                    Content::StateValue {
+                        network,
+                        read,
+                        result,
+                        hops: scope,
+                    }
+                }
+            }
+            (13, 19, Some(_)) => {
+                let network = Network {
+                    founder: u64::from_le_bytes(p[5..13].try_into().unwrap()),
+                    channel: p[13],
+                };
+                if !network.valid() || network.channel != channel {
+                    return Err(InvalidFrame);
+                }
+                let phase = match p[14] {
+                    0 => LinkPhase::Offer,
+                    1 => LinkPhase::Accept,
+                    2 => LinkPhase::Confirm,
+                    3 => LinkPhase::Reject,
+                    _ => return Err(InvalidFrame),
+                };
+                let token = u32::from_le_bytes(p[15..19].try_into().unwrap());
+                if token == 0 {
+                    return Err(InvalidFrame);
+                }
+                Content::LinkExchange {
+                    network,
+                    phase,
+                    token,
+                }
+            }
+            (14, 49, _) | (15, 54 | 64, Some(_)) => {
+                let network = Network {
+                    founder: u64::from_le_bytes(p[5..13].try_into().unwrap()),
+                    channel: p[13],
+                };
+                let read = LinkRead::decode(&p[14..48]);
+                let scope = p[48];
+                if !network.valid()
+                    || network.channel != channel
+                    || !valid_address(read.reader)
+                    || !valid_address(read.owner)
+                    || read.reader == read.owner
+                    || (read.via != 0
+                        && (!valid_address(read.via)
+                            || read.via == read.reader
+                            || read.via == read.owner))
+                    || !(1..=MAX_HOPS).contains(&scope)
+                {
+                    return Err(InvalidFrame);
+                }
+                if p[4] == 14 {
+                    if scope == MAX_HOPS && source != read.reader {
+                        return Err(InvalidFrame);
+                    }
+                    Content::ReadLinks {
+                        network,
+                        read,
+                        remaining: scope,
+                    }
+                } else {
+                    if scope == 1 && source != read.owner {
+                        return Err(InvalidFrame);
+                    }
+                    let revision = u32::from_le_bytes(p[49..53].try_into().unwrap());
+                    let link = match (p[53], p.len()) {
+                        (0, 54) => None,
+                        (1, 64) => {
+                            let peer = u64::from_le_bytes(p[54..62].try_into().unwrap());
+                            let round_trip_ms = u16::from_le_bytes(p[62..64].try_into().unwrap());
+                            if !valid_address(peer)
+                                || peer == read.owner
+                                || peer <= read.after
+                                || round_trip_ms == 0
+                            {
+                                return Err(InvalidFrame);
+                            }
+                            Some(PeerLink {
+                                peer,
+                                round_trip_ms,
+                            })
+                        }
+                        _ => return Err(InvalidFrame),
+                    };
+                    Content::LinkEntry {
+                        network,
+                        read,
+                        revision,
+                        link,
+                        hops: scope,
+                    }
+                }
+            }
             _ => return Err(InvalidFrame),
         };
         Ok(Self {
@@ -584,6 +890,43 @@ impl Invocation {
             owner: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
             request: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
             transformer: u64::from_le_bytes(bytes[20..28].try_into().unwrap()),
+        }
+    }
+}
+
+impl LinkRead {
+    fn encode(self, out: &mut [u8]) {
+        out[..8].copy_from_slice(&self.reader.to_le_bytes());
+        out[8..16].copy_from_slice(&self.owner.to_le_bytes());
+        out[16..18].copy_from_slice(&self.request.to_le_bytes());
+        out[18..26].copy_from_slice(&self.after.to_le_bytes());
+        out[26..34].copy_from_slice(&self.via.to_le_bytes());
+    }
+    fn decode(bytes: &[u8]) -> Self {
+        Self {
+            reader: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            owner: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            request: u16::from_le_bytes(bytes[16..18].try_into().unwrap()),
+            after: u64::from_le_bytes(bytes[18..26].try_into().unwrap()),
+            via: u64::from_le_bytes(bytes[26..34].try_into().unwrap()),
+        }
+    }
+}
+
+impl StateRead {
+    fn encode(self, out: &mut [u8]) {
+        out[..8].copy_from_slice(&self.reader.to_le_bytes());
+        out[8..16].copy_from_slice(&self.owner.to_le_bytes());
+        out[16..18].copy_from_slice(&self.request.to_le_bytes());
+        out[18..26].copy_from_slice(&self.attribute.to_le_bytes());
+    }
+
+    fn decode(bytes: &[u8]) -> Self {
+        Self {
+            reader: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            owner: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            request: u16::from_le_bytes(bytes[16..18].try_into().unwrap()),
+            attribute: u64::from_le_bytes(bytes[18..26].try_into().unwrap()),
         }
     }
 }
@@ -731,6 +1074,384 @@ mod tests {
     use super::*;
     const A: u64 = 0x0102_0304_0506_0708;
     const B: u64 = 0x1112_1314_1516_1718;
+
+    #[test]
+    fn link_exchange_and_cursor_records_fit_individual_frames_and_validate_direction() {
+        let network = Network {
+            founder: 99,
+            channel: 15,
+        };
+        let read = LinkRead {
+            reader: A,
+            owner: B,
+            request: 0x1234,
+            after: 0,
+            via: A + 1,
+        };
+        let mut wire = [0; MAX_FRAME_SIZE];
+        for phase in [
+            LinkPhase::Offer,
+            LinkPhase::Accept,
+            LinkPhase::Confirm,
+            LinkPhase::Reject,
+        ] {
+            let message = Message {
+                source: A,
+                destination: Some(B),
+                content: Content::LinkExchange {
+                    network,
+                    phase,
+                    token: 0x04030201,
+                },
+            };
+            let n = message.encode(7, &mut wire);
+            assert_eq!(n, 40);
+            assert_eq!(
+                &wire[21..n],
+                &[
+                    b'L',
+                    b'V',
+                    b'T',
+                    5,
+                    13,
+                    99,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    15,
+                    phase as u8,
+                    1,
+                    2,
+                    3,
+                    4
+                ]
+            );
+            assert_eq!(Message::decode(&wire[..n], B, 15).unwrap(), message);
+            for end in 0..n {
+                assert!(Message::decode(&wire[..end], B, 15).is_err());
+            }
+            assert!(Message::decode(&wire[..n + 1], B, 15).is_err());
+            let mut bad = wire;
+            bad[21 + 14] = 4;
+            assert!(Message::decode(&bad[..n], B, 15).is_err());
+            bad = wire;
+            bad[21 + 15..n].fill(0);
+            assert!(Message::decode(&bad[..n], B, 15).is_err());
+            let n = Message {
+                destination: None,
+                ..message
+            }
+            .encode(7, &mut wire);
+            assert!(Message::decode(&wire[..n], B, 15).is_err());
+        }
+        let query = Message {
+            source: A,
+            destination: Some(B),
+            content: Content::ReadLinks {
+                network,
+                read,
+                remaining: 8,
+            },
+        };
+        let n = query.encode(1, &mut wire);
+        assert_eq!(n, 70);
+        assert_eq!(
+            &wire[21..n],
+            &[
+                b'L', b'V', b'T', 5, 14, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
+                23, 22, 21, 20, 19, 18, 17, 0x34, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 9, 7, 6, 5, 4, 3,
+                2, 1, 8,
+            ]
+        );
+        for link in [
+            None,
+            Some(PeerLink {
+                peer: A,
+                round_trip_ms: 3,
+            }),
+        ] {
+            let reply = Message {
+                source: B,
+                destination: Some(A),
+                content: Content::LinkEntry {
+                    network,
+                    read,
+                    revision: 0x04030201,
+                    link,
+                    hops: 1,
+                },
+            };
+            for message in [query, reply] {
+                let local = message.destination.unwrap();
+                let n = message.encode(1, &mut wire);
+                assert_eq!(
+                    n,
+                    if local == B {
+                        70
+                    } else if link.is_some() {
+                        85
+                    } else {
+                        75
+                    }
+                );
+                assert_eq!(Message::decode(&wire[..n], local, 15).unwrap(), message);
+                for end in 0..n {
+                    assert!(Message::decode(&wire[..end], local, 15).is_err());
+                }
+                assert!(Message::decode(&wire[..n + 1], local, 15).is_err());
+                assert!(Message::decode(&wire[..n], local, 16).is_err());
+                for hop in [0, 9] {
+                    let mut bad = wire;
+                    bad[21 + 48] = hop;
+                    assert!(Message::decode(&bad[..n], local, 15).is_err());
+                }
+                for via in [A, B, u64::MAX] {
+                    let mut bad = wire;
+                    bad[21 + 40..21 + 48].copy_from_slice(&via.to_le_bytes());
+                    assert!(Message::decode(&bad[..n], local, 15).is_err());
+                }
+            }
+            let n = reply.encode(2, &mut wire);
+            assert_eq!(&wire[21 + 49..21 + 53], &0x04030201u32.to_le_bytes());
+            let mut bad = wire;
+            bad[21 + 53] = 2;
+            assert!(Message::decode(&bad[..n], A, 15).is_err());
+            if link.is_some() {
+                for peer in [0, B, u64::MAX] {
+                    let mut bad = wire;
+                    bad[21 + 54..21 + 62].copy_from_slice(&peer.to_le_bytes());
+                    assert!(Message::decode(&bad[..n], A, 15).is_err());
+                }
+                let mut bad = wire;
+                bad[21 + 62..21 + 64].fill(0);
+                assert!(Message::decode(&bad[..n], A, 15).is_err());
+                bad = wire;
+                bad[21 + 32..21 + 40].copy_from_slice(&A.to_le_bytes());
+                assert!(
+                    Message::decode(&bad[..n], A, 15).is_err(),
+                    "cursor repeated a prior entry"
+                );
+            }
+            let n = Message {
+                destination: None,
+                ..reply
+            }
+            .encode(3, &mut wire);
+            assert!(Message::decode(&wire[..n], A, 15).is_err());
+            let n = Message {
+                source: A + 1,
+                ..reply
+            }
+            .encode(4, &mut wire);
+            assert!(
+                Message::decode(&wire[..n], A, 15).is_err(),
+                "non-owner claimed first hop"
+            );
+            let forwarded = Message {
+                source: A + 1,
+                content: Content::LinkEntry {
+                    network,
+                    read,
+                    revision: 1,
+                    link,
+                    hops: 2,
+                },
+                ..reply
+            };
+            let n = forwarded.encode(5, &mut wire);
+            assert_eq!(Message::decode(&wire[..n], A, 15).unwrap(), forwarded);
+        }
+        let n = Message {
+            destination: None,
+            content: Content::ReadLinks {
+                network,
+                read: LinkRead {
+                    via: 0,
+                    after: u64::MAX,
+                    ..read
+                },
+                remaining: 8,
+            },
+            ..query
+        }
+        .encode(6, &mut wire);
+        assert_eq!(n, 64);
+        assert!(Message::decode(&wire[..n], B, 15).is_ok());
+    }
+
+    #[test]
+    fn state_read_frames_are_complete_and_distinguish_values_from_failures() {
+        let network = Network {
+            founder: 99,
+            channel: 15,
+        };
+        let read = StateRead {
+            reader: A,
+            owner: B,
+            request: 0x1234,
+            attribute: 42,
+        };
+        let request = Message {
+            source: A,
+            destination: Some(B),
+            content: Content::ReadState {
+                network,
+                read,
+                remaining: 8,
+            },
+        };
+        let mut wire = [0; MAX_FRAME_SIZE];
+        let n = request.encode(7, &mut wire);
+        assert_eq!(n, 62);
+        assert_eq!(
+            &wire[21..n],
+            &[
+                b'L', b'V', b'T', 5, 11, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
+                23, 22, 21, 20, 19, 18, 17, 0x34, 0x12, 42, 0, 0, 0, 0, 0, 0, 0, 8,
+            ]
+        );
+        for (result, length, tag) in [
+            (StateReadResult::UnknownAttribute, 63, 1),
+            (StateReadResult::Busy, 63, 2),
+            (
+                StateReadResult::Value {
+                    sequence: 0,
+                    value: None,
+                },
+                68,
+                0,
+            ),
+            (
+                StateReadResult::Value {
+                    sequence: 0x04030201,
+                    value: Some(Value::boolean(false)),
+                },
+                69,
+                0,
+            ),
+            (
+                StateReadResult::Value {
+                    sequence: u32::MAX,
+                    value: Some(Value::integer(Integer::I64, i64::MIN as i128).unwrap()),
+                },
+                76,
+                0,
+            ),
+        ] {
+            let reply = Message {
+                source: B,
+                destination: Some(A),
+                content: Content::StateValue {
+                    network,
+                    read,
+                    result,
+                    hops: 1,
+                },
+            };
+            let n = reply.encode(8, &mut wire);
+            assert_eq!(n, length);
+            assert_eq!(wire[21 + 41], tag);
+            if let StateReadResult::Value { sequence, .. } = result {
+                assert_eq!(&wire[21 + 42..21 + 46], &sequence.to_le_bytes());
+            }
+            for message in [request, reply] {
+                let local = message.destination.unwrap();
+                let n = message.encode(1, &mut wire);
+                assert_eq!(Message::decode(&wire[..n], local, 15).unwrap(), message);
+                for end in 0..n {
+                    assert!(Message::decode(&wire[..end], local, 15).is_err());
+                }
+                assert!(Message::decode(&wire[..n + 1], local, 15).is_err());
+                assert!(Message::decode(&wire[..n], local, 16).is_err());
+                for range in [14..22, 22..30, 32..40] {
+                    for byte in [0, 255] {
+                        let mut bad = wire;
+                        bad[21 + range.start..21 + range.end].fill(byte);
+                        assert!(Message::decode(&bad[..n], local, 15).is_err());
+                    }
+                }
+                for hop in [0, 9] {
+                    let mut bad = wire;
+                    bad[21 + 40] = hop;
+                    assert!(Message::decode(&bad[..n], local, 15).is_err());
+                }
+                let forwarded = Message {
+                    source: B + 1,
+                    content: match message.content {
+                        Content::ReadState { network, read, .. } => Content::ReadState {
+                            network,
+                            read,
+                            remaining: 7,
+                        },
+                        Content::StateValue {
+                            network,
+                            read,
+                            result,
+                            ..
+                        } => Content::StateValue {
+                            network,
+                            read,
+                            result,
+                            hops: 2,
+                        },
+                        _ => unreachable!(),
+                    },
+                    ..message
+                };
+                let n = forwarded.encode(2, &mut wire);
+                assert_eq!(Message::decode(&wire[..n], local, 15).unwrap(), forwarded);
+                wire[21 + 40] = if local == B { 8 } else { 1 };
+                assert!(
+                    Message::decode(&wire[..n], local, 15).is_err(),
+                    "forged first hop accepted"
+                );
+            }
+            let n = reply.encode(3, &mut wire);
+            wire[21 + 41] = 3;
+            assert!(Message::decode(&wire[..n], A, 15).is_err());
+            let n = Message {
+                destination: None,
+                ..reply
+            }
+            .encode(4, &mut wire);
+            assert!(
+                Message::decode(&wire[..n], A, 15).is_err(),
+                "state read result broadcast"
+            );
+        }
+        let n = Message {
+            destination: None,
+            ..request
+        }
+        .encode(5, &mut wire);
+        assert_eq!(n, 56);
+        assert!(Message::decode(&wire[..n], B, 15).is_ok());
+        let bad_value = Message {
+            source: B,
+            destination: Some(A),
+            content: Content::StateValue {
+                network,
+                read,
+                result: StateReadResult::Value {
+                    sequence: 1,
+                    value: Some(Value::boolean(true)),
+                },
+                hops: 1,
+            },
+        };
+        let n = bad_value.encode(6, &mut wire);
+        wire[21 + 47] = 2;
+        assert!(Message::decode(&wire[..n], A, 15).is_err());
+        wire[21 + 46] = 255;
+        assert!(
+            Message::decode(&wire[..n], A, 15).is_err(),
+            "unavailable value had trailing bytes"
+        );
+    }
 
     #[test]
     fn scalar_arguments_keep_width_signedness_and_fit_one_frame() {

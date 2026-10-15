@@ -35,7 +35,7 @@ network it hears; ownership selection between nearby deployments is not
 implemented. [Surface reads](EXPOSURE.md) now use bounded exploration and learned
 owner directions. Compact arrivals and owner queries now cross relays without sending
 complete surfaces.
-[Native invocation and registered state deltas](INVOCATION.md) now share that runtime.
+[Native invocation, state reads, and registered deltas](INVOCATION.md) now share that runtime.
 Compiled-fragment installation/activation and authenticated admission remain unimplemented.
 
 The on-air discovery profile is:
@@ -51,7 +51,9 @@ The on-air discovery profile is:
 | Size before hardware FCS | 20 bytes discovery; 35 bytes directed presence/proposal; 29 bytes broadcast proposal |
 
 The same envelope includes arrival (3), surface read (4), surface part (5),
-find owners (6), owner found (7), invocation (8), result (9), and state changed (10),
+find owners (6), owner found (7), invocation (8), result (9), state changed (10),
+read state (11), state value (12), link exchange (13), read links (14), and link
+entry (15),
 specified in [the exposure format](EXPOSURE.md#read-envelope). Reads are driven
 by an interested consumer; discovery never triggers full-surface publication.
 
@@ -78,9 +80,10 @@ The network record is volatile; reboot searches again. The founding peer is not
 required once another resident retains its record. Established nodes do not yet
 migrate channels in response to later interference.
 
-After selection, a compact arrival can cross relays. One owner query is sent
-after the first 2–3 second receive interval; its matching replies reveal owners
-and establish directions for later reads. Later periodic discovery stays link-local.
+After selection, a compact arrival can cross relays. Periodic discovery stays
+link-local and introduces candidates for the bounded link-maintenance exchange.
+There is no automatic owner query. [Link traversal](LINKS.md) lets interested peers
+follow references from one reachable contact; `FindOwners` remains explicit.
 Presence ends that local exchange; there is no
 echo loop, neighbor registry, graph retry, or allocation. Unsupported versions,
 foreign PAN/payloads, self frames, wrong recipients, truncation, trailing payload,
@@ -123,7 +126,8 @@ the range/forwarding checks. Two passive observers do not initiate reads.
 ## Validation scope
 
 The current version-5 kernel has host/build validation. Native calls, relayed
-surface reads, owner discovery, and deltas have deterministic host checks; their
+surface/current-state reads, reciprocal link maintenance, guided traversal, owner
+discovery, and deltas have deterministic host checks; their
 complete tablet-to-appliance path still needs hardware validation. Earlier images
 exercised channel formation and peer exchange on C6 and Nordic. Those results do
 not establish the current wire version's end-to-end behavior or radio range.

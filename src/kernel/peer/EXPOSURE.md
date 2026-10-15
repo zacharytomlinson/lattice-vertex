@@ -4,7 +4,7 @@ Appliance firmware binds its static `Surface` and native device in `kernel::Appl
 then passes that binding to `kernel::start(context, radio, &APPLIANCE)`.
 The kernel borrows its definitions;
 `exposure::Description` emits requested ranges without a second resident IR copy.
-No state reader, native transformer, or IR expression executes during a read.
+No state reader, native transformer, or IR expression executes during a surface read.
 
 Arrivals carry compact owner metadata across relays. Joining, periodic link
 discovery, and receiving another arrival never broadcast complete surfaces. A
@@ -12,8 +12,22 @@ bounded owner search locates preexisting appliances. Any interested peer can req
 range from a known owner. There is no privileged nucleus read API. Ordinary
 vertices serve their own definitions and relay reads/replies, retaining no foreign
 IR. The tablet/nucleus consumer, content-based lookup, and surface reconstruction
-are not implemented here. [Native invocation and registered deltas](INVOCATION.md) use separate messages;
-reads continue to expose immutable mathematics only.
+are not implemented here. [Native control and current-state reads](INVOCATION.md)
+use separate messages; surface reads continue to expose immutable mathematics only.
+
+## Progressive discovery direction
+
+The accepted direction is a built-in `ReadLinks` operation over the kernel's
+maintained reciprocal peer relationships. An interested peer starts from a nearby
+vertex and follows references, reading appliance surfaces along the way. This
+requires explicit forwarding through the vertex that supplied a new reference;
+a remote address alone does not establish a radio path. The local destination
+cache is not the enumerable topology. See the
+[kernel direction](../../../docs/KERNEL_DIRECTION.md#maintained-peer-links-and-progressive-discovery).
+
+Maintained links and guided traversal are implemented in the common runtime;
+see [the link protocol](LINKS.md). Startup performs local link maintenance;
+`FindOwners` remains an explicit bounded search when an interested peer needs it.
 
 ## Owner discovery
 
@@ -23,8 +37,8 @@ owner and sequence while using its own MAC source address; a recent-notice recor
 suppresses duplicate copies. Arrival only reports the owner. It never causes a
 surface read, another announcement, or another owner search.
 
-One normal discovery interval later (2–3 seconds), the joining vertex sends one
-`FindOwners` query. Each reached vertex remembers the first incoming neighbor,
+An interested peer can send a `FindOwners` query. Each reached vertex remembers
+the first incoming neighbor,
 returns its own compact `OwnerFound` reply, and forwards the query if scope remains.
 Replies from multiple owners follow that same reverse path. Duplicate reply keys
 include both query and owner, so the first reply does not suppress other owners.
@@ -32,7 +46,8 @@ Matching replies install owner directions in the same cache used by surface read
 hearing an unsolicited arrival does not confirm a usable reverse direction.
 
 Ordinary periodic channel/network discovery remains link-local. No periodic
-network-wide owner scan or full owner catalog is introduced. Interested peers can
+network-wide owner scan or full owner catalog is introduced. Its existing interval
+also initiates bounded link maintenance. Interested peers can
 issue additional owner queries with fresh tokens. Results are incremental: this
 protocol has no claim that every owner has replied or that a missing owner is absent.
 No description body is sent until an interested peer requests a range.
@@ -46,9 +61,11 @@ complete response frame along that reverse path. The matching response teaches
 relays which neighbor leads toward the owner. The MAC source identifies the
 immediate sender; the range record retains the original reader and actual owner.
 
-The shared forwarder holds three learned owner directions, eight recent read paths,
+The shared forwarder holds three learned owner directions, eight recent paths shared
+by surface and current-state reads,
 four owner-query return paths, eight recent owner notices, four invocation paths,
-and eight delta duplicate keys, with a compile-time ceiling of 1,536 bytes.
+eight delta duplicate keys, and eight maintained adjacent-peer records, within a
+2,048-byte compile-time ceiling. Link enumeration shares the same read paths.
 Invocation paths retain exact argument bytes; no foreign definitions are retained.
 Read/query/notice records expire after 10 seconds, confirmed directions after 60 seconds without another
 matching reply; expiry uses wrapping millisecond arithmetic. Full storage evicts
@@ -59,7 +76,8 @@ retry, route-quality optimizer, guaranteed delivery, or acknowledgement of
 executable work in this slice.
 
 A reader must use a fresh 16-bit request token for each attempt, including a retry
-of the same range. It must not reuse a token within the retained window. Relays
+of the same range. Tokens must be fresh across surface, current-state, and link reads
+within the retained window. Relays
 suppress duplicate reader/token pairs without confusing separate range requests;
 responses must match the reader, owner, request token, and offset. Full storage or
 reboot can shorten duplicate retention, so the eight-hop bound remains necessary.
@@ -78,8 +96,10 @@ exactly-once delivery or complete membership protocol. Mutation calls have separ
 ## Read envelope
 
 `LVT` **version 5** retains version-4 discovery, arrival, owner-query, and range-read
-layouts (opcodes 0–7), and adds native invocation/result and state deltas (8–10).
-Earlier versions do not interoperate. MAC framing still uses numeric 2006 data frames,
+layouts (opcodes 0–7), native invocation/result and deltas (8–10), and current-state
+read/result (11–12). Link maintenance and enumeration add opcodes 13–15 as specified
+in [LINKS.md](LINKS.md#wire-format). These extensions preserve existing v5 layouts;
+older version-5 images ignore unsupported opcodes. Earlier versions do not interoperate. MAC framing still uses numeric 2006 data frames,
 compressed PAN `0x4c56`, extended source, and broadcast or extended destination.
 No MAC ACK is requested. Integers are little-endian.
 

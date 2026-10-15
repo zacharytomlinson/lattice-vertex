@@ -85,6 +85,13 @@ pub(crate) fn record(instance: *const (), attribute: u64, value: Option<Value>) 
 pub(crate) fn pending() -> bool {
     access(|out| out.count != 0)
 }
+
+/// Latest registered local change, including records already sent or evicted.
+/// Sample with the appliance mutex held when pairing this watermark with state.
+pub(crate) fn sequence() -> u32 {
+    access(|out| out.sequence)
+}
+
 pub(crate) fn take() -> Option<Change> {
     access(|out| {
         if out.count == 0 {

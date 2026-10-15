@@ -83,7 +83,12 @@ fn consider(content: Content<'_>, proposal: &mut Option<Network>) -> Option<Netw
         | Content::OwnerFound { .. }
         | Content::Invoke { .. }
         | Content::InvocationResult { .. }
-        | Content::StateChanged { .. } => None,
+        | Content::StateChanged { .. }
+        | Content::ReadState { .. }
+        | Content::StateValue { .. }
+        | Content::LinkExchange { .. }
+        | Content::ReadLinks { .. }
+        | Content::LinkEntry { .. } => None,
     }
 }
 

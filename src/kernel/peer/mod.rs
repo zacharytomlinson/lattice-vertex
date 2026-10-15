@@ -1,4 +1,4 @@
-//! Common formation, discovery, surface reads, native calls, and state deltas.
+//! Common formation, maintained links, traversal, reads, native calls, and deltas.
 //! Residents share the channel choice; the original founder has no special
 //! runtime role. This initial protocol has no authenticated admission mechanism.
 
@@ -8,6 +8,7 @@ mod forwarding;
 pub(crate) mod frame;
 #[cfg(feature = "use-mutexes")]
 mod invocation;
+mod links;
 
 use frame::{Content, Message};
 
@@ -71,9 +72,6 @@ pub(crate) fn run(
     send(radio, arrival, &mut sequence, &mut outgoing);
     let period = crate::milliseconds_to_ticks_checked(2_000 + local % 997).unwrap();
     let mut last_discovery = started;
-    // One owner search after the arrival has had a receive interval to spread.
-    // Later wakeups retain the small link-local formation/discovery exchange.
-    let mut find_owners = true;
     loop {
         let now = tasks::xTaskGetTickCount();
         let milliseconds = ((now as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
@@ -89,22 +87,37 @@ pub(crate) fn run(
         }
         if now.wrapping_sub(last_discovery) >= period {
             last_discovery = now;
-            let message = if find_owners {
-                find_owners = false;
-                forwarder.find_owners(now as u16, milliseconds)
-            } else {
-                Message {
-                    source: local,
-                    destination: None,
-                    content: Content::Discover,
-                }
+            let message = Message {
+                source: local,
+                destination: None,
+                content: Content::Discover,
             };
             send(radio, message, &mut sequence, &mut outgoing);
+            if let Some(exchange) = forwarder.maintain_links(milliseconds) {
+                send(radio, exchange, &mut sequence, &mut outgoing);
+            }
         }
         let timeout =
             period.saturating_sub(tasks::xTaskGetTickCount().wrapping_sub(last_discovery));
         if let Some(message) = receive(radio, local, network.channel, &mut buffer, timeout) {
-            if matches!(message.content, Content::Invoke { network: n, .. }
+            if let Content::LinkExchange { network: n, .. } = message.content {
+                if n == network {
+                    let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
+                        / crate::configTICK_RATE_HZ as u64) as u32;
+                    if let Some(reply) = forwarder.receive_link(message, now) {
+                        send(radio, reply, &mut sequence, &mut outgoing);
+                    }
+                }
+            } else if matches!(message.content, Content::ReadLinks {network:n,..} | Content::LinkEntry {network:n,..} if n==network)
+            {
+                let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
+                    / crate::configTICK_RATE_HZ as u64) as u32;
+                if let Some(reply) = forwarder.receive_links(message, now) {
+                    if !send(radio, reply, &mut sequence, &mut outgoing) {
+                        forwarder.transmit_failed(&reply);
+                    }
+                }
+            } else if matches!(message.content, Content::Invoke { network: n, .. }
                 | Content::InvocationResult { network: n, .. } if n == network)
             {
                 let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
@@ -116,6 +129,18 @@ pub(crate) fn run(
                 if let Some(reply) = forwarder.receive_control(message, now, |call, arguments| {
                     invocations.invoke(native, &context, call, arguments)
                 }) {
+                    if !send(radio, reply, &mut sequence, &mut outgoing) {
+                        forwarder.transmit_failed(&reply);
+                    }
+                }
+            } else if matches!(message.content, Content::ReadState { network: n, .. }
+                | Content::StateValue { network: n, .. } if n == network)
+            {
+                let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
+                    / crate::configTICK_RATE_HZ as u64) as u32;
+                if let Some(reply) = forwarder
+                    .receive_state(message, now, |attribute| native.read(&context, attribute))
+                {
                     if !send(radio, reply, &mut sequence, &mut outgoing) {
                         forwarder.transmit_failed(&reply);
                     }
@@ -212,6 +237,9 @@ pub(crate) fn run(
             } else if let Some(reply) = discovery_response(local, &message, network, true) {
                 send(radio, reply, &mut sequence, &mut outgoing);
             } else if message.content == Content::Present(network) {
+                let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
+                    / crate::configTICK_RATE_HZ as u64) as u32;
+                forwarder.record_presence(message.source, now);
                 #[cfg(feature = "test-support")]
                 super::radio::testing::event(
                     super::radio::testing::Event::DiscoveryResponseReceived(message.source),
@@ -258,6 +286,12 @@ fn send(
                     value: delta.value,
                     evicted: crate::kernel::change::evicted(),
                 },
+                // This successful send needs no dedicated fixture counter.
+                Content::ReadState { .. }
+                | Content::StateValue { .. }
+                | Content::LinkExchange { .. }
+                | Content::ReadLinks { .. }
+                | Content::LinkEntry { .. } => return true,
                 Content::ReadSurface { .. } => Event::SurfaceReadForwarded,
                 Content::SurfacePart {
                     read, total, bytes, ..

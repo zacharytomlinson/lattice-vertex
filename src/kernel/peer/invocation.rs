@@ -235,6 +235,169 @@ mod tests {
     }
 
     #[test]
+    fn state_reads_report_established_values_without_dispatching_or_consuming_deltas() {
+        use super::super::frame::StateReadResult;
+        let f = Fixture::new();
+        let attribute = core::ptr::from_ref(POWER.definition()) as usize as u64;
+        assert_eq!(
+            f.device.read(&f.context, attribute),
+            StateReadResult::Value {
+                sequence: 0,
+                value: None
+            }
+        );
+        for unknown in [
+            0,
+            123,
+            core::ptr::from_ref(HIDDEN.definition()) as usize as u64,
+            core::ptr::from_ref(&SET) as usize as u64,
+        ] {
+            assert_eq!(
+                f.device.read(&f.context, unknown),
+                StateReadResult::UnknownAttribute
+            );
+        }
+        f.device.with(&f.context, |_| {
+            assert_eq!(f.device.read(&f.context, attribute), StateReadResult::Busy)
+        });
+        assert!(!change::pending());
+        let mut invocations = Invocations::new();
+        assert_eq!(
+            invocations.invoke(f.device, &f.context, call(1), ON),
+            InvokeStatus::Invoked
+        );
+        assert_eq!(
+            f.device.read(&f.context, attribute),
+            StateReadResult::Value {
+                sequence: 0,
+                value: None
+            }
+        );
+        f.device.with(&f.context, |a| {
+            POWER.update(a, |a| a.observed = Some(false))
+        });
+        for _ in 0..2 {
+            assert_eq!(
+                f.device.read(&f.context, attribute),
+                StateReadResult::Value {
+                    sequence: 1,
+                    value: Some(Value::boolean(false))
+                }
+            );
+        }
+        assert_eq!(
+            change::take().unwrap().sequence,
+            1,
+            "read consumed or registered a delta"
+        );
+        assert!(!change::pending());
+        assert_eq!(f.calls(), 1, "read invoked a transformer");
+        // Other attributes can advance the watermark without changing this value.
+        f.device
+            .with(&f.context, |a| OTHER.update(a, |a| a.other = true));
+        assert_eq!(
+            f.device.read(&f.context, attribute),
+            StateReadResult::Value {
+                sequence: 2,
+                value: Some(Value::boolean(false))
+            }
+        );
+        f.device
+            .with(&f.context, |a| POWER.update(a, |a| a.observed = None));
+        let records = drain();
+        assert_eq!(
+            f.device.read(&f.context, attribute),
+            StateReadResult::Value {
+                sequence: 3,
+                value: None
+            }
+        );
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn state_reply_crosses_two_relays_and_keeps_its_value_when_a_newer_delta_arrives() {
+        use super::super::frame::{StateRead, StateReadResult};
+        let f = Fixture::new();
+        f.device.with(&f.context, |a| {
+            POWER.update(a, |a| a.observed = Some(false))
+        });
+        let mut relay_a = Forwarder::new(2, NETWORK);
+        let mut relay_b = Forwarder::new(3, NETWORK);
+        let mut owner = Forwarder::new(4, NETWORK);
+        let read = StateRead {
+            reader: 1,
+            owner: 4,
+            request: 7,
+            attribute: core::ptr::from_ref(POWER.definition()) as usize as u64,
+        };
+        let mut message = Message {
+            source: 1,
+            destination: None,
+            content: Content::ReadState {
+                network: NETWORK,
+                read,
+                remaining: 8,
+            },
+        };
+        let mut wire = [0; crate::kernel::radio::MAX_FRAME_SIZE];
+        for (address, node) in [(2, &mut relay_a), (3, &mut relay_b), (4, &mut owner)] {
+            let n = message.encode(0, &mut wire);
+            let incoming = Message::decode(&wire[..n], address, 15).unwrap();
+            message = node
+                .receive_state(incoming, 0, |attribute| {
+                    assert_eq!(address, 4, "relay read its own appliance");
+                    f.device.read(&f.context, attribute)
+                })
+                .unwrap();
+        }
+        let baseline = StateReadResult::Value {
+            sequence: 1,
+            value: Some(Value::boolean(false)),
+        };
+        assert!(matches!(message.content,Content::StateValue {result,..} if result==baseline));
+        // A delayed reply must retain the value/watermark sampled at the owner.
+        f.device
+            .with(&f.context, |a| POWER.update(a, |a| a.observed = Some(true)));
+        let deltas = drain();
+        assert_eq!(
+            (deltas[1].sequence, deltas[1].value),
+            (2, Some(Value::boolean(true)))
+        );
+        for (address, node) in [(3, &mut relay_b), (2, &mut relay_a)] {
+            let n = message.encode(1, &mut wire);
+            let incoming = Message::decode(&wire[..n], address, 15).unwrap();
+            message = node
+                .receive_state(incoming, 1, |_| panic!("relay read native state"))
+                .unwrap();
+        }
+        let n = message.encode(2, &mut wire);
+        let received = Message::decode(&wire[..n], 1, 15).unwrap();
+        assert_eq!(received.destination, Some(1));
+        assert!(
+            matches!(received.content,Content::StateValue {result,hops:3,..} if result==baseline)
+        );
+        assert_eq!(f.calls(), 0);
+        let next = Message {
+            source: 1,
+            destination: None,
+            content: Content::ReadState {
+                network: NETWORK,
+                read: StateRead { request: 8, ..read },
+                remaining: 8,
+            },
+        };
+        assert_eq!(
+            relay_a
+                .receive_state(next, 2, |_| panic!())
+                .unwrap()
+                .destination,
+            Some(3)
+        );
+        assert!(!change::pending());
+    }
+
+    #[test]
     fn routed_native_call_replays_result_and_only_reports_established_state() {
         let f = Fixture::new();
         let mut invocations = Invocations::new();

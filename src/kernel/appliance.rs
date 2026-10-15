@@ -1,6 +1,10 @@
 //! Resident appliance storage and synchronized native dispatch.
 
-use super::{peer::frame::InvokeStatus, queue::StaticQueue_t, tasks};
+use super::{
+    peer::frame::{InvokeStatus, StateReadResult},
+    queue::StaticQueue_t,
+    tasks,
+};
 use crate::{
     ir::Value,
     surface::{InvokeError, Surface},
@@ -103,6 +107,7 @@ impl<A: Send, E> Appliance<A, E> {
 pub(crate) trait Native: Sync {
     fn ready(&self) -> bool;
     fn owns(&self, instance: *const (), attribute: u64) -> bool;
+    fn read(&self, context: &TaskContext, attribute: u64) -> StateReadResult;
     fn invoke(&self, context: &TaskContext, transformer: u64, arguments: &[Value]) -> InvokeStatus;
 }
 
@@ -118,6 +123,25 @@ impl<A: Send, E> Native for Appliance<A, E> {
                 .iter()
                 .any(|s| ptr::from_ref(s.definition()) as usize as u64 == attribute)
     }
+    fn read(&self, context: &TaskContext, attribute: u64) -> StateReadResult {
+        let Some(state) = self
+            .surface
+            .states
+            .iter()
+            .find(|s| ptr::from_ref(s.definition()) as usize as u64 == attribute)
+        else {
+            return StateReadResult::UnknownAttribute;
+        };
+        let Some(guard) = self.native().try_lock(context) else {
+            return StateReadResult::Busy;
+        };
+        // Hold the same mutex used for observation updates while reading the
+        // value and its change watermark. A read neither registers nor drains deltas.
+        let value = state.read(&guard);
+        let sequence = super::change::sequence();
+        StateReadResult::Value { sequence, value }
+    }
+
     fn invoke(&self, context: &TaskContext, transformer: u64, arguments: &[Value]) -> InvokeStatus {
         let Some(handle) = self
             .surface
