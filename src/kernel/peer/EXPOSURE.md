@@ -1,53 +1,128 @@
-# Arrival-triggered surface publication
+# Owner discovery and surface reads
 
-Appliance firmware passes its existing static `Surface` to
-`kernel::start(context, radio, &SURFACE)`. The kernel borrows the definitions and
-publishes them after network selection. Firmware supplies no exposure packet
-handler, polling loop, remote registry, or additional networking trait.
+Appliance firmware binds its static `Surface` and native device in `kernel::Appliance`,
+then passes that binding to `kernel::start(context, radio, &APPLIANCE)`.
+The kernel borrows its definitions;
+`exposure::Description` emits requested ranges without a second resident IR copy.
+No state reader, native transformer, or IR expression executes during a read.
 
-Every vertex follows the same path:
+Arrivals carry compact owner metadata across relays. Joining, periodic link
+discovery, and receiving another arrival never broadcast complete surfaces. A
+bounded owner search locates preexisting appliances. Any interested peer can request a
+range from a known owner. There is no privileged nucleus read API. Ordinary
+vertices serve their own definitions and relay reads/replies, retaining no foreign
+IR. The tablet/nucleus consumer, content-based lookup, and surface reconstruction
+are not implemented here. [Native invocation and registered deltas](INVOCATION.md) use separate messages;
+reads continue to expose immutable mathematics only.
 
-1. After joining/forming, broadcast one arrival announcement and publish its own
-   surface.
-2. On an arrival from the same network, publish its own surface for the newcomer.
-3. Accept surface pieces transiently. Ordinary vertices currently discard their
-   contents after frame validation; the test observer consumes them synchronously.
+## Owner discovery
 
-Periodic discovery and received surface pieces never trigger publication. An
-arrival while a publication is active requests one subsequent complete pass, so
-a newcomer does not receive only its tail. Several arrivals before that pass may
-share it: these are identical immutable definitions, not distinct state deltas.
-Neither nucleus nor a founding vertex has privileged exposure behavior.
+Each vertex announces its address and encoded description length after joining.
+That arrival notice travels up to eight links. Every relay preserves the original
+owner and sequence while using its own MAC source address; a recent-notice record
+suppresses duplicate copies. Arrival only reports the owner. It never causes a
+surface read, another announcement, or another owner search.
 
-Definitions describe the appliance's mathematics. No state reader, native
-transformer, or IR evaluator runs while encoding. Current values and their deltas
-are a separate, not-yet-connected communication path. Nucleus can retain and
-interpret descriptions for synthesis; ordinary vertices do not mirror them.
+One normal discovery interval later (2–3 seconds), the joining vertex sends one
+`FindOwners` query. Each reached vertex remembers the first incoming neighbor,
+returns its own compact `OwnerFound` reply, and forwards the query if scope remains.
+Replies from multiple owners follow that same reverse path. Duplicate reply keys
+include both query and owner, so the first reply does not suppress other owners.
+Matching replies install owner directions in the same cache used by surface reads;
+hearing an unsolicited arrival does not confirm a usable reverse direction.
 
-## Publication envelope
+Ordinary periodic channel/network discovery remains link-local. No periodic
+network-wide owner scan or full owner catalog is introduced. Interested peers can
+issue additional owner queries with fresh tokens. Results are incremental: this
+protocol has no claim that every owner has replied or that a missing owner is absent.
+No description body is sent until an interested peer requests a range.
 
-The existing `LVT` version-2 envelope adds two opcodes. Both are broadcast data
-frames on the selected channel, with the common PAN filter and no requested MAC
-ACK. As with discovery, the network tag is not an authorization credential.
+## Read forwarding
 
-| Opcode | Bytes after the opcode |
-| --- | --- |
-| 3: arrival | Founding address `u64 LE`, channel `u8` |
-| 4: surface part | Founding address `u64 LE`, channel `u8`, publication sequence `u16 LE`, byte offset `u16 LE`, total length `u16 LE`, data |
+`forwarding.rs` is owned by the resident peer task. Unknown directions cause a
+bounded broadcast read; known directions use an addressed next hop. Each relay
+records the first incoming neighbor for a request, and the owner returns one
+complete response frame along that reverse path. The matching response teaches
+relays which neighbor leads toward the owner. The MAC source identifies the
+immediate sender; the range record retains the original reader and actual owner.
 
-Surface parts contain 84 bytes except the last, whose size is the exact remaining
-length. Offsets must be multiples of 84. A description has at least 13 bytes.
-The source MAC address scopes the publication sequence; it increments per local
-publication and wraps at 16 bits. This is provisional transfer framing, not a
-durable binding incarnation or authenticated replay boundary.
+The shared forwarder holds three learned owner directions, eight recent read paths,
+four owner-query return paths, eight recent owner notices, four invocation paths,
+and eight delta duplicate keys, with a compile-time ceiling of 1,536 bytes.
+Invocation paths retain exact argument bytes; no foreign definitions are retained.
+Read/query/notice records expire after 10 seconds, confirmed directions after 60 seconds without another
+matching reply; expiry uses wrapping millisecond arithmetic. Full storage evicts
+the oldest record. A failed addressed TX removes that direction. An expired
+unanswered read removes its unconfirmed direction unless a newer response has
+confirmed it. Subsequent requests then explore again. There is no automatic
+retry, route-quality optimizer, guaranteed delivery, or acknowledgement of
+executable work in this slice.
 
-The resident task sends one part at each local 7–13 ms pacing deadline and serves
-incoming frames between parts. An API-reported transmit failure abandons that
-pass; a later arrival can cause another publication. There is no receipt/retry
-protocol yet. Consumers must reject incomplete/gapped transfers. Merely hearing
-an arrival, receiving the last part, or seeing a local TX completion does not
-establish that a peer received the entire description. Forwarding and a nucleus
-consumer have not yet been connected.
+A reader must use a fresh 16-bit request token for each attempt, including a retry
+of the same range. It must not reuse a token within the retained window. Relays
+suppress duplicate reader/token pairs without confusing separate range requests;
+responses must match the reader, owner, request token, and offset. Full storage or
+reboot can shorten duplicate retention, so the eight-hop bound remains necessary.
+This identity is for immutable reads, not an exactly-once execution mechanism.
+
+Arrival and owner discovery now cross relays within the same eight-link bound.
+Channel formation remains link-local. Adaptive relay selection, content-addressed
+sharing, and installed-fragment delivery remain later extensions.
+The network tag and matching responses are not authentication credentials.
+Startup arrival/query tags use local tick values, not durable boot identities.
+A rapid restart or reused token may be suppressed by retained history. Retries
+use fresh tokens; history expiry bounds that suppression. This is not an
+exactly-once delivery or complete membership protocol. Mutation calls have separate
+[request/replay rules](INVOCATION.md#forwarding-and-duplicate-commands).
+
+## Read envelope
+
+`LVT` **version 5** retains version-4 discovery, arrival, owner-query, and range-read
+layouts (opcodes 0–7), and adds native invocation/result and state deltas (8–10).
+Earlier versions do not interoperate. MAC framing still uses numeric 2006 data frames,
+compressed PAN `0x4c56`, extended source, and broadcast or extended destination.
+No MAC ACK is requested. Integers are little-endian.
+
+Read and range-reply messages begin after their opcode with the network founder (`u64`) and
+channel (`u8`), followed by a `SurfaceRead`: reader (`u64`), owner (`u64`), request
+(`u16`), and byte offset (`u16`). These owner/reader addresses are not graph IDs.
+
+| Kind | Remaining fields | Delivery |
+| --- | --- | --- |
+| 4: read surface | Remaining hop budget (`u8`, 1–8) | Addressed along a learned direction, otherwise broadcast |
+| 5: surface part | Total encoded length (`u16`), distance from owner (`u8`, 1–8), bytes | Addressed along the recorded reverse path |
+
+A reader starts with hop budget 8 (or less); a relay decrements it. A node at
+budget 1 can answer for itself but cannot forward farther. The owner starts the
+reply distance at 1 and each relay increments it. A reply's largest addressed
+frame has a 21-byte MAC header, a 37-byte Lattice envelope, and **67 bytes of data**,
+fitting the 125-byte MAC limit before hardware FCS.
+
+Offsets need not be aligned. Each response contains exactly
+`min(67, total - offset)` bytes. Offset equal to total returns an empty terminal
+range; an owner ignores offsets beyond its description. The request fields,
+length, and frame checksum identify a complete individual range. Consumers still
+need all required ranges to reconstruct a complete definition and must handle
+missing replies. No whole-surface delivery is inferred from the final range.
+
+## Discovery envelope
+
+Arrival/query/reply payloads start with the same four-byte magic, opcode, founder
+(`u64`), and channel (`u8`). Remaining fields are:
+
+| Kind | Fields after network | MAC delivery | Total bytes before FCS |
+| --- | --- | --- | --- |
+| 3: arrival | Owner (`u64`), sequence (`u16`), description length (`u16`), distance (`u8`) | Broadcast | 42 |
+| 6: find owners | Seeker (`u64`), request (`u16`), remaining scope (`u8`) | Broadcast | 40 |
+| 7: owner found | Seeker (`u64`), request (`u16`), owner (`u64`), description length (`u16`), distance (`u8`) | Directed reverse path | 56 |
+
+The owner description length is at least 13 bytes. Arrival and owner replies start
+at distance 1 and relays increment it; an eight-link notice may be consumed but
+cannot travel farther. Queries start with scope 8 or less; scope 1 permits the
+local owner's reply but no additional forwarding. All messages fit one radio
+frame. Discovery return paths remain open for multiple owner replies until expiry
+or eviction. The node stores only recent duplicate keys and return directions,
+not the advertised descriptions or a record for every vertex in the network.
 
 ## Mathematical description encoding
 
@@ -108,31 +183,24 @@ surface. This is a transport/encoder bound, not a new IR language rule. Each par
 is generated by walking the immutable definitions up to that byte range. This
 trades repeated traversal for fixed RAM and avoids retaining an encoded copy.
 
-## Checks
+## Checks and current status
 
-Host tests compare an exact wire vector containing all four surface categories,
-shared definitions and direct state references, across several part sizes. They
-also check signed literals, expression control, depth/size rejection, canonical
-part framing, and finite publication progress. Native readers and transformers
-in that test panic if called, establishing that exposure doesn't invoke them.
+Peer tests exercise arrival and owner-query propagation across two relays,
+multiple independent owner replies, cyclic duplicate suppression, discovery
+followed by an addressed surface read, and expired/evicted discovery paths.
+Range-read checks cover cold exploration followed
+by directed reuse, duplicate paths and cycles, independent tokens, response
+correlation, hop limits, invalid owner offsets, bounded eviction, TX failure,
+expiry, and clock wrap. Existing encoder vectors still check the IR vocabulary
+and assert that native readers/transformers never execute. Random/repeated range
+reads are independent of any publication cursor.
 
-The port fixture's `peer-observer` feature supplies two small authored appliances:
-a switch (one state/transformer) or a dimmer (two states, one transformer, one axiom,
-one invariant). The board identity chooses which definition to use. Both enter
-the same normal kernel startup path. `SURFACE` output reports completed local
-publications and received transfers, a streaming FNV-1a checksum, and received
-category counts. The observer retains only the 13-byte header and transfer
-progress; it does not retain a received mathematical surface.
+The passive board observer supplies a switch or dimmer surface and logs
+`SURFACE_PART` ranges with reader, owner, token, offset, total, RSSI, and per-range
+checksum. Its counters count requests and parts, not completed surfaces. It
+originates no reads, and pairing two uninterested vertices intentionally produces
+no surface traffic. A consumer is needed to exercise reads on hardware.
 
-For two boards, compare A's `tx_hash` to B's `rx_hash` and vice versa, verify the
-opposite category counts, and verify that publication counts stop increasing
-while ordinary discovery continues. Start one later, then restart either to
-check reciprocal arrival-triggered exposure. Build without observer/probe features
-to exercise an explicitly empty surface with no test observer. FNV-1a here is
-only a test measurement, not a security checksum or transport authenticity check.
-
-Current validation: ten focused peer/encoding tests pass, as do C6 ordinary,
-observer and radio-probe builds and the Nordic observer build. The RF experiment
-also compiles through its existing test entry. No C6 USB serial devices were
-available for the new live publication check, so no boards were flashed for this
-change. Earlier discovery captures are not evidence of surface publication.
+RF/range investigation remains paused. This revision is validated by host tests
+and both MCU builds, not a new hardware run. Older broadcast-capture results do
+not validate the current version-5 behavior; see [validation scope](TESTING.md#validation-scope).

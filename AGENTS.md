@@ -45,10 +45,16 @@ Memory efficiency and readability are both requirements.
 - Use Redox and Bitcoin as references for clear responsibility-based organization.
   Let Lattice's implemented responsibilities determine its modules; add structure
   as the code needs it.
-- Treat `experiments/` as temporary bring-up scaffolding. Move reusable code into
-  platform ports and useful checks into kernel tests as integration proceeds,
-  then remove the directory. It is not part of the permanent kernel layout or
-  an acceptable dependency of the kernel runtime.
+- Keep one-off experiments outside this repository. Local `experiments/` and
+  `lab/` directories are ignored as a backstop and must never be committed or
+  packaged. Kernel code, tests, and build dependencies must not refer to them.
+- Retain portable behavior checks and reproducible port tests beside their owners.
+  Board-specific linker/upload support for those tests is legitimate; RF diaries,
+  vendor A/B images, flash capture recorders, and appliance integration prototypes
+  belong in a separate local lab. Archive useful experiments before removing them.
+- Test-only feature gates do not make experimental code permanent kernel API.
+  Keep only the hooks used by maintained kernel checks. Generic tests/examples must
+  not require unrelated appliance firmware repositories.
 
 ## Review after each meaningful change
 

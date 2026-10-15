@@ -27,6 +27,12 @@
 //! - `event_groups` - Event group synchronization
 //! - `stream_buffer` - Optional stream and message buffers
 
+#[cfg(feature = "use-mutexes")]
+mod appliance;
+#[cfg(feature = "use-mutexes")]
+pub use appliance::Appliance;
+#[cfg(feature = "use-mutexes")]
+pub(crate) mod change;
 pub mod event_groups;
 pub mod list;
 pub(crate) mod peer;
@@ -42,21 +48,23 @@ pub mod timers;
 /// Hardware clocks/CPU-port initialization and any appliance tasks must be ready.
 /// The resident radio enters common peer discovery. Appliance code supplies no
 /// channel, PAN, discovery loop, or diagnostic workload.
-/// `surface` borrows the appliance's static states, transformers, and IR predicates.
-/// It is encoded without reading live state and published when this vertex arrives
-/// or hears another arrival. No foreign-surface registry is created.
+/// `appliance` owns the initialized native instance and borrows its static surface.
+/// The resident task serves definitions, invokes exposed native transformers,
+/// and sends registered observation deltas. Relays retain bounded directions and
+/// duplicate history, never foreign surfaces or an appliance-state mirror.
 ///
 /// # Panics
-/// Before scheduler startup, rejects an encoded surface over 65,535 bytes or
-/// expression nesting reaching the encoder's depth limit (32).
+/// Before scheduler startup, rejects uninitialized/already-bound appliances, an
+/// encoded surface over 65,535 bytes, or expression nesting reaching 32 levels.
 #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
-pub fn start<A: 'static, E: 'static>(
+pub fn start<A: Send + 'static, E: 'static>(
     context: crate::sync::TaskContext,
     radio: crate::port::RadioPeripheral,
-    surface: &'static crate::surface::Surface<'static, A, E>,
+    appliance: &'static Appliance<A, E>,
 ) -> ! {
-    let publication =
-        peer::exposure::Publication::new(surface).expect("surface exceeds publication limits");
-    radio::start(&context, radio, publication);
+    let description = peer::exposure::Description::new(appliance.surface())
+        .expect("surface exceeds description limits");
+    change::bind(appliance);
+    radio::start(&context, radio, description, appliance);
     crate::start_scheduler(context)
 }

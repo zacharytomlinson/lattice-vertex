@@ -71,12 +71,19 @@ fn retain_proposal(current: &mut Option<Network>, proposed: Network) {
 /// of address order. Proposal ties use the same order on every participating MCU.
 fn consider(content: Content<'_>, proposal: &mut Option<Network>) -> Option<Network> {
     match content {
-        Content::Present(network) | Content::Arrive(network) => Some(network),
+        Content::Present(network) | Content::Arrive { network, .. } => Some(network),
         Content::Propose(network) => {
             retain_proposal(proposal, network);
             None
         }
-        Content::Discover | Content::SurfacePart { .. } => None,
+        Content::Discover
+        | Content::ReadSurface { .. }
+        | Content::SurfacePart { .. }
+        | Content::FindOwners { .. }
+        | Content::OwnerFound { .. }
+        | Content::Invoke { .. }
+        | Content::InvocationResult { .. }
+        | Content::StateChanged { .. } => None,
     }
 }
 

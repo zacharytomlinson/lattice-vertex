@@ -113,7 +113,7 @@ impl StateTransformer for Set {
             return Err(InvalidSetting);
         }
         // Real firmware writes its PWM hardware and establishes its observation.
-        lamp.level = level;
+        lattice_vertex::observation::update(lamp, &[&POWER, &LEVEL], |lamp| lamp.level = level);
         Ok(())
     }
 }

@@ -30,7 +30,7 @@ fn event(event: Event) {
             EVICTED.fetch_add(1, Ordering::Relaxed);
         }
         Event::ReceiveSignal(rssi) => {
-            RSSI.store(rssi as i32, Ordering::Relaxed);
+            RSSI.store(rssi.map_or(i32::MIN, i32::from), Ordering::Relaxed);
         }
         Event::ReceiveAborted(reason) => {
             RX_ABORT_EVENTS.fetch_add(1, Ordering::Relaxed);

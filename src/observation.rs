@@ -3,8 +3,9 @@
 //! Dependency links live with the state they depend on. Activation is immediate
 //! in the caller's context; there is no graph work queue, polling task, retained
 //! observation cache, or IR interpreter. A callback represents a compiled local
-//! activation entrypoint. Remote delivery and loadable fragment installation are
-//! separate work; this is not their wire format or final executable ABI.
+//! activation entrypoint. Bound appliance changes also enter the kernel's fixed
+//! outgoing delta ring. Loadable fragment installation remains separate work;
+//! this local list is not its wire format or final executable ABI.
 //! The resident pointer is only local fanout-list linkage. It is not a DAG entry
 //! reference, an upstream peer reference, or a distributed continuation.
 
@@ -63,12 +64,13 @@ impl<Appliance: 'static> Dependents<Appliance> {
 /// Apply a local state update, compare before/after values, and notify dependents.
 ///
 /// The caller supplies the update closure. State readers compare the appliance's
-/// values around that update; the kernel then handles local notification.
+/// values around that update; the kernel handles delta transport for a bound
+/// instance and synchronous local notification.
 ///
 /// The array length is inferred from the supplied group: no fixed slot capacity
-/// is imposed. Include each affected state once, including derived states. Old
-/// values and changed flags exist only on this call's stack. This is a group of
-/// states affected by one report, not a snapshot of the distributed graph.
+/// is imposed. Include each affected state once, including derived states. Before/after
+/// values exist on this call's stack; only changed post-values enter transport records.
+/// This group covers one hardware report, not a snapshot of the distributed graph.
 ///
 /// All updates and comparisons complete before callbacks run. Once detected,
 /// a delta is delivered even if an earlier callback changes that state again.
@@ -86,11 +88,17 @@ pub fn update<Appliance: 'static, R, const N: usize>(
 ) -> R {
     let before = states.map(|state| state.read(appliance));
     let result = update(appliance);
-    let changed: [bool; N] =
-        core::array::from_fn(|index| states[index].read(appliance) != before[index]);
-    for (state, changed) in states.iter().zip(changed) {
-        if changed {
-            state.changed(appliance);
+    let after = states.map(|state| state.read(appliance));
+    // Register the whole report before callbacks can cause later observations.
+    // Otherwise a callback's newer value could precede an older sibling delta.
+    for (index, state) in states.iter().enumerate() {
+        if before[index] != after[index] {
+            state.record_change(appliance, after[index]);
+        }
+    }
+    for (index, state) in states.iter().enumerate() {
+        if before[index] != after[index] {
+            state.dispatch_dependents(appliance);
         }
     }
     result

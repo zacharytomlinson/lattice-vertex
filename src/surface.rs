@@ -4,8 +4,9 @@
 //! Their native types determine the scalar boundary; static handles make those
 //! implementations enumerable alongside their IR without an allocator or registry.
 //! Device-wide axioms and invariants remain visible mathematical predicates.
-//! Pass the static [`Surface`] to `kernel::start` on an MCU port to let
-//! the kernel publish these definitions on arrival; no packet handling is required.
+//! Bind the static [`Surface`] and native instance in `kernel::Appliance` and pass
+//! that to `kernel::start` on an MCU port. The kernel serves definitions, invokes
+//! native operations, and transmits registered observations without appliance packet handling.
 //!
 //! This module exposes local definitions, invocation, and state change hooks.
 //! It does not interpret IR, prove an appliance model, or install executable
@@ -38,7 +39,7 @@ pub type Operation<Appliance> = ir::Operation<'static, 'static, Read<Appliance>>
 ///
 /// The native value type supplies the IR type automatically. Readers observe
 /// existing appliance state; they must not issue commands or invent a desired
-/// value. The appliance implementation supplies any required synchronization.
+/// value. `kernel::Appliance::with` supplies task synchronization for a bound instance.
 pub trait State {
     /// Concrete appliance encapsulation, such as a lamp or valve.
     type Appliance: 'static;
@@ -93,6 +94,29 @@ impl<Appliance: 'static> StateHandle<Appliance> {
     /// is unavailable. Every call is a distinct delta, including unavailable state.
     /// Dependents execute synchronously in the caller's context and read fresh state.
     pub fn changed(&self, appliance: &mut Appliance) {
+        let value = self.read(appliance);
+        self.record_change(appliance, value);
+        self.dispatch_dependents(appliance);
+    }
+
+    pub(crate) fn record_change(&self, appliance: &Appliance, value: Option<Value>) {
+        #[cfg(all(
+            feature = "use-mutexes",
+            any(
+                feature = "port-esp32c6",
+                feature = "port-nrf52840",
+                feature = "port-test"
+            )
+        ))]
+        crate::kernel::change::record(
+            core::ptr::from_ref(appliance).cast(),
+            core::ptr::from_ref(self.definition()) as usize as u64,
+            value,
+        );
+        let _ = (appliance, value);
+    }
+
+    pub(crate) fn dispatch_dependents(&self, appliance: &mut Appliance) {
         self.dependents.dispatch(appliance, self);
     }
 

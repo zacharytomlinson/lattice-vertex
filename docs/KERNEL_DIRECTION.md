@@ -13,6 +13,10 @@ Nordic nRF52840 and ESP32-C6 are both hardware targets. C6 support is needed for
 the Shelly devices as well as the existing prototypes. Keep each platform's
 dependencies isolated and the common kernel's interfaces and protocol portable.
 
+RF range investigation is paused at the user's request. Its source, captures,
+and vendor comparisons are kept in an external local lab. Continue kernel and
+protocol development without restarting range/RSSI experiments as routine work.
+
 Read this plan alongside the
 [architecture white paper](Lattice-DRTOS-Architecture-White-Paper.docx). This file
 defines repository ownership and the implementation sequence. Existing interfaces
@@ -49,6 +53,13 @@ The ordinary appliance startup API must not ask the author to select a PAN ID,
 channel, radio address, formation/join role, or implement a networking loop. The
 kernel owns those decisions and operations. Any installation selection or
 credentials needed for commissioning belong to the common Lattice mechanism.
+
+The first installation is vertices plus a tablet running a daemon peer. It needs
+surface reads, native control, registered state changes, and limited manually
+authored automation. Nucleus adds synthesis/compilation later; the tablet currently
+supplies intent IR when nucleus is present. Learned surface models, observation
+nodes, and executable capability challenges belong to later tiers and are not
+requirements for this basic installation.
 
 ## Local participation produces the distributed kernel
 
@@ -132,15 +143,28 @@ scheduler has valid task storage. Driver futures register a waker for that task;
 when pending, the task blocks on a notification. The IRQ wakes it to resume the
 same operation. There is no additional executor task or graph work queue.
 
-`kernel::start(context, radio_peripheral, &surface)` owns the static radio stack/control
-block and starts the existing scheduler. The resident transport owns its selected
-driver and task waker, then runs `kernel::peer` on the same task. Common discovery
-selects the rendezvous radio settings, broadcasts discovery, and answers a peer
-with directed presence. It borrows and encodes the supplied static surface, then
-publishes it when arriving or encountering another arrival. The same behavior
-runs on every vertex, with no enumeration administrator or polling catalog.
-State changes, authorization, and installed fragments still need to be connected
-to common peer handling.
+`kernel::Appliance::new(&SURFACE)` reserves the native instance's static storage
+and RTOS mutex. Firmware initializes it once before scheduler startup, then passes
+that binding to `kernel::start(context, radio_peripheral, &APPLIANCE)`. Hardware
+report tasks use `APPLIANCE.with` and the existing state-update primitives. The
+kernel owns both synchronization with incoming native calls and delta transport;
+appliance code supplies its actual device behavior and observations.
+
+Startup owns the static radio stack/control block and starts the existing scheduler.
+The resident transport owns its selected driver and task waker, then runs
+`kernel::peer` on the same task. It surveys/selects a channel, discovers peers,
+serves borrowed description ranges, forwards compact arrival/owner messages,
+invokes exposed native transformers, and propagates registered state changes.
+Responses establish bounded owner directions; every vertex runs the same behavior,
+without an enumeration administrator or foreign-surface catalog.
+
+Invocation success records the native function's return, not physical convergence.
+The kernel publishes actual observations later as reported. Remote calls return
+`Busy` if the native instance is already in use. No automatic mutation retries,
+IR evaluation, or graph work queue is introduced. Authentication and installed
+compiled fragments remain separate work. The
+[native invocation path](../src/kernel/peer/INVOCATION.md) documents the exact
+frame, observation, replay, and storage semantics.
 
 Hardware tests opt into `test-support` to observe the ordinary path or replace
 its handler with a supplied RF-probe workload. Both use the same resident task,
@@ -155,27 +179,32 @@ implemented:
 | Area | Responsibility |
 | --- | --- |
 | `src/kernel/` | The complete kernel: startup, task machinery, resident state and change handling, and common peer participation |
-| `src/kernel/peer/` | Channel survey/formation, common discovery, and portable MAC/message encoding |
+| `src/kernel/appliance.rs` | Static native-instance ownership, existing RTOS mutex, and typed dispatch against exposed handles |
+| `src/kernel/change.rs` | Pending registered observation deltas in one fixed transport ring |
+| `src/kernel/peer/` | Formation/discovery, surface reads, native invocation, delta forwarding, and portable wire encoding |
 | `src/port/` | Architecture, MCU, and radio-specific implementation and board integration |
 | `src/sync/` | Safe access to existing kernel synchronization facilities |
 | `src/memory/` | Kernel memory support and storage mechanisms |
 | `src/lib.rs` | Public entry point and exports |
-| `examples/` | Small appliance implementations that consume kernel behavior |
-| `src/kernel/radio/tests/` | RF-probe workload and passive counters for ordinary peer discovery |
+| `examples/` | Small, self-contained examples of the public state/surface APIs |
+| `src/kernel/radio/tests/` | Reusable transport probe and passive counters for ordinary peer discovery |
 | `src/port/{esp32c6,nrf52840}/tests/` | Board test entry points and logging |
-| `experiments/esp32c6-rf/` | Temporary RF/register/GPIO investigations and standalone vendor/Wi-Fi/OpenThread comparisons |
 
-The original polling radio experiment has been removed. Its useful hardware
-adaptation lives in the C6 port. MCU test firmware lives in each port's `tests/`
-directory, and the shared radio workload lives in `src/kernel/radio/tests/`.
-These remain separately built crates so each firmware has its own entry point
-and linker setup; colocation does not make test code part of ordinary kernel
-modules or dependencies. Independent RF comparisons and one-off board investigations
-live under `experiments/esp32c6-rf/`, including the antenna trial and raw register
-reporting that were previously mixed into the C6 test binary. This is temporary
-scaffolding, not part of the permanent kernel layout. Experiments may consume the
-kernel and test workload; neither depends on experiments. Captured binaries and
-logs remain ignored artifacts, not source dependencies.
+The inherited host/QEMU tests and `xtask` runner remain reusable kernel checks.
+MCU test firmware lives in each port's `tests/` directory, and the shared transport
+workload lives in `src/kernel/radio/tests/`. These are separately built crates
+with their own entry points and linker setup, not ordinary kernel dependencies.
+Board-specific upload layouts and fixture logging stay there because they make
+kernel checks reproducible on supported hardware.
+
+One-off experiments live outside the repository. Local `experiments/` and `lab/`
+paths are ignored and excluded from Cargo packages as a backstop; neither should
+be added to Git. Vendor comparison firmware, register assays, receive-only RF
+captures, room/range diaries, and private appliance integration prototypes are
+not permanent kernel tests or feature-gated kernel APIs. Their source must be
+preserved in the lab before removal. Generic examples and tests depend only on
+the kernel and shared IR, not diffuser/radio application repositories. Runtime,
+maintained tests, and build instructions must be usable without the local lab.
 
 The kernel must never depend on the test workload crate. The board fixtures depend
 on both the kernel and `lattice-radio-test`. Only the gated transport entry and
@@ -204,7 +233,9 @@ both now use a compatible `riscv-rt` 0.16 dependency generation.
 
 The [Nordic radio port](../src/port/nrf52840/radio.rs) consumes
 `embassy-nrf`'s 802.15.4 packet driver and adds register-level energy detection
-on the same interrupt, because the HAL does not expose that operation.
+on the same interrupt, because the HAL does not expose that operation. It also
+restores the nRF52840 CCA correlation threshold/count after the HAL's whole-register
+mode write clears them; this is port initialization, not appliance policy.
 The [C6 radio port](../src/port/esp32c6/radio/mod.rs)
 uses extracted `esp-radio` MAC/register/clock code, with upstream attribution
 and its MIT license retained. It uses `esp-phy` for PHY initialization. Both
@@ -292,8 +323,8 @@ PAN `0x4c56` remains a common discovery filter, not an allocated PAN or membersh
 credential. The network tag distinguishes advertised networks; startup currently
 adopts the first established network it hears. Choosing between independently
 owned deployments and authorizing operations are not decided by that tag or PAN.
-The `LVT` version-2 envelope carries discovery, provisional proposals, and directed
-presence; it rejects the earlier fixed-channel version. Ordinary discovery still
+The `LVT` version-5 envelope carries discovery, proposals, surface reads, native
+calls/results, and deltas; it rejects earlier wire versions. Ordinary discovery still
 repeats every 2–3 seconds after selection. Presence never causes an echo. MAC ACKs
 are not requested for these frames. No peer table, appliance formation/join knob,
 graph work queue, or repeated transformer invocation is introduced.
@@ -301,44 +332,27 @@ graph work queue, or repeated transformer invocation is introduced.
 The board fixture's `peer-observer` feature observes this normal path. It supplies
 an authored test surface, registers a passive event callback, and reports counters;
 it supplies no radio settings, message generator, or handler. Both C6 and Nordic
-use the same common discovery and [surface publication](../src/kernel/peer/EXPOSURE.md).
-One arrival announcement triggers reciprocal publication of local definitions.
-Periodic discovery and received descriptions do not trigger exposure. Parts are
-generated from immutable IR without invoking native readers/transformers or
-retaining another vertex's definitions. Interested consumers own any reassembly;
-the ordinary receiver currently discards descriptions after frame validation.
-Transport receipts, forwarding, consumer integration, and authorization remain
-open. Discovery or a description grants no permission to install or mutate.
+use the same common discovery and [surface reads](../src/kernel/peer/EXPOSURE.md).
+Arrival and periodic link discovery do not transmit complete mathematical definitions.
+Arrival notices can cross eight links. One owner-discovery round after joining
+finds preexisting owners; matching owner replies follow recorded reverse paths.
+Later periodic discovery stays link-local, and arrivals do not trigger new searches.
+An interested peer requests a range from a named owner. The owner encodes that
+range from immutable IR without invoking native readers/transformers. Intermediates
+forward borrowed frames and retain only request paths and learned directions.
+Consumer-side reconstruction/caching, content-based definition sharing,
+authorization, and installed-fragment delivery remain open. A received definition grants
+no permission to install or mutate.
 
-C6 RF investigation keeps TX power fixed at 20 dBm, including reference runs.
-Similar results across the three tested boards make the shared PHY setup the
-current investigation focus. The C6 port now selects combo-radio PHY mode before
-calibration and explicitly disables Wi-Fi RX for its 802.15.4-only operation,
-matching the vendor initialization convention and upstream PHY fix. Its effect
-has been checked in a follow-up capture: both boards still report one unanswered
-post-contact probe and roughly -66 dBm RSSI. The subsequent vendor-reference run
-at channel 15 / 20 dBm received 20/20 frames each way but still reported median
-RSSI of -68 and -69 dBm, reproducing the weak readings without our driver/kernel.
-The cause remains unresolved; retain the evidence and comparison tools under
-the RF experiments rather than treating this short run as proof of RF quality.
-A phone subsequently detected one board's Wi-Fi control AP with a strong bar
-indication. C6 Wi-Fi scans have not produced peer RSSI samples, so this establishes
-only qualitative Wi-Fi transmission to an independent receiver, not a validated
-C6 receive path or resolution of the 802.15.4 problem.
-The [register assay](../experiments/esp32c6-rf/RF_ASSAY.md#corrections-and-verification)
-led to fixes for the PAN mask, ED sampling fields, and unused Wi-Fi-power clock.
-Both boards' readbacks verify the corrected configuration at 20 dBm. A one-minute
-run still reported two/four unanswered post-contact probes and weak RSSI, so the
-remaining RF issue continues to need investigation.
-An [OpenThread control](../experiments/esp32c6-rf/openthread/README.md) now supplies
-pinned source, radio/Thread validation, and flash/register captures. Its comparison
-led to an explicit modem ETM clock enable; the C6 radio fixture also now matches
-the reference's 160 MHz CPU setting. The latest short run answered 17/17
-and 18/18 probes but still reported -66 to -61 dBm. This is useful configuration
-evidence, not a resolution of the weak-signal concern.
+C6 TX remains fixed at 20 dBm, and Nordic uses its supported 8 dBm. Keep the
+retained PHY timing, PAN/ED-mask, clock, and Nordic CCA corrections in the ports;
+these are driver behavior, not experimental workload. Provenance belongs beside
+the driver. Detailed RF measurements and vendor comparison programs stay outside
+the repository. Ordinary and observed images use the same receive operations;
+test instrumentation must not install an alternative radio configuration.
 
 The survey timings and discovery encoding are provisional common-kernel decisions.
-Deployment selection, authorization, and executable-message encodings remain open.
+Deployment selection, authorization, and installed-fragment encodings remain open.
 Discovery works before Lattice assigns any short radio address. PAN IDs and radio
 addresses remain transport data, not substitutes for graph relationships or proof
 of network membership.
@@ -347,6 +361,83 @@ Configuration and packet adaptation must stay below the appliance boundary. The
 same appliance definition should work on another supported platform without a
 new networking implementation. Platform-specific capabilities or limitations
 should be handled by that port and the common kernel policy.
+
+## Forwarding learned from communication
+
+Use directed diffusion as the design basis for common peer delivery: explore
+when a necessary direction is unknown, retain local incoming/next-hop relationships,
+and let successful communication establish useful paths. The founding vertex,
+tablet, and nucleus have no exclusive forwarding role. Surface availability,
+arrival dissemination, relay participation, and repair should reuse this machinery.
+Definitions remain owned by appliances; interested peers may retain disposable
+copies. Content identifiers and shared mathematical definitions are a subsequent
+extension, not an implemented global registry or predefined appliance vocabulary.
+
+A semantic relationship names the state/transformer owner that must participate.
+A communication path can add relay vertices without adding predicates or changing
+that target. Duplicate transport copies and distinct registered changes are
+separate things. Neither routing nor duplicate suppression may merge independent
+deltas or invent additional transformer invocations. A cached mathematical
+surface cannot stand in for its owner's physical state or execute its operation.
+
+The first implemented slice is `peer::forwarding`: a bounded surface read to a
+known owner explores by broadcast when no confirmed next hop is available. Each
+relay retains the first incoming neighbor for that request. A matching reply
+returns through those records and installs a direction toward the owner. Later
+reads use that direction. Local TX failure, unanswered-read expiry, and stale
+route expiry restore exploration for subsequent requests. No automatic read retry
+or graph work queue is added; the consumer owns any retry with a fresh read token.
+
+Owner discovery now shares that forwarding component and route cache. A compact
+arrival carries the original owner, description length, sequence, and distance;
+relays preserve that origin while replacing the immediate MAC sender. A separate
+owner query retains its first incoming neighbor. Each reached vertex replies
+with its own address/description length and relays the query within its remaining
+scope. Multiple owners' responses can follow the same return path. A matching
+reply teaches a direction; an unsolicited announcement alone does not.
+
+On entry, a vertex announces itself, listens for one ordinary discovery interval,
+then searches once for preexisting owners. Subsequent periodic discovery remains
+link-local. An incoming arrival never triggers a new query or surface transfer.
+Results are consumed transiently; ordinary vertices retain no complete owner list.
+The tablet/nucleus consumer can initiate further queries with fresh request tokens.
+
+The current fixed forwarder budget is three learned directions, eight recent read
+paths, four owner-query return paths, eight recent owner notices, four call paths,
+and eight delta duplicate keys, with a compile-time 1,536-byte ceiling. All return
+paths and duplicate keys expire after 10 seconds;
+confirmed routes after 60 seconds without another matching response. Full storage
+evicts its oldest record. Eviction can lose a response or shorten duplicate
+suppression; hop limits remain necessary. Neither these paths nor a TX completion prove native execution. The limits are explicit starting capacities.
+
+Host checks cover arrival propagation, cyclic/duplicate paths, several owners
+replying to one query, and discovering then reading an owner through two relays.
+Discovery remains best-effort and scoped: no response proves complete network
+membership, and a missing response does not prove absence. Startup tokens use
+local ticks, not durable boot identities; rapid restart or token reuse can collide
+with retained history until it expires. Fresh-query attempts recover independently.
+
+This establishes bounded dissemination and path reuse, not an adaptive coverage
+optimizer. Delivery/latency/airtime scoring, alternative-path retention, and
+protection of unique bridges remain to be implemented. Arrival, owner discovery,
+reads, calls/results, and deltas are bounded to eight links. Channel survey/formation remains local and
+requires an existing radio neighbor; forwarding requires the same selected network
+and channel. Partition merging and coordinated channel migration remain separate.
+
+Native invocation now reuses this direction/reverse-path mechanism. The owner
+matches an exposed handle and invokes its native adapter. Four call paths retain
+exact arguments and returned results; eight owner records replay an identical
+call's status without invoking again. Reused caller/request with different content
+is rejected. This replay is bounded by eviction/reboot and is not an exactly-once
+ledger. Unlike immutable read attempts, uncertain mutations must not be retried
+with fresh tokens. There are no automatic command retries. Installed executable
+fragments and their activation ABI remain future work.
+
+A registered observation emits a compact owner/attribute/sequence/value delta.
+The kernel preserves distinct changes, including unavailable state, and relays
+accepted messages within the same scope with recent duplicate suppression.
+Receiving another appliance's delta never overwrites local state. No global state
+mirror, periodic state polling, or learned model is introduced.
 
 ## Structured memory and resident relationships
 
@@ -371,6 +462,15 @@ four fixed receive entries, evicting the oldest frame on overflow. Test builds
 report evictions to fixture-owned counters. Transmit storage remains owned by the driver until completion.
 No transport buffer is used as storage for queued graph activations.
 
+The native binding owns one existing static RTOS mutex/control block and the
+actual appliance value. `kernel::change` retains eight pending delta records,
+evicting oldest on overflow with a counter. Grouped observations register every
+changed value before dependent callbacks run, so newer callback changes cannot
+precede an older sibling delta. Notifications wake the resident radio task without
+merging those records; receive waits become interruptible after formation. Owner
+invocation history has a 768-byte compile-time ceiling. No allocator is enabled
+by either MCU port. Loss, eviction, and reboot do not imply automatic recovery.
+
 ## Implementation map
 
 This is the working responsibility map used by the
@@ -385,13 +485,17 @@ flowchart TB
     surface["Existing State / StateTransformer and surface definitions"]
     ir["lattice-ir mathematical definitions"]
     startup["kernel::start: static radio task and scheduler startup"]
-    state["Integrated state and fragment handling: to build"]
-    peers["Authorization, surface messages, and graph dispatch: to build"]
+    binding["kernel::Appliance: static native instance, surface, RTOS mutex"]
+    observation["StateHandle / observation: register actual changes, dispatch local dependents"]
+    state["kernel::change: bounded outgoing deltas"]
+    invocation["peer::invocation: native dispatch and bounded result replay"]
+    peers["Authorization and installed compiled-fragment dispatch: to build"]
     discovery["kernel::peer: channel survey, computed rendezvous, arrival and message dispatch"]
-    exposure["peer::exposure: borrowed local IR, bounded encoding, publication progress"]
-    radio["Nordic/C6 radio ports: fixed buffers, energy detection, hardware IRQs"]
+    exposure["peer::exposure: borrowed local IR and bounded range encoding"]
+    forwarding["peer::forwarding: bounded arrivals, owner discovery/read/call return paths, learned directions, delta duplicates"]
+    radio["Nordic/C6 radio ports: fixed buffers, energy/CCA setup, hardware IRQs"]
     transport["kernel::radio: resident driver and notification waits"]
-    probe["src/kernel/radio/tests: RF probe workload and passive discovery observer"]
+    probe["src/kernel/radio/tests: transport probe, discovery counters and surface-range observer"]
     testentry["test-support only: scoped transport access and event hooks"]
     tasks["Existing RTOS tasks, notifications, synchronization, static storage"]
     cpu["CPU ports: Nordic nRF52840, ESP32-C6, and generic targets"]
@@ -399,7 +503,7 @@ flowchart TB
     nordic["embassy-nrf chip initialization"]
     hal["esp-hal startup, timers, and interrupt routing: C6 only"]
     smoke["Nordic and C6 test firmware beside their ports"]
-    rfexperiments["experiments/esp32c6-rf: temporary RF/board diagnostics and vendor controls"]
+    usbconsole["Nordic fixture only: USB diagnostics and XIAO serial-DFU entry"]
     sync["Existing safe synchronization API"]
 
     surface -->|native access| appliance
@@ -414,127 +518,78 @@ flowchart TB
     smoke -->|initializes selected chip resources| cpu
     smoke -->|creates static tasks and starts scheduler| tasks
     smoke -->|radio-probe or peer-observer feature includes| probe
-    rfexperiments -->|kernel-based RF trials reuse| probe
-    rfexperiments -->|kernel-based RF trials inspect hardware configuration| radio
-    probe -->|installs RF workload or only observes discovery| testentry
+    smoke -->|optional USB console feature| usbconsole
+    usbconsole -->|low-priority reporter uses existing task API| tasks
+    usbconsole -->|USB peripheral driver| nordic
+    probe -->|installs transport workload or observes peers and surface ranges| testentry
     testentry -->|uses normal task and scheduler startup| startup
     testentry -->|passes resident transport to workload| transport
     transport -->|test builds emit events to fixture callback| testentry
     discovery -->|test builds emit events to fixture callback| testentry
-    appliance -.->|supplies its surface and board resources| startup
-    startup -.->|establishes resident bindings| state
-    startup -.->|establishes kernel communication| peers
+    appliance -->|static surface and native instance| binding
+    binding -->|existing mutex synchronization| sync
+    binding -->|supplied with board resources| startup
+    startup -->|binds exact native instance| state
+    surface -->|typed updates and explicit changes| observation
+    observation -->|registered deltas before local callbacks| state
+    discovery -->|validated native call at owner| invocation
+    invocation -->|typed adapter under mutex| binding
+    state -->|notifies resident radio task| transport
+    discovery -->|drains pending deltas| state
     startup -->|creates static radio task| tasks
     startup -->|creates resident transport| transport
-    startup -->|checks and transfers local publication| exposure
+    startup -->|checks and borrows local description| exposure
     transport -->|owns selected driver| radio
     transport -->|ordinary resident task runs| discovery
-    discovery -->|arrival triggers local publication| exposure
-    exposure -->|encoded parts through resident transport| transport
+    discovery -->|validated discovery, reads, calls, and deltas| forwarding
+    forwarding -->|owner encodes requested range| exposure
+    forwarding -->|bounded announcements, exploration, and reverse replies| transport
     discovery -->|surveys energy, selects channel, exchanges frames through| transport
     transport -->|receives and transmits frames| radio
     transport -->|blocks on notifications while hardware works| tasks
-    state -.->|uses existing definitions| surface
-    state -.->|change messages and activations| peers
-    peers -.->|dispatches prescribed local work| state
+    peers -.->|compiled activations depend on local state| observation
+    peers -.->|invokes reached transformer| binding
     peers -.->|runs in kernel execution contexts| tasks
     peers -.->|configures and exchanges frames| transport
     radio -->|IRQ waker notifies resident task| tasks
 
     classDef planned stroke-dasharray: 5 5;
-    class state,peers planned;
+    class peers planned;
 ```
 
 ## Current baseline
 
-The inherited task, synchronization, and memory implementations remain the
-execution core. `port-nrf52840` connects them to Nordic hardware through the
-shared Cortex-M4F port. `initialize` consumes SysTick and returns Nordic appliance
-peripherals after HAL initialization. The kernel owns the 1 kHz tick and its
-exception handlers. The port starts the 32 MHz crystal required for radio use;
-the low-frequency source remains internal. `kernel::start` transfers RADIO to
-the resident task, which initializes it. Ordinary startup runs common discovery
-on that transport; the optional RF-test workload replaces the common handler.
+The inherited task/list/queue/timer/event/stream implementations remain the
+execution core. Both MCU ports have static kernel-owned radio task startup,
+interrupt wakeups, channel survey/formation, and common peer handling. Neither
+port requires an allocator, appliance-owned network loop, or separate executor.
+The standalone CPU smoke checks exercise static task startup, critical sections,
+IRQ wakeups, preemption, and register preservation; they have build validation,
+not a claimed hardware pass.
 
-The [Nordic hardware smoke image](../src/port/nrf52840/tests/README.md) builds
-without an allocator and without ESP dependencies. Its assertions cover the
-kernel vectors, tick configuration, critical sections, ISR wakeup, preemption,
-and integer/FPU context preservation. The standalone image uses SWD/RTT and does
-not assume a board-specific USB bootloader. It is build/link verified; execution
-on an nRF52840 remains unverified.
+Nordic uses the shared Cortex-M4F task/FPU port, SysTick at 1 kHz, the 64 MHz CPU,
+and the required 32 MHz radio crystal. C6 uses its RV32IMAC task context, 2 KiB
+minimum task/idle stacks, and a separate 2 KiB context-switch stack. Radio drivers
+are initialized inside the resident task after scheduler storage is established.
+The separate XIAO fixture can preserve its stock bootloader and provide USB
+logging/upload entry; those are fixture facilities, not kernel requirements.
 
-`port-esp32c6` connects the same task scheduler to the C6 through
-esp-hal, saving registers on each task's static stack and switching on a private
-2 KiB stack. C6's minimum task/idle stack is 2 KiB because HAL peripheral handlers
-use the interrupted task's stack. Timer setup precedes the first task restore,
-which enables interrupts only after the scheduler has valid task storage.
+Prior board bring-up exercised discovery and formation on C6, and Nordic/C6 peer
+exchange through the kernel. RF quality remains unresolved and the investigation
+is paused. Historical captures used older wire revisions and live in the external
+lab; they do not establish current protocol delivery or general loss-free operation.
 
-The [C6 hardware smoke image](../src/port/esp32c6/tests/README.md) builds without
-an allocator. It tests static task startup, nested critical sections, device ISR
-notification, tick preemption, and register preservation. Build/link checks pass;
-the standalone smoke fixture has not been run on hardware. C6 runtime evidence
-comes from the integrated radio image below. This port still uses a
-periodic tick; `tickless-idle` falls back to waiting with that tick running.
+The current LVT v5 path has host tests and both MCU builds: borrowed surface range
+reads, compact owner discovery, bounded relay directions, native appliance binding,
+owner-directed invocation/results, and registered observation deltas. Tests cover
+argument/reference rejection, retained command replay, actual observation timing,
+and grouped-delta ordering. Kernel task/protocol behavior remains in common source;
+portable codecs, fixture counters, and hardware logging live in separate test crates.
 
-The resident radio transport is connected to RTOS startup and the actual radio
-interrupts on both ports. The [radio test images](../src/kernel/radio/TESTING.md)
-compile/link without an allocator. Their shared test crate owns the diagnostic
-codec and its wire-vector/rejection tests. Ordinary images build independently
-without that crate or the `test-support` feature.
-
-C6 hardware bring-up has exercised the separated workload in both directions.
-Fixture logging no longer masks radio interrupts, and the port preserves the
-linked PHY initializer's baseband/MAC timing instead of overwriting one delay.
-The [timing-change capture](../experiments/esp32c6-rf/RF_RESULTS.md#result-after-preserving-phy-timing--2026-10-06)
-verifies both boards' timing/channel/power-index readbacks and reports 22/22 and
-23/23 probes answered, with no pending/unanswered probes, API errors, or evictions.
-This establishes the receive → IRQ wakeup → task handling → reply path for that
-run. It does not establish the cause of the earlier missed reply or general
-loss-free delivery. The subsequent combo-PHY capture reports one unanswered
-post-contact probe per board, with no pending probes and -66 dBm RSSI. It leaves
-the reported loss and received-signal concern unresolved.
-
-Received signal remains around -64 to -70 dBm in the excerpts. Hardware SFD-timeout
-counters are nonzero and increasing, without attribution to specific peers or
-probes. RF quality/range and Nordic hardware interoperability remain open; the
-RF experiment notes retain the earlier captures and the configuration audit.
-The [vendor comparison](../experiments/esp32c6-rf/RF_RESULTS.md#vendor-comparison-result--2026-10-06)
-also reports weak RSSI at 20 dBm, with 20/20 raw frames delivered each way. Both
-boards were restored to Lattice; their short follow-up answered 19/19 and 20/20
-probes with sampled RSSI from -70 to -63 dBm. No kernel change accompanied this
-comparison, and the earlier intermittent loss remains unexplained.
-
-Typed surface/IR definitions now enter kernel startup and feed arrival-triggered
-surface messages through `kernel::peer`. Publication carries states, transformer
-preconditions/effects, axioms, and invariants without executing them. There is no
-foreign-surface catalog. The local observation callback list is still separate
-from distributed message handling and is not the installed distributed DAG.
-State-change messages and fragment installation remain unimplemented. The
-diagnostic probe/reply handler provides none of these production behaviors.
-
-The [common discovery capture](../src/kernel/peer/TESTING.md#c6-result--2026-10-06)
-identified both C6 peers and exchanged directed presence responses. Replacing
-one board's observed image with ordinary firmware preserved discovery while the
-other board stayed running; reflashing it again also required no peer-side setup.
-This validates the common handler independently of the test workload. Both MCU
-ports build it; Nordic hardware validation remains pending.
-That capture used version 1 on fixed channel 15. Subsequent channel-survey and
-formation results are recorded separately in the
-[hardware check](../src/kernel/peer/TESTING.md#formation-validation-status--2026-10-07):
-A selected channel 21 from measured energy, B joined it, and B preserved the
-network while A restarted and returned. An ordinary image without test features
-also rejoined. A simultaneous start converged on channel 12 and one founding
-address in that intermediate implementation. The shared formation channel has
-since been removed in favor of computed channel rendezvous. The subsequent C6
-pair met on channel 16 and settled on operating channel 12 during simultaneous
-startup; the channel-24 staggered run also passed joining and founder-return
-checks, including ordinary firmware. Five host tests and both MCU builds pass.
-Nordic's new ED path still awaits hardware execution.
-
-Earlier standalone C6 probes exchanged frames without our scheduler. They do
-not prove packet delivery through this new kernel path, and the earlier RF range
-issue remains open. C6 peer reception and replies are now demonstrated through
-the kernel; a separate scheduler-only test is not a prerequisite to further work.
+Authentication, tablet consumer integration, initial live-state reads, installed
+compiled fragments, and their distributed activation remain open. Local dependents
+are immediate native callbacks, not an installed distributed DAG. The current
+manual-control message path has not yet had an end-to-end hardware run.
 
 ## Next implementation sequence
 
@@ -546,29 +601,38 @@ the kernel; a separate scheduler-only test is not a prerequisite to further work
    appliance-owned radio loop.
    Both CPU/radio ports, fixed buffering, and kernel-owned radio task/startup
    are implemented. The C6 pair has completed the hardware receive → wakeup →
-   reply run using the separated test workload; Nordic hardware execution remains
-   pending. The fixture supplies diagnostic traffic and settings through a
+   reply run using the separated test workload; the Nordic radio fixture now
+   runs ordinary discovery alongside C6. The fixture supplies diagnostic traffic and settings through a
    test-only entry on the real kernel transport. Native appliance-instance binding
-   and distributed state-change handling remain separate from these task checks.
-   Rendezvous/discovery and arrival-triggered surface publication now run through
-   ordinary kernel startup.
+   and state-change handling now have separate host checks; the prior task captures
+   do not validate them.
+   Rendezvous/discovery and relay-assisted surface reads now run through ordinary
+   kernel startup. The new forwarding behavior has host/build validation; no new
+   radio experiment or hardware validation was performed.
 2. **Implement automatic peer participation.** Put radio configuration, bootstrap,
    discovery, and surface-exposure handling in the common kernel. Use the provided
    platform port to perform the hardware operations. Completion means two appliance
    implementations can enter the network and expose their surfaces through the
    same kernel behavior, without choosing PANs or writing packet handlers.
    Channel survey/formation and directed discovery responses are implemented.
-   Arrival-triggered mathematical surface publication is implemented. Reliable
-   delivery/consumer integration and authorization remain open. Surface descriptions
+   Owner-directed surface reads, bounded exploration, reverse replies, and learned
+   directions are implemented. Compact arrivals and owner discovery now cross relays
+   using the same route cache. Consumer integration, adaptive relay selection,
+   and authorization remain open. Surface descriptions
    do not establish physical appliance state or permission to mutate it.
 3. **Complete the state-change communication path.** An appliance establishes a
    state change; the kernel detects/registers the delta, emits the required peer
    message, and the receiving kernel performs its prescribed local handling.
    Completion means this path works through the common runtime, with the examples
    reduced to appliance definitions and physical I/O.
+   Native binding, owner-directed calls/results, registered observation capture,
+   and scoped delta forwarding are implemented and checked on the host. Both MCU
+   images build. The tablet daemon, initial live-state reads, hardware exercise of
+   this path, and installed conditional activation remain open.
 
 Extend that working path into compiled-fragment installation, conditional
-activation, transformer invocation, and forwarding. Keep upstream state
+activation, and their forwarding semantics. Native transformer invocation is now
+available independently of fragment installation. Keep upstream state
 activation distinct from downstream execution. Nucleus supplies compiled work;
 its full implementation is not a prerequisite to building the node's common
 mechanics. Relay optimization and storage tuning follow concrete implementation

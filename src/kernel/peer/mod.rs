@@ -1,10 +1,13 @@
-//! Common channel formation, discovery, and arrival-triggered surface publication.
+//! Common formation, discovery, surface reads, native calls, and state deltas.
 //! Residents share the channel choice; the original founder has no special
-//! runtime role. This is reachability, not authority to mutate an appliance.
+//! runtime role. This initial protocol has no authenticated admission mechanism.
 
 mod bootstrap;
 pub(crate) mod exposure;
-mod frame;
+mod forwarding;
+pub(crate) mod frame;
+#[cfg(feature = "use-mutexes")]
+mod invocation;
 
 use frame::{Content, Message};
 
@@ -48,102 +51,166 @@ fn discovery_response(
 #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
 pub(crate) fn run(
     radio: &mut super::radio::task::Transport,
-    publication: exposure::Publication,
+    description: exposure::Description,
+    native: &'static dyn crate::kernel::appliance::Native,
 ) -> ! {
     use super::{radio::MAX_FRAME_SIZE, tasks};
     let local = radio.address();
     let mut buffer = [0; MAX_FRAME_SIZE];
+    let mut outgoing = [0; MAX_FRAME_SIZE];
+    let mut piece = [0; frame::SURFACE_BYTES];
     let mut sequence = 0u8;
     let network = bootstrap::join_or_form(radio, local, &mut sequence, &mut buffer);
-    send(
-        radio,
-        Message {
-            source: local,
-            destination: None,
-            content: Content::Arrive(network),
-        },
-        &mut sequence,
-        &mut buffer,
-    );
-    let mut publisher = exposure::Publisher::new(publication);
-    let publication_period = crate::milliseconds_to_ticks_checked(7 + local % 7).unwrap();
-    let mut last_piece = tasks::xTaskGetTickCount();
+    let mut forwarder = forwarding::Forwarder::new(local, network);
+    let mut invocations = invocation::Invocations::new();
+    let context = unsafe { crate::sync::TaskContext::assume() };
+    radio.enable_state_changes();
+    let started = tasks::xTaskGetTickCount();
+    let milliseconds = ((started as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
+    let arrival = forwarder.announce(started as u16, description.len(), milliseconds);
+    send(radio, arrival, &mut sequence, &mut outgoing);
     let period = crate::milliseconds_to_ticks_checked(2_000 + local % 997).unwrap();
-    let mut last_discovery = tasks::xTaskGetTickCount().wrapping_sub(period);
+    let mut last_discovery = started;
+    // One owner search after the arrival has had a receive interval to spread.
+    // Later wakeups retain the small link-local formation/discovery exchange.
+    let mut find_owners = true;
     loop {
         let now = tasks::xTaskGetTickCount();
+        let milliseconds = ((now as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
+        forwarder.expire(milliseconds);
+        if let Some(change) = crate::kernel::change::take() {
+            let message = forwarder.announce_change(
+                change.attribute,
+                change.sequence,
+                change.value,
+                milliseconds,
+            );
+            send(radio, message, &mut sequence, &mut outgoing);
+        }
         if now.wrapping_sub(last_discovery) >= period {
             last_discovery = now;
-            send(
-                radio,
+            let message = if find_owners {
+                find_owners = false;
+                forwarder.find_owners(now as u16, milliseconds)
+            } else {
                 Message {
                     source: local,
                     destination: None,
                     content: Content::Discover,
-                },
-                &mut sequence,
-                &mut buffer,
-            );
-        }
-        let now = tasks::xTaskGetTickCount();
-        if publisher.has_work() && now.wrapping_sub(last_piece) >= publication_period {
-            let mut piece = [0; frame::SURFACE_BYTES];
-            let n = publisher.prepare_part(&mut piece);
-            if n != 0 {
-                let outgoing = Message {
-                    source: local,
-                    destination: None,
-                    content: Content::SurfacePart {
-                        network,
-                        sequence: publisher.sequence,
-                        offset: publisher.offset,
-                        total: publisher.publication.len(),
-                        bytes: &piece[..n],
-                    },
-                };
-                if send(radio, outgoing, &mut sequence, &mut buffer) {
-                    publisher.transmitted(n);
-                } else {
-                    publisher.transmit_failed();
                 }
-            }
-            last_piece = tasks::xTaskGetTickCount();
+            };
+            send(radio, message, &mut sequence, &mut outgoing);
         }
-        let now = tasks::xTaskGetTickCount();
-        let mut timeout = period.saturating_sub(now.wrapping_sub(last_discovery));
-        if publisher.has_work() {
-            timeout = timeout.min(publication_period.saturating_sub(now.wrapping_sub(last_piece)));
-        }
+        let timeout =
+            period.saturating_sub(tasks::xTaskGetTickCount().wrapping_sub(last_discovery));
         if let Some(message) = receive(radio, local, network.channel, &mut buffer, timeout) {
-            if message.content == Content::Arrive(network) {
-                publisher.arrival();
-                #[cfg(feature = "test-support")]
-                super::radio::testing::event(super::radio::testing::Event::ArrivalReceived);
-            } else if let Content::SurfacePart {
-                network: advertised,
-                sequence,
-                offset,
-                total,
-                bytes,
-            } = message.content
+            if matches!(message.content, Content::Invoke { network: n, .. }
+                | Content::InvocationResult { network: n, .. } if n == network)
             {
-                if advertised == network {
-                    #[cfg(feature = "test-support")]
+                let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
+                    / crate::configTICK_RATE_HZ as u64) as u32;
+                #[cfg(feature = "test-support")]
+                if matches!(message.content, Content::Invoke { .. }) {
+                    super::radio::testing::event(super::radio::testing::Event::InvocationReceived);
+                }
+                if let Some(reply) = forwarder.receive_control(message, now, |call, arguments| {
+                    invocations.invoke(native, &context, call, arguments)
+                }) {
+                    if !send(radio, reply, &mut sequence, &mut outgoing) {
+                        forwarder.transmit_failed(&reply);
+                    }
+                }
+            } else if matches!(message.content, Content::StateChanged { network: n, .. } if n == network)
+            {
+                let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
+                    / crate::configTICK_RATE_HZ as u64) as u32;
+                let received = forwarder.receive_change(message, now, |out| {
+                    send(radio, out, &mut sequence, &mut outgoing);
+                });
+                #[cfg(feature = "test-support")]
+                if let Some(delta) = received {
                     super::radio::testing::event(
-                        super::radio::testing::Event::SurfacePartReceived {
-                            source: message.source,
-                            sequence,
-                            offset,
-                            total,
-                            bytes,
+                        super::radio::testing::Event::StateChangeReceived {
+                            owner: delta.owner,
+                            attribute: delta.attribute,
+                            sequence: delta.sequence,
+                            value: delta.value,
                         },
                     );
-                    // Uninterested vertices retain no foreign definitions. This
-                    // borrowed packet ends here; interested consumers own reassembly.
-                    let _ = (sequence, offset, total, bytes);
+                }
+                let _ = received;
+            } else if matches!(message.content, Content::Arrive { network: n, .. }
+                | Content::FindOwners { network: n, .. }
+                | Content::OwnerFound { network: n, .. } if n == network)
+            {
+                let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
+                    / crate::configTICK_RATE_HZ as u64) as u32;
+                #[cfg(feature = "test-support")]
+                if matches!(message.content, Content::FindOwners { .. }) {
+                    super::radio::testing::event(
+                        super::radio::testing::Event::OwnerDiscoveryReceived,
+                    );
+                }
+                let observed =
+                    forwarder.receive_discovery(message, description.len(), now, |out| {
+                        send(radio, out, &mut sequence, &mut outgoing);
+                    });
+                #[cfg(feature = "test-support")]
+                if let Some(owner) = observed {
+                    let (hops, solicited) = match message.content {
+                        Content::Arrive { hops, .. } => {
+                            super::radio::testing::event(
+                                super::radio::testing::Event::ArrivalReceived,
+                            );
+                            (hops, false)
+                        }
+                        Content::OwnerFound { hops, .. } => (hops, true),
+                        _ => unreachable!(),
+                    };
+                    super::radio::testing::event(super::radio::testing::Event::OwnerObserved {
+                        owner: owner.address,
+                        surface_bytes: owner.surface_bytes,
+                        via: message.source,
+                        hops,
+                        solicited,
+                    });
+                }
+                let _ = observed;
+            } else if matches!(message.content, Content::ReadSurface { network: n, .. }
+                | Content::SurfacePart { network: n, .. } if n == network)
+            {
+                #[cfg(feature = "test-support")]
+                {
+                    use super::radio::testing::{event, Event};
+                    match message.content {
+                        Content::ReadSurface { read, .. } => event(Event::SurfaceReadReceived {
+                            reader: read.reader,
+                            owner: read.owner,
+                            request: read.request,
+                            offset: read.offset,
+                        }),
+                        Content::SurfacePart {
+                            read, total, bytes, ..
+                        } => event(Event::SurfacePartReceived {
+                            reader: read.reader,
+                            owner: read.owner,
+                            request: read.request,
+                            offset: read.offset,
+                            total,
+                            bytes,
+                        }),
+                        _ => {}
+                    }
+                }
+                let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
+                    / crate::configTICK_RATE_HZ as u64) as u32;
+                if let Some(reply) = forwarder.receive(message, &description, &mut piece, now) {
+                    if !send(radio, reply, &mut sequence, &mut outgoing) {
+                        forwarder.transmit_failed(&reply);
+                    }
                 }
             } else if let Some(reply) = discovery_response(local, &message, network, true) {
-                send(radio, reply, &mut sequence, &mut buffer);
+                send(radio, reply, &mut sequence, &mut outgoing);
             } else if message.content == Content::Present(network) {
                 #[cfg(feature = "test-support")]
                 super::radio::testing::event(
@@ -174,16 +241,31 @@ fn send(
                 Content::Discover => Event::DiscoveryRequestSent,
                 Content::Present(_) => Event::DiscoveryResponseSent,
                 Content::Propose(_) => Event::ChannelProposalSent,
-                Content::Arrive(_) => Event::ArrivalSent,
+                Content::Arrive { owner, .. } if owner.address == message.source => {
+                    Event::ArrivalSent
+                }
+                Content::Arrive { .. } => Event::ArrivalForwarded,
+                Content::FindOwners { .. } => Event::OwnerDiscoverySent,
+                Content::OwnerFound { .. } => Event::OwnerResponseSent,
+                Content::Invoke { .. } => Event::InvocationSent,
+                Content::InvocationResult { status, .. } => Event::InvocationResultSent {
+                    status: status as u8,
+                },
+                Content::StateChanged { delta, .. } => Event::StateChangeSent {
+                    owner: delta.owner,
+                    attribute: delta.attribute,
+                    sequence: delta.sequence,
+                    value: delta.value,
+                    evicted: crate::kernel::change::evicted(),
+                },
+                Content::ReadSurface { .. } => Event::SurfaceReadForwarded,
                 Content::SurfacePart {
-                    sequence,
-                    offset,
-                    total,
-                    bytes,
-                    ..
+                    read, total, bytes, ..
                 } => Event::SurfacePartSent {
-                    sequence,
-                    offset,
+                    reader: read.reader,
+                    owner: read.owner,
+                    request: read.request,
+                    offset: read.offset,
                     total,
                     bytes,
                 },
@@ -280,12 +362,41 @@ mod tests {
         );
         assert_eq!(reply.destination, Some(1));
         for content in [
-            Content::Arrive(network),
+            Content::Arrive {
+                network,
+                owner: frame::SurfaceOwner {
+                    address: 1,
+                    surface_bytes: 13,
+                },
+                sequence: 0,
+                hops: 1,
+            },
+            Content::FindOwners {
+                network,
+                seeker: 1,
+                request: 0,
+                remaining: frame::MAX_HOPS,
+            },
+            Content::OwnerFound {
+                network,
+                seeker: 2,
+                request: 0,
+                owner: frame::SurfaceOwner {
+                    address: 1,
+                    surface_bytes: 13,
+                },
+                hops: 1,
+            },
             Content::SurfacePart {
                 network,
-                sequence: 1,
-                offset: 0,
+                read: frame::SurfaceRead {
+                    reader: 1,
+                    owner: 2,
+                    request: 1,
+                    offset: 0,
+                },
                 total: 13,
+                hops: 1,
                 bytes: &[0; 13],
             },
         ] {

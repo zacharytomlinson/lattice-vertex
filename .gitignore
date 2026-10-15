@@ -30,3 +30,9 @@ FreeRTOS-Kernel/
 
 # Claude Code session data
 .claude/
+
+# Local investigations never belong to the distributed kernel source.
+/experiments/
+/lab/
+__pycache__/
+*.py[cod]

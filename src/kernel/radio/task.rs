@@ -14,18 +14,22 @@ use core::{
     marker::PhantomData,
     pin::pin,
     ptr,
+    sync::atomic::{AtomicPtr, Ordering},
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
 static mut STACK: [StackType_t; 1536] = [0; 1536];
 static mut CONTROL: tasks::StaticTask_t = tasks::StaticTask_t::new();
 static mut PERIPHERAL: Option<port::RadioPeripheral> = None;
-static mut PUBLICATION: Option<crate::kernel::peer::exposure::Publication> = None;
+static WAKE_TARGET: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static mut NATIVE: Option<&'static dyn crate::kernel::appliance::Native> = None;
+static mut DESCRIPTION: Option<crate::kernel::peer::exposure::Description> = None;
 
 pub(crate) fn start(
     context: &TaskContext,
     peripheral: port::RadioPeripheral,
-    publication: crate::kernel::peer::exposure::Publication,
+    description: crate::kernel::peer::exposure::Description,
+    native: &'static dyn crate::kernel::appliance::Native,
 ) {
     assert_eq!(
         tasks::xTaskGetSchedulerState(),
@@ -34,7 +38,8 @@ pub(crate) fn start(
     unsafe {
         assert!(PERIPHERAL.is_none(), "radio task already installed");
         PERIPHERAL = Some(peripheral);
-        PUBLICATION = Some(publication);
+        DESCRIPTION = Some(description);
+        NATIVE = Some(native);
         TaskHandle::spawn_static(context, b"radio", &mut STACK, &mut CONTROL, 3, run).unwrap();
     }
 }
@@ -73,13 +78,21 @@ unsafe fn clone_waker(data: *const ()) -> RawWaker {
 unsafe fn drop_waker(_: *const ()) {}
 static WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(clone_waker, wake, wake, drop_waker);
 
-fn wait<F: Future>(future: F, waker: &Waker, timeout: TickType_t) -> Option<F::Output> {
+fn wait<F: Future>(
+    future: F,
+    waker: &Waker,
+    timeout: TickType_t,
+    changes: bool,
+) -> Option<F::Output> {
     let start = tasks::xTaskGetTickCount();
     let mut future = pin!(future);
     let mut cx = Context::from_waker(waker);
     loop {
         if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
             return Some(result);
+        }
+        if changes && crate::kernel::change::pending() {
+            return None;
         }
         let remaining = if timeout == portMAX_DELAY {
             timeout
@@ -103,11 +116,25 @@ fn wait<F: Future>(future: F, waker: &Waker, timeout: TickType_t) -> Option<F::O
 /// hardware fixtures receive a scoped borrow through the test-only entry.
 pub struct Transport {
     radio: port::Radio,
+    changes: bool,
     waker: Waker,
     _task_context: PhantomData<*mut ()>,
 }
 
+pub(crate) fn notify_changes() {
+    let target = WAKE_TARGET.load(Ordering::Acquire);
+    if !target.is_null() {
+        unsafe {
+            wake(target.cast());
+        }
+    }
+}
+
 impl Transport {
+    pub(crate) fn enable_state_changes(&mut self) {
+        self.changes = true;
+    }
+
     pub fn address(&self) -> u64 {
         self.radio.address()
     }
@@ -122,8 +149,13 @@ impl Transport {
         let timeout =
             crate::milliseconds_to_ticks_checked(u64::from(duration_us).div_ceil(1000) + 20)
                 .unwrap();
-        wait(self.radio.energy_detect(duration_us), &self.waker, timeout)
-            .unwrap_or(Err(Error::Aborted))
+        wait(
+            self.radio.energy_detect(duration_us),
+            &self.waker,
+            timeout,
+            false,
+        )
+        .unwrap_or(Err(Error::Aborted))
     }
 
     pub fn receive(
@@ -131,17 +163,29 @@ impl Transport {
         frame: &mut [u8; MAX_FRAME_SIZE],
         timeout: TickType_t,
     ) -> Option<Result<usize, Error>> {
-        wait(self.radio.receive(frame), &self.waker, timeout)
+        wait(
+            self.radio.receive(frame),
+            &self.waker,
+            timeout,
+            self.changes,
+        )
     }
 
     pub fn transmit(&mut self, frame: &[u8]) -> Result<(), Error> {
         // No timeout drops active DMA. The driver retains its buffer until the
         // hardware completes or aborts this single attempt.
-        wait(self.radio.transmit(frame), &self.waker, portMAX_DELAY).unwrap()
+        wait(
+            self.radio.transmit(frame),
+            &self.waker,
+            portMAX_DELAY,
+            false,
+        )
+        .unwrap()
     }
 }
 
 extern "C" fn run(_: *mut c_void) {
+    WAKE_TARGET.store(tasks::xTaskGetCurrentTaskHandle(), Ordering::Release);
     let peripheral = unsafe { PERIPHERAL.take().unwrap() };
     let radio = port::Radio::new(peripheral);
     let waker = unsafe {
@@ -152,6 +196,7 @@ extern "C" fn run(_: *mut c_void) {
     };
     let mut transport = Transport {
         radio,
+        changes: false,
         waker,
         _task_context: PhantomData,
     };
@@ -159,5 +204,9 @@ extern "C" fn run(_: *mut c_void) {
     #[cfg(feature = "test-support")]
     super::testing::run(&mut transport);
 
-    crate::kernel::peer::run(&mut transport, unsafe { PUBLICATION.take().unwrap() })
+    crate::kernel::peer::run(
+        &mut transport,
+        unsafe { DESCRIPTION.take().unwrap() },
+        unsafe { NATIVE.take().unwrap() },
+    )
 }

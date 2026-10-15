@@ -9,6 +9,8 @@ publish = false
 [features]
 radio-probe = ["dep:lattice-radio-test"]
 peer-observer = ["dep:lattice-radio-test"]
+xiao-bootloader = ["cortex-m-rt/set-vtor", "cortex-m-rt/set-sp"]
+usb-console = ["dep:embassy-usb", "dep:embassy-futures"]
 
 [[bin]]
 name = "radio"
@@ -20,6 +22,8 @@ lattice-vertex = { path = "../../../..", default-features = false, features = ["
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
 rtt-target = "=0.6.2"
+embassy-usb = { version = "=0.5.1", default-features = false, optional = true }
+embassy-futures = { version = "=0.1.2", optional = true }
 
 [profile.release]
 opt-level = "s"

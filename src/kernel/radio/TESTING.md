@@ -28,7 +28,10 @@ probe-rs run --chip nRF52840_xxAA target/thumbv7em-none-eabihf/release/radio
 
 Nordic's standalone memory layout begins at flash address zero. This image is
 for SWD loading and RTT output; a board's USB/UF2 bootloader needs its own image
-layout/packaging. Where the ARM target component is unavailable but Rust sources
+layout/packaging. The XIAO path in the
+[Nordic README](../../port/nrf52840/tests/README.md) supplies that layout and a
+USB console; select `radio-probe,xiao-bootloader,usb-console` for this workload.
+Where the ARM target component is unavailable but Rust sources
 are installed, use `cargo +nightly build -Z build-std=core` with the same flags.
 
 Select the actual connected device before flashing. Flashing replaces its
@@ -39,13 +42,6 @@ slightly different intervals derived from their factory identifiers. Each valid
 probe causes a directed reply. Replies do not cause further replies. The shared
 test settings are channel 15, broadcast PAN 0xffff, extended source addresses,
 and no requested MAC ACK. C6 uses 20 dBm and nRF52840 uses 8 dBm.
-
-For this C6 RF investigation, TX power is fixed at **20 dBm**, including every
-vendor-reference comparison. Lower-power sweeps and board-substitution trials
-are already covered by the earlier work and must not be repeated as the next
-diagnostic step. Similar RSSI across all three units and pairings directs the
-investigation toward their shared setup; it is not evidence that the RF result
-is satisfactory.
 
 Look for `START kernel radio`, followed by `RADIO ... Statistics` lines. Both boards
 must show increasing `received`, `replies_sent`, and `replies_received`; a
@@ -74,64 +70,6 @@ Zero received frames and zero replies are expected without another Lattice
 participant. This run can establish local progress and TX completion handling;
 it cannot establish peer reception, receive IRQ handling, or RF range.
 
-### Recorded C6 result — 2026-10-06
-
-User-supplied serial output from C6 `E8:F6:0A:FB:EF:E0` reached tick 34,012:
-
-| Measurement | Final value |
-| --- | --- |
-| Task activity at every reported sample | `Receiving` |
-| Radio-reported completed transmissions | 15 |
-| Radio interrupt wakeups | 15 |
-| Receive deadlines | 15 |
-| Task notification waits | 31 |
-| Receive/transmit errors and evictions | 0 |
-| Received frames and replies | 0 |
-
-This chip's derived probe interval is 2,132 ticks. Fifteen completions by this
-sample agree with that interval; the sixteenth probe is not due until at least
-tick 34,112, plus initialization time. The receive deadlines are expected probe
-triggers with no peer, not receive failures.
-
-The capture demonstrates kernel startup and repeated TX interrupt → notification
-→ task-resume cycles, returning to receive waits without a reported error or
-reset during the capture. This one-board capture does not establish peer
-reception, RX interrupt handling, replies, or RF range.
-
-This capture predates moving the probe workload into `lattice-radio-test`. The
-pair run below exercises the separated workload.
-
-### Recorded C6 pair result — 2026-10-06
-
-User-supplied excerpts from both terminals after the separated-image flash
-instructions show bidirectional exchange. The connected C6s were
-`E8:F6:0A:FB:EF:E0` and `9C:CC:01:40:67:98`; the pasted streams were not labeled
-by port, so columns retain their order in the report.
-
-| Measurement | First capture, final sample | Second capture, final sample |
-| --- | --- | --- |
-| Kernel tick | 41,040 | 66,050 |
-| Received frames | 35 | 40 |
-| Completed transmissions | 36 | 50 |
-| Replies received | 17 | 20 |
-| Replies sent | 18 | 20 |
-| Radio interrupt wakeups | 71 | 90 |
-| Receive deadlines | 18 | 30 |
-| Notification waits | 90 | 121 |
-| Ignored frames, receive/transmit errors, evictions | 0 | 0 |
-| Reported task activity | `Receiving` | `Receiving` |
-
-Both excerpts show increasing received frames and sent/received replies. At each
-final sample, interrupt wakeups equal RX plus TX completions (35 + 36 = 71 and
-40 + 50 = 90). Notification waits equal wakeups plus receive deadlines plus the
-current receive wait. This supports the complete radio IRQ → kernel wakeup →
-probe/reply workload → transmission path on both C6s.
-
-The samples have different uptimes and no common wall-clock interval. Unanswered
-probe totals cannot be classified as packet loss from these excerpts, and zero
-driver errors do not prove loss-free delivery. RF range and Nordic execution or
-cross-chip interoperability remain unverified.
-
 ## Probe diagnostics
 
 The shared workload records these fixture-owned diagnostics:
@@ -151,9 +89,9 @@ The shared workload records these fixture-owned diagnostics:
   count of RF errors. `receive_errors` still counts errors returned by the receive
   API, which previously hid this distinction.
 
-The [RF investigation](../../../experiments/esp32c6-rf/RF_RESULTS.md) retains
-PHY comparisons, Wi-Fi/vendor controls, register snapshots, and antenna trials.
-Those experiments are separate from the kernel transport checks.
+Historical RF measurements, vendor comparisons, and one-off captures are kept
+outside the kernel repository. The maintained probe verifies the transport/IRQ
+path; its counters do not prove radio range or loss-free delivery.
 
 ## Build separation checks
 

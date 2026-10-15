@@ -797,14 +797,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hal-protocol"
-version = "0.1.0"
-source = "git+ssh://git@github.com/zacharytomlinson/diffuser-fw.git?rev=e78cbe3eb31f977222a97acd6f628534462d7ab5#e78cbe3eb31f977222a97acd6f628534462d7ab5"
-dependencies = [
- "matter-topology",
-]
-
-[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -951,15 +943,11 @@ dependencies = [
  "esp-phy",
  "esp-sync",
  "esp-wifi-sys-esp32c6",
- "hal-protocol",
  "heapless 0.9.3",
  "ieee802154",
  "lattice-ir",
- "matter-topology",
- "mhz-radio-surface",
  "riscv 0.12.1",
  "riscv-rt",
- "s3-control",
 ]
 
 [[package]]
@@ -969,29 +957,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
-name = "matter-topology"
-version = "0.1.0"
-source = "git+ssh://git@github.com/zacharytomlinson/diffuser-fw.git?rev=e78cbe3eb31f977222a97acd6f628534462d7ab5#e78cbe3eb31f977222a97acd6f628534462d7ab5"
-
-[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
-
-[[package]]
-name = "mhz-radio-core"
-version = "0.1.0"
-source = "git+ssh://git@github.com/zacharytomlinson/mhz-radio-fw.git?rev=846da6acc2cf2980d2b14d5162cc76a5c775e9b6#846da6acc2cf2980d2b14d5162cc76a5c775e9b6"
-
-[[package]]
-name = "mhz-radio-surface"
-version = "0.1.0"
-source = "git+ssh://git@github.com/zacharytomlinson/mhz-radio-fw.git?rev=846da6acc2cf2980d2b14d5162cc76a5c775e9b6#846da6acc2cf2980d2b14d5162cc76a5c775e9b6"
-dependencies = [
- "mhz-radio-core",
- "serde",
-]
 
 [[package]]
 name = "nb"
@@ -1202,15 +1171,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "s3-control"
-version = "0.1.0"
-source = "git+ssh://git@github.com/zacharytomlinson/diffuser-fw.git?rev=e78cbe3eb31f977222a97acd6f628534462d7ab5#e78cbe3eb31f977222a97acd6f628534462d7ab5"
-dependencies = [
- "hal-protocol",
- "matter-topology",
-]
 
 [[package]]
 name = "semver"

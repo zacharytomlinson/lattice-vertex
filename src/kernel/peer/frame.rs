@@ -1,7 +1,8 @@
-//! Discovery, arrival, and surface-publication envelopes over 802.15.4.
+//! Discovery, surface reads, native invocation, and state deltas over 802.15.4.
 //! PHY length/FCS belong to the port. Network tags are not credentials.
 
 use super::{Network, PAN_ID};
+use crate::ir::{Integer, Type, Value};
 use crate::kernel::radio::MAX_FRAME_SIZE;
 use byte::BytesExt;
 use ieee802154::mac::{
@@ -10,25 +11,115 @@ use ieee802154::mac::{
 };
 
 const PAN: PanId = PanId(PAN_ID);
-const MAGIC: &[u8; 4] = b"LVT\x02";
-pub(super) const SURFACE_BYTES: usize = MAX_FRAME_SIZE - 21 - 20;
+const MAGIC: &[u8; 4] = b"LVT\x05";
+pub(super) const MAX_HOPS: u8 = 8;
+const MAX_PAYLOAD: usize = MAX_FRAME_SIZE - 21;
+// Worst-case addressed MAC header plus the complete routed reply envelope.
+pub(super) const SURFACE_BYTES: usize = MAX_PAYLOAD - 37;
+pub(super) const CALL_ARGUMENT_BYTES: usize = MAX_PAYLOAD - 43;
+pub(super) const MAX_CALL_ARGUMENTS: usize = (CALL_ARGUMENT_BYTES - 1) / 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Invocation {
+    pub caller: u64,
+    pub owner: u64,
+    pub request: u32,
+    pub transformer: u64,
+}
+
+/// Result of dispatch, never a claim that physical state has converged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum InvokeStatus {
+    Invoked = 0,
+    Arguments = 1,
+    UnknownTransformer = 2,
+    ApplianceError = 3,
+    Busy = 4,
+    ConflictingRequest = 5,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct StateDelta {
+    pub owner: u64,
+    pub attribute: u64,
+    pub sequence: u32,
+    pub value: Option<Value>,
+}
+
+/// Presence metadata only; no mathematical definition or live value is copied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SurfaceOwner {
+    pub address: u64,
+    pub surface_bytes: u16,
+}
+
+/// One immutable range request. The reader chooses a fresh token for each
+/// attempt; MAC sequence numbers identify individual link transmissions only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SurfaceRead {
+    pub reader: u64,
+    pub owner: u64,
+    pub request: u16,
+    pub offset: u16,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Content<'a> {
     Discover,
     Present(Network),
     Propose(Network),
-    Arrive(Network),
+    Arrive {
+        network: Network,
+        owner: SurfaceOwner,
+        sequence: u16,
+        hops: u8,
+    },
+    FindOwners {
+        network: Network,
+        seeker: u64,
+        request: u16,
+        remaining: u8,
+    },
+    OwnerFound {
+        network: Network,
+        seeker: u64,
+        request: u16,
+        owner: SurfaceOwner,
+        hops: u8,
+    },
+    ReadSurface {
+        network: Network,
+        read: SurfaceRead,
+        remaining: u8,
+    },
     SurfacePart {
         network: Network,
-        sequence: u16,
-        offset: u16,
+        read: SurfaceRead,
         total: u16,
+        hops: u8,
         bytes: &'a [u8],
+    },
+    Invoke {
+        network: Network,
+        call: Invocation,
+        remaining: u8,
+        arguments: &'a [u8],
+    },
+    InvocationResult {
+        network: Network,
+        call: Invocation,
+        status: InvokeStatus,
+        hops: u8,
+    },
+    StateChanged {
+        network: Network,
+        delta: StateDelta,
+        hops: u8,
     },
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Message<'a> {
     pub source: u64,
     pub destination: Option<u64>,
@@ -40,37 +131,145 @@ pub(super) struct InvalidFrame;
 
 impl<'a> Message<'a> {
     pub fn encode(&self, sequence: u8, out: &mut [u8; MAX_FRAME_SIZE]) -> usize {
-        let mut payload = [0; 20 + SURFACE_BYTES];
+        let mut payload = [0; 37 + SURFACE_BYTES];
         payload[..4].copy_from_slice(MAGIC);
         let size = match self.content {
             Content::Discover => 5,
-            Content::Present(network) | Content::Propose(network) | Content::Arrive(network) => {
+            Content::Present(network) | Content::Propose(network) => {
                 payload[4] = match self.content {
                     Content::Present(_) => 1,
-                    Content::Propose(_) => 2,
-                    _ => 3,
+                    _ => 2,
                 };
                 payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
                 payload[13] = network.channel;
                 14
             }
-            Content::SurfacePart {
+            Content::Arrive {
                 network,
+                owner,
                 sequence,
-                offset,
-                total,
-                bytes,
+                hops,
             } => {
-                assert!(!bytes.is_empty() && bytes.len() <= SURFACE_BYTES);
-                assert!(usize::from(offset) + bytes.len() <= usize::from(total));
+                payload[4] = 3;
+                payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
+                payload[13] = network.channel;
+                payload[14..22].copy_from_slice(&owner.address.to_le_bytes());
+                payload[22..24].copy_from_slice(&sequence.to_le_bytes());
+                payload[24..26].copy_from_slice(&owner.surface_bytes.to_le_bytes());
+                payload[26] = hops;
+                27
+            }
+            Content::FindOwners {
+                network,
+                seeker,
+                request,
+                remaining,
+            } => {
+                payload[4] = 6;
+                payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
+                payload[13] = network.channel;
+                payload[14..22].copy_from_slice(&seeker.to_le_bytes());
+                payload[22..24].copy_from_slice(&request.to_le_bytes());
+                payload[24] = remaining;
+                25
+            }
+            Content::OwnerFound {
+                network,
+                seeker,
+                request,
+                owner,
+                hops,
+            } => {
+                payload[4] = 7;
+                payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
+                payload[13] = network.channel;
+                payload[14..22].copy_from_slice(&seeker.to_le_bytes());
+                payload[22..24].copy_from_slice(&request.to_le_bytes());
+                payload[24..32].copy_from_slice(&owner.address.to_le_bytes());
+                payload[32..34].copy_from_slice(&owner.surface_bytes.to_le_bytes());
+                payload[34] = hops;
+                35
+            }
+            Content::ReadSurface {
+                network,
+                read,
+                remaining,
+            } => {
                 payload[4] = 4;
                 payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
                 payload[13] = network.channel;
-                payload[14..16].copy_from_slice(&sequence.to_le_bytes());
-                payload[16..18].copy_from_slice(&offset.to_le_bytes());
-                payload[18..20].copy_from_slice(&total.to_le_bytes());
-                payload[20..20 + bytes.len()].copy_from_slice(bytes);
-                20 + bytes.len()
+                read.encode(&mut payload[14..34]);
+                payload[34] = remaining;
+                35
+            }
+            Content::SurfacePart {
+                network,
+                read,
+                total,
+                hops,
+                bytes,
+            } => {
+                assert!(read.offset <= total);
+                assert_eq!(
+                    bytes.len(),
+                    SURFACE_BYTES.min(usize::from(total - read.offset))
+                );
+                payload[4] = 5;
+                payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
+                payload[13] = network.channel;
+                read.encode(&mut payload[14..34]);
+                payload[34..36].copy_from_slice(&total.to_le_bytes());
+                payload[36] = hops;
+                payload[37..37 + bytes.len()].copy_from_slice(bytes);
+                37 + bytes.len()
+            }
+            Content::Invoke {
+                network,
+                call,
+                remaining,
+                arguments,
+            } => {
+                assert!(valid_arguments(arguments));
+                payload[4] = 8;
+                payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
+                payload[13] = network.channel;
+                call.encode(&mut payload[14..42]);
+                payload[42] = remaining;
+                payload[43..43 + arguments.len()].copy_from_slice(arguments);
+                43 + arguments.len()
+            }
+            Content::InvocationResult {
+                network,
+                call,
+                status,
+                hops,
+            } => {
+                payload[4] = 9;
+                payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
+                payload[13] = network.channel;
+                call.encode(&mut payload[14..42]);
+                payload[42] = status as u8;
+                payload[43] = hops;
+                44
+            }
+            Content::StateChanged {
+                network,
+                delta,
+                hops,
+            } => {
+                payload[4] = 10;
+                payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
+                payload[13] = network.channel;
+                payload[14..22].copy_from_slice(&delta.owner.to_le_bytes());
+                payload[22..30].copy_from_slice(&delta.attribute.to_le_bytes());
+                payload[30..34].copy_from_slice(&delta.sequence.to_le_bytes());
+                payload[34] = hops;
+                if let Some(value) = delta.value {
+                    35 + encode_value(value, &mut payload[35..])
+                } else {
+                    payload[35] = 255;
+                    36
+                }
             }
         };
         let destination = match self.destination {
@@ -136,7 +335,7 @@ impl<'a> Message<'a> {
         }
         let content = match (p[4], p.len(), destination) {
             (0, 5, None) => Content::Discover,
-            (1 | 2 | 3, 14, _) => {
+            (1 | 2, 14, _) => {
                 let network = Network {
                     founder: u64::from_le_bytes(p[5..13].try_into().unwrap()),
                     channel: p[13],
@@ -145,39 +344,221 @@ impl<'a> Message<'a> {
                 // also advertises its proposed channel while sweeping others.
                 if !network.valid()
                     || (p[4] == 1 && (network.channel != channel || destination.is_none()))
-                    || (p[4] == 3 && (network.channel != channel || destination.is_some()))
                 {
                     return Err(InvalidFrame);
                 }
                 match p[4] {
                     1 => Content::Present(network),
-                    2 => Content::Propose(network),
-                    _ => Content::Arrive(network),
+                    _ => Content::Propose(network),
                 }
             }
-            (4, n, None) if n > 20 && n <= 20 + SURFACE_BYTES => {
+            (3, 27, None) | (6, 25, None) | (7, 35, Some(_)) => {
                 let network = Network {
                     founder: u64::from_le_bytes(p[5..13].try_into().unwrap()),
                     channel: p[13],
                 };
-                let sequence = u16::from_le_bytes(p[14..16].try_into().unwrap());
-                let offset = u16::from_le_bytes(p[16..18].try_into().unwrap());
-                let total = u16::from_le_bytes(p[18..20].try_into().unwrap());
+                if !network.valid() || network.channel != channel {
+                    return Err(InvalidFrame);
+                }
+                let address = u64::from_le_bytes(p[14..22].try_into().unwrap());
+                let token = u16::from_le_bytes(p[22..24].try_into().unwrap());
+                if !valid_address(address) {
+                    return Err(InvalidFrame);
+                }
+                if p[4] == 6 {
+                    let remaining = p[24];
+                    if !(1..=MAX_HOPS).contains(&remaining)
+                        || (remaining == MAX_HOPS && source != address)
+                    {
+                        return Err(InvalidFrame);
+                    }
+                    Content::FindOwners {
+                        network,
+                        seeker: address,
+                        request: token,
+                        remaining,
+                    }
+                } else {
+                    let (owner, hops) = if p[4] == 3 {
+                        (
+                            SurfaceOwner {
+                                address,
+                                surface_bytes: u16::from_le_bytes(p[24..26].try_into().unwrap()),
+                            },
+                            p[26],
+                        )
+                    } else {
+                        (
+                            SurfaceOwner {
+                                address: u64::from_le_bytes(p[24..32].try_into().unwrap()),
+                                surface_bytes: u16::from_le_bytes(p[32..34].try_into().unwrap()),
+                            },
+                            p[34],
+                        )
+                    };
+                    if !valid_address(owner.address)
+                        || owner.surface_bytes < 13
+                        || !(1..=MAX_HOPS).contains(&hops)
+                        || (hops == 1 && source != owner.address)
+                    {
+                        return Err(InvalidFrame);
+                    }
+                    if p[4] == 3 {
+                        Content::Arrive {
+                            network,
+                            owner,
+                            sequence: token,
+                            hops,
+                        }
+                    } else if owner.address != address {
+                        Content::OwnerFound {
+                            network,
+                            seeker: address,
+                            request: token,
+                            owner,
+                            hops,
+                        }
+                    } else {
+                        return Err(InvalidFrame);
+                    }
+                }
+            }
+            (4, 35, _) | (5, 37..=MAX_PAYLOAD, Some(_)) => {
+                let network = Network {
+                    founder: u64::from_le_bytes(p[5..13].try_into().unwrap()),
+                    channel: p[13],
+                };
+                let read = SurfaceRead::decode(&p[14..34]);
                 if !network.valid()
                     || network.channel != channel
-                    || total < 13
-                    || offset >= total
-                    || offset as usize % SURFACE_BYTES != 0
-                    || n - 20 != SURFACE_BYTES.min(usize::from(total - offset))
+                    || !valid_address(read.reader)
+                    || !valid_address(read.owner)
+                    || read.reader == read.owner
                 {
                     return Err(InvalidFrame);
                 }
-                Content::SurfacePart {
+                if p[4] == 4 {
+                    let remaining = p[34];
+                    if !(1..=MAX_HOPS).contains(&remaining)
+                        || (remaining == MAX_HOPS && source != read.reader)
+                    {
+                        return Err(InvalidFrame);
+                    }
+                    Content::ReadSurface {
+                        network,
+                        read,
+                        remaining,
+                    }
+                } else {
+                    let total = u16::from_le_bytes(p[34..36].try_into().unwrap());
+                    let hops = p[36];
+                    if total < 13
+                        || read.offset > total
+                        || !(1..=MAX_HOPS).contains(&hops)
+                        || (hops == 1 && source != read.owner)
+                        || p.len() - 37 != SURFACE_BYTES.min(usize::from(total - read.offset))
+                    {
+                        return Err(InvalidFrame);
+                    }
+                    Content::SurfacePart {
+                        network,
+                        read,
+                        total,
+                        hops,
+                        bytes: &p[37..],
+                    }
+                }
+            }
+            (8, 44..=MAX_PAYLOAD, _) | (9, 44, Some(_)) => {
+                let network = Network {
+                    founder: u64::from_le_bytes(p[5..13].try_into().unwrap()),
+                    channel: p[13],
+                };
+                let call = Invocation::decode(&p[14..42]);
+                if !network.valid()
+                    || network.channel != channel
+                    || !valid_address(call.caller)
+                    || !valid_address(call.owner)
+                    || call.caller == call.owner
+                    || !valid_address(call.transformer)
+                {
+                    return Err(InvalidFrame);
+                }
+                if p[4] == 8 {
+                    let remaining = p[42];
+                    if !(1..=MAX_HOPS).contains(&remaining)
+                        || (remaining == MAX_HOPS && source != call.caller)
+                        || !valid_arguments(&p[43..])
+                    {
+                        return Err(InvalidFrame);
+                    }
+                    Content::Invoke {
+                        network,
+                        call,
+                        remaining,
+                        arguments: &p[43..],
+                    }
+                } else {
+                    let status = match p[42] {
+                        0 => InvokeStatus::Invoked,
+                        1 => InvokeStatus::Arguments,
+                        2 => InvokeStatus::UnknownTransformer,
+                        3 => InvokeStatus::ApplianceError,
+                        4 => InvokeStatus::Busy,
+                        5 => InvokeStatus::ConflictingRequest,
+                        _ => return Err(InvalidFrame),
+                    };
+                    let hops = p[43];
+                    if !(1..=MAX_HOPS).contains(&hops) || (hops == 1 && source != call.owner) {
+                        return Err(InvalidFrame);
+                    }
+                    Content::InvocationResult {
+                        network,
+                        call,
+                        status,
+                        hops,
+                    }
+                }
+            }
+            (10, 36..=44, None) => {
+                let network = Network {
+                    founder: u64::from_le_bytes(p[5..13].try_into().unwrap()),
+                    channel: p[13],
+                };
+                let owner = u64::from_le_bytes(p[14..22].try_into().unwrap());
+                let attribute = u64::from_le_bytes(p[22..30].try_into().unwrap());
+                let sequence = u32::from_le_bytes(p[30..34].try_into().unwrap());
+                let hops = p[34];
+                if !network.valid()
+                    || network.channel != channel
+                    || !valid_address(owner)
+                    || !valid_address(attribute)
+                    || !(1..=MAX_HOPS).contains(&hops)
+                    || (hops == 1 && owner != source)
+                {
+                    return Err(InvalidFrame);
+                }
+                let value = if p[35] == 255 {
+                    if p.len() != 36 {
+                        return Err(InvalidFrame);
+                    }
+                    None
+                } else {
+                    let (value, n) = decode_value(&p[35..]).ok_or(InvalidFrame)?;
+                    if n != p.len() - 35 {
+                        return Err(InvalidFrame);
+                    }
+                    Some(value)
+                };
+                Content::StateChanged {
                     network,
-                    sequence,
-                    offset,
-                    total,
-                    bytes: &p[20..],
+                    delta: StateDelta {
+                        owner,
+                        attribute,
+                        sequence,
+                        value,
+                    },
+                    hops,
                 }
             }
             _ => return Err(InvalidFrame),
@@ -190,6 +571,161 @@ impl<'a> Message<'a> {
     }
 }
 
+impl Invocation {
+    fn encode(self, out: &mut [u8]) {
+        out[..8].copy_from_slice(&self.caller.to_le_bytes());
+        out[8..16].copy_from_slice(&self.owner.to_le_bytes());
+        out[16..20].copy_from_slice(&self.request.to_le_bytes());
+        out[20..28].copy_from_slice(&self.transformer.to_le_bytes());
+    }
+    fn decode(bytes: &[u8]) -> Self {
+        Self {
+            caller: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            owner: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            request: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            transformer: u64::from_le_bytes(bytes[20..28].try_into().unwrap()),
+        }
+    }
+}
+
+pub(super) fn type_tag(ty: Type) -> u8 {
+    match ty {
+        Type::Bool => 0,
+        Type::Integer(i) => match i {
+            Integer::U8 => 1,
+            Integer::U16 => 2,
+            Integer::U32 => 3,
+            Integer::U64 => 4,
+            Integer::I8 => 5,
+            Integer::I16 => 6,
+            Integer::I32 => 7,
+            Integer::I64 => 8,
+        },
+    }
+}
+
+pub(super) fn encode_value(value: Value, out: &mut [u8]) -> usize {
+    out[0] = type_tag(value.ty());
+    match value.ty() {
+        Type::Bool => {
+            out[1] = u8::from(value.as_bool().unwrap());
+            2
+        }
+        Type::Integer(ty) => {
+            let n = ty.width() as usize / 8;
+            out[1..1 + n].copy_from_slice(&(value.as_integer().unwrap() as u64).to_le_bytes()[..n]);
+            1 + n
+        }
+    }
+}
+
+pub(super) fn decode_value(bytes: &[u8]) -> Option<(Value, usize)> {
+    let tag = *bytes.first()?;
+    if tag == 0 {
+        return match bytes.get(1)? {
+            0 => Some((Value::boolean(false), 2)),
+            1 => Some((Value::boolean(true), 2)),
+            _ => None,
+        };
+    }
+    let ty = match tag {
+        1 => Integer::U8,
+        2 => Integer::U16,
+        3 => Integer::U32,
+        4 => Integer::U64,
+        5 => Integer::I8,
+        6 => Integer::I16,
+        7 => Integer::I32,
+        8 => Integer::I64,
+        _ => return None,
+    };
+    let n = ty.width() as usize / 8;
+    let mut raw = [0; 8];
+    raw[..n].copy_from_slice(bytes.get(1..1 + n)?);
+    let bits = u64::from_le_bytes(raw);
+    let mut value = i128::from(bits);
+    if ty.signed() && bits & (1u64 << (ty.width() - 1)) != 0 {
+        value -= 1i128 << ty.width();
+    }
+    Some((Value::integer(ty, value).ok()?, 1 + n))
+}
+
+fn valid_arguments(bytes: &[u8]) -> bool {
+    let Some(&count) = bytes.first() else {
+        return false;
+    };
+    if bytes.len() > CALL_ARGUMENT_BYTES || usize::from(count) > MAX_CALL_ARGUMENTS {
+        return false;
+    }
+    let mut offset = 1;
+    for _ in 0..count {
+        let Some((_, n)) = decode_value(&bytes[offset..]) else {
+            return false;
+        };
+        offset += n;
+    }
+    offset == bytes.len()
+}
+
+pub(super) fn decode_arguments<'a>(
+    bytes: &[u8],
+    out: &'a mut [Value; MAX_CALL_ARGUMENTS],
+) -> Option<&'a [Value]> {
+    if !valid_arguments(bytes) {
+        return None;
+    }
+    let count = bytes[0] as usize;
+    let mut offset = 1;
+    for value in &mut out[..count] {
+        let (v, n) = decode_value(&bytes[offset..])?;
+        *value = v;
+        offset += n;
+    }
+    Some(&out[..count])
+}
+
+#[cfg(test)]
+pub(super) fn encode_arguments(
+    values: &[Value],
+    out: &mut [u8; CALL_ARGUMENT_BYTES],
+) -> Option<usize> {
+    if values.len() > MAX_CALL_ARGUMENTS {
+        return None;
+    }
+    out[0] = values.len() as u8;
+    let mut offset = 1;
+    for &value in values {
+        let mut scalar = [0; 9];
+        let n = encode_value(value, &mut scalar);
+        out.get_mut(offset..offset + n)?
+            .copy_from_slice(&scalar[..n]);
+        offset += n;
+    }
+    Some(offset)
+}
+
+fn valid_address(address: u64) -> bool {
+    address != 0 && address != u64::MAX
+}
+
+impl SurfaceRead {
+    fn encode(self, out: &mut [u8]) {
+        out[..8].copy_from_slice(&self.reader.to_le_bytes());
+        out[8..16].copy_from_slice(&self.owner.to_le_bytes());
+        out[16..18].copy_from_slice(&self.request.to_le_bytes());
+        out[18..20].copy_from_slice(&self.offset.to_le_bytes());
+    }
+
+    fn decode(bytes: &[u8]) -> Self {
+        Self {
+            reader: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            owner: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            request: u16::from_le_bytes(bytes[16..18].try_into().unwrap()),
+            offset: u16::from_le_bytes(bytes[18..20].try_into().unwrap()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,26 +733,398 @@ mod tests {
     const B: u64 = 0x1112_1314_1516_1718;
 
     #[test]
-    fn publication_fragments_are_bounded_broadcasts_with_exact_offsets() {
+    fn scalar_arguments_keep_width_signedness_and_fit_one_frame() {
+        let mut bytes = [0; CALL_ARGUMENT_BYTES];
+        let mut decoded = [Value::boolean(false); MAX_CALL_ARGUMENTS];
+        for (ty, lo, hi, tag, width) in [
+            (Integer::U8, 0, u8::MAX as i128, 1, 1),
+            (Integer::U16, 0, u16::MAX as i128, 2, 2),
+            (Integer::U32, 0, u32::MAX as i128, 3, 4),
+            (Integer::U64, 0, u64::MAX as i128, 4, 8),
+            (Integer::I8, i8::MIN as i128, i8::MAX as i128, 5, 1),
+            (Integer::I16, i16::MIN as i128, i16::MAX as i128, 6, 2),
+            (Integer::I32, i32::MIN as i128, i32::MAX as i128, 7, 4),
+            (Integer::I64, i64::MIN as i128, i64::MAX as i128, 8, 8),
+        ] {
+            for value in [lo, hi] {
+                let values = [Value::integer(ty, value).unwrap()];
+                let n = encode_arguments(&values, &mut bytes).unwrap();
+                assert_eq!(n, 2 + width);
+                assert_eq!(&bytes[..2], &[1, tag]);
+                assert_eq!(&bytes[2..n], &(value as u64).to_le_bytes()[..width]);
+                assert_eq!(decode_arguments(&bytes[..n], &mut decoded).unwrap(), values);
+                for end in 0..n {
+                    assert!(decode_arguments(&bytes[..end], &mut decoded).is_none());
+                }
+            }
+        }
+        for value in [false, true] {
+            assert_eq!(
+                encode_arguments(&[Value::boolean(value)], &mut bytes),
+                Some(3)
+            );
+            assert_eq!(&bytes[..3], &[1, 0, u8::from(value)]);
+        }
+        assert_eq!(encode_arguments(&[], &mut bytes), Some(1));
+        assert_eq!(decode_arguments(&bytes[..1], &mut decoded).unwrap(), &[]);
+        for bad in [
+            &[][..],
+            &[1],
+            &[1, 0, 2],
+            &[0, 0],
+            &[1, 255],
+            &[1, 9, 0],
+            &[2, 0, 1],
+        ] {
+            assert!(decode_arguments(bad, &mut decoded).is_none());
+        }
+        assert_eq!(
+            encode_arguments(&[Value::boolean(true); 30], &mut bytes),
+            Some(61)
+        );
+        let call = Invocation {
+            caller: A,
+            owner: B,
+            request: 7,
+            transformer: 42,
+        };
+        let message = Message {
+            source: A,
+            destination: Some(B),
+            content: Content::Invoke {
+                network: Network {
+                    founder: 99,
+                    channel: 15,
+                },
+                call,
+                remaining: MAX_HOPS,
+                arguments: &bytes,
+            },
+        };
+        let mut wire = [0; MAX_FRAME_SIZE];
+        let n = message.encode(0, &mut wire);
+        assert_eq!(n, MAX_FRAME_SIZE);
+        assert_eq!(Message::decode(&wire[..n], B, 15).unwrap(), message);
+        assert_eq!(
+            encode_arguments(&[Value::boolean(true); 31], &mut bytes),
+            None
+        );
+        let large = Value::integer(Integer::U64, u64::MAX as i128).unwrap();
+        assert_eq!(encode_arguments(&[large; 6], &mut bytes), Some(55));
+        assert_eq!(encode_arguments(&[large; 7], &mut bytes), None);
+    }
+
+    #[test]
+    fn control_and_delta_envelopes_are_complete_numeric_messages() {
+        let network = Network {
+            founder: 99,
+            channel: 15,
+        };
+        let call = Invocation {
+            caller: A,
+            owner: B,
+            request: 0x04030201,
+            transformer: 0x0807060504030201,
+        };
+        let request = Message {
+            source: A,
+            destination: Some(B),
+            content: Content::Invoke {
+                network,
+                call,
+                remaining: MAX_HOPS,
+                arguments: &[1, 0, 1],
+            },
+        };
+        let mut wire = [0; MAX_FRAME_SIZE];
+        let n = request.encode(7, &mut wire);
+        assert_eq!(n, 67);
+        assert_eq!(
+            &wire[21..n],
+            &[
+                b'L', b'V', b'T', 5, 8, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
+                23, 22, 21, 20, 19, 18, 17, 1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8, 8, 1, 0, 1,
+            ]
+        );
+        for message in [
+            request,
+            Message {
+                source: B,
+                destination: Some(A),
+                content: Content::InvocationResult {
+                    network,
+                    call,
+                    status: InvokeStatus::Invoked,
+                    hops: 1,
+                },
+            },
+            Message {
+                source: A,
+                destination: None,
+                content: Content::StateChanged {
+                    network,
+                    delta: StateDelta {
+                        owner: A,
+                        attribute: 42,
+                        sequence: 17,
+                        value: None,
+                    },
+                    hops: 1,
+                },
+            },
+            Message {
+                source: A,
+                destination: None,
+                content: Content::StateChanged {
+                    network,
+                    delta: StateDelta {
+                        owner: A,
+                        attribute: 42,
+                        sequence: 18,
+                        value: Some(Value::boolean(false)),
+                    },
+                    hops: 1,
+                },
+            },
+            Message {
+                source: A,
+                destination: None,
+                content: Content::StateChanged {
+                    network,
+                    delta: StateDelta {
+                        owner: A,
+                        attribute: 42,
+                        sequence: 19,
+                        value: Some(Value::integer(Integer::I64, -1).unwrap()),
+                    },
+                    hops: 1,
+                },
+            },
+        ] {
+            let local = if message.source == A { B } else { A };
+            let mut wire = [0; MAX_FRAME_SIZE];
+            let n = message.encode(7, &mut wire);
+            assert_eq!(Message::decode(&wire[..n], local, 15).unwrap(), message);
+            assert!(Message::decode(&wire[..n], local, 16).is_err());
+            for end in 0..n {
+                assert!(Message::decode(&wire[..end], local, 15).is_err());
+            }
+            assert!(Message::decode(&wire[..n + 1], local, 15).is_err());
+            let header = if message.destination.is_some() {
+                21
+            } else {
+                15
+            };
+            let hop = match message.content {
+                Content::Invoke { .. } => 42,
+                Content::InvocationResult { .. } => 43,
+                _ => 34,
+            };
+            for value in [0, 9] {
+                let mut bad = wire;
+                bad[header + hop] = value;
+                assert!(Message::decode(&bad[..n], local, 15).is_err());
+            }
+            for range in [14..22, 22..30] {
+                for value in [0, 255] {
+                    let mut bad = wire;
+                    bad[header + range.start..header + range.end].fill(value);
+                    assert!(Message::decode(&bad[..n], local, 15).is_err());
+                }
+            }
+        }
+        // Status and scalar tags are strict; neither failure is an application call.
+        let reply = Message {
+            source: B,
+            destination: Some(A),
+            content: Content::InvocationResult {
+                network,
+                call,
+                status: InvokeStatus::Busy,
+                hops: 1,
+            },
+        };
+        let n = reply.encode(0, &mut wire);
+        wire[21 + 42] = 6;
+        assert!(Message::decode(&wire[..n], A, 15).is_err());
+        let n = request.encode(0, &mut wire);
+        wire[21 + 45] = 2;
+        assert!(Message::decode(&wire[..n], B, 15).is_err());
+    }
+
+    #[test]
+    fn owner_discovery_wire_vectors_preserve_origin_and_enforce_scope() {
+        let network = Network {
+            founder: 99,
+            channel: 23,
+        };
+        let owner = SurfaceOwner {
+            address: A,
+            surface_bytes: 195,
+        };
+        let cases: &[(Content, Option<u64>, &[u8])] = &[
+            (
+                Content::Arrive {
+                    network,
+                    owner,
+                    sequence: 0x1234,
+                    hops: 1,
+                },
+                None,
+                &[
+                    b'L', b'V', b'T', 5, 3, 99, 0, 0, 0, 0, 0, 0, 0, 23, 8, 7, 6, 5, 4, 3, 2, 1,
+                    0x34, 0x12, 195, 0, 1,
+                ],
+            ),
+            (
+                Content::FindOwners {
+                    network,
+                    seeker: A,
+                    request: 0x1234,
+                    remaining: MAX_HOPS,
+                },
+                None,
+                &[
+                    b'L', b'V', b'T', 5, 6, 99, 0, 0, 0, 0, 0, 0, 0, 23, 8, 7, 6, 5, 4, 3, 2, 1,
+                    0x34, 0x12, 8,
+                ],
+            ),
+            (
+                Content::OwnerFound {
+                    network,
+                    seeker: B,
+                    request: 0x1234,
+                    owner,
+                    hops: 1,
+                },
+                Some(B),
+                &[
+                    b'L', b'V', b'T', 5, 7, 99, 0, 0, 0, 0, 0, 0, 0, 23, 0x18, 0x17, 0x16, 0x15,
+                    0x14, 0x13, 0x12, 0x11, 0x34, 0x12, 8, 7, 6, 5, 4, 3, 2, 1, 195, 0, 1,
+                ],
+            ),
+        ];
+        for &(content, destination, expected) in cases {
+            let message = Message {
+                source: A,
+                destination,
+                content,
+            };
+            let mut wire = [0; MAX_FRAME_SIZE];
+            let n = message.encode(42, &mut wire);
+            let header = if destination.is_some() { 21 } else { 15 };
+            assert_eq!(&wire[header..n], expected);
+            assert_eq!(Message::decode(&wire[..n], B, 23).unwrap(), message);
+            assert!(Message::decode(&wire[..n], B, 22).is_err());
+            for end in 0..n {
+                assert!(Message::decode(&wire[..end], B, 23).is_err());
+            }
+            assert!(Message::decode(&wire[..n + 1], B, 23).is_err());
+            for (field, value) in [
+                (3, 4),
+                (5, 0),
+                (13, 10),
+                (expected.len() - 1, 0),
+                (expected.len() - 1, MAX_HOPS + 1),
+            ] {
+                let mut bad = wire;
+                bad[header + field] = value;
+                assert!(Message::decode(&bad[..n], B, 23).is_err());
+            }
+            for address in [0u8, 255] {
+                let mut bad = wire;
+                bad[header + 14..header + 22].fill(address);
+                assert!(Message::decode(&bad[..n], B, 23).is_err());
+            }
+            if !matches!(content, Content::FindOwners { .. }) {
+                let owner = if destination.is_some() { 24 } else { 14 };
+                let length = if destination.is_some() { 32 } else { 24 };
+                let mut bad = wire;
+                bad[header + length..header + length + 2].copy_from_slice(&12u16.to_le_bytes());
+                assert!(Message::decode(&bad[..n], B, 23).is_err());
+                for address in [0, u64::MAX, A + 1, B] {
+                    let mut bad = wire;
+                    bad[header + owner..header + owner + 8].copy_from_slice(&address.to_le_bytes());
+                    assert!(Message::decode(&bad[..n], B, 23).is_err());
+                }
+            }
+            let wrong = Message {
+                destination: if destination.is_some() { None } else { Some(B) },
+                ..message
+            };
+            let n = wrong.encode(1, &mut wire);
+            assert!(Message::decode(&wire[..n], B, 23).is_err());
+            // A forwarded packet has a new link sender but retains its owner/seeker.
+            let forwarded = Message {
+                source: A + 1,
+                destination,
+                content: match content {
+                    Content::Arrive {
+                        network,
+                        owner,
+                        sequence,
+                        ..
+                    } => Content::Arrive {
+                        network,
+                        owner,
+                        sequence,
+                        hops: 2,
+                    },
+                    Content::FindOwners {
+                        network,
+                        seeker,
+                        request,
+                        ..
+                    } => Content::FindOwners {
+                        network,
+                        seeker,
+                        request,
+                        remaining: MAX_HOPS - 1,
+                    },
+                    Content::OwnerFound {
+                        network,
+                        seeker,
+                        request,
+                        owner,
+                        ..
+                    } => Content::OwnerFound {
+                        network,
+                        seeker,
+                        request,
+                        owner,
+                        hops: 2,
+                    },
+                    _ => unreachable!(),
+                },
+            };
+            let n = forwarded.encode(1, &mut wire);
+            assert_eq!(Message::decode(&wire[..n], B, 23).unwrap(), forwarded);
+        }
+    }
+
+    #[test]
+    fn reads_and_replies_have_bounded_complete_frames() {
         let network = Network {
             founder: 99,
             channel: 23,
         };
         let bytes = [0x5a; SURFACE_BYTES];
-        for (offset, total, length) in [
-            (0, 100, SURFACE_BYTES),
-            (SURFACE_BYTES as u16, 100, 100 - SURFACE_BYTES),
-            (0, 13, 13),
-        ] {
+        for offset in [0, 13, 67, 99, 100] {
+            let read = SurfaceRead {
+                reader: B,
+                owner: A,
+                request: 7,
+                offset,
+            };
             let message = Message {
                 source: A,
-                destination: None,
+                destination: Some(B),
                 content: Content::SurfacePart {
                     network,
-                    sequence: 7,
-                    offset,
-                    total,
-                    bytes: &bytes[..length],
+                    read,
+                    total: 100,
+                    hops: 1,
+                    bytes: &bytes[..SURFACE_BYTES.min(100 - offset as usize)],
                 },
             };
             let mut out = [0; MAX_FRAME_SIZE];
@@ -224,32 +1132,55 @@ mod tests {
             assert_eq!(Message::decode(&out[..n], B, 23).unwrap(), message);
             assert!(Message::decode(&out[..n], B, 22).is_err());
             for end in 0..n {
-                assert!(
-                    Message::decode(&out[..end], B, 23).is_err(),
-                    "truncated {end}/{n}"
-                );
+                assert!(Message::decode(&out[..end], B, 23).is_err());
             }
-            for (field, value) in [(31, 1), (33, 0), (28, 10)] {
+            // Network, owner, count, and hop fields are checked independently.
+            for (field, value) in [(34, 10), (57, 0), (57, MAX_HOPS + 1), (55, 0)] {
                 let mut bad = out;
                 bad[field] = value;
-                assert!(Message::decode(&bad[..n], B, 23).is_err());
+                assert!(Message::decode(&bad[..n], B, 23).is_err(), "field {field}");
             }
-            let directed = Message {
-                destination: Some(B),
+            let broadcast = Message {
+                destination: None,
                 ..message
             };
-            let n = directed.encode(1, &mut out);
+            let n = broadcast.encode(1, &mut out);
             assert!(Message::decode(&out[..n], B, 23).is_err());
         }
-        let arrival = Message {
-            source: A,
-            destination: None,
-            content: Content::Arrive(network),
-        };
-        let mut out = [0; MAX_FRAME_SIZE];
-        let n = arrival.encode(0, &mut out);
-        assert_eq!(Message::decode(&out[..n], B, 23).unwrap(), arrival);
-        assert!(Message::decode(&out[..n], B, 22).is_err());
+        for destination in [None, Some(A)] {
+            let message = Message {
+                source: B,
+                destination,
+                content: Content::ReadSurface {
+                    network,
+                    read: SurfaceRead {
+                        reader: B,
+                        owner: A,
+                        request: 0x1234,
+                        offset: 0x5678,
+                    },
+                    remaining: MAX_HOPS,
+                },
+            };
+            let mut out = [0; MAX_FRAME_SIZE];
+            let n = message.encode(9, &mut out);
+            assert_eq!(Message::decode(&out[..n], A, 23).unwrap(), message);
+            let p = if destination.is_some() { 21 } else { 15 };
+            assert_eq!(
+                &out[p..n],
+                &[
+                    b'L', b'V', b'T', 5, 4, 99, 0, 0, 0, 0, 0, 0, 0, 23, 0x18, 0x17, 0x16, 0x15,
+                    0x14, 0x13, 0x12, 0x11, 8, 7, 6, 5, 4, 3, 2, 1, 0x34, 0x12, 0x78, 0x56, 8
+                ]
+            );
+            for end in 0..n {
+                assert!(Message::decode(&out[..end], A, 23).is_err());
+            }
+            for remaining in [0, MAX_HOPS + 1] {
+                out[n - 1] = remaining;
+                assert!(Message::decode(&out[..n], A, 23).is_err());
+            }
+        }
     }
 
     #[test]
@@ -267,7 +1198,7 @@ mod tests {
                 },
                 &[
                     0x41, 0xd8, 42, 0x56, 0x4c, 0xff, 0xff, 8, 7, 6, 5, 4, 3, 2, 1, b'L', b'V',
-                    b'T', 2, 0,
+                    b'T', 5, 0,
                 ],
             ),
             (
@@ -278,7 +1209,7 @@ mod tests {
                 },
                 &[
                     0x41, 0xdc, 42, 0x56, 0x4c, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 8,
-                    7, 6, 5, 4, 3, 2, 1, b'L', b'V', b'T', 2, 1, 0x28, 0x27, 0x26, 0x25, 0x24,
+                    7, 6, 5, 4, 3, 2, 1, b'L', b'V', b'T', 5, 1, 0x28, 0x27, 0x26, 0x25, 0x24,
                     0x23, 0x22, 0x21, 23,
                 ],
             ),
@@ -290,7 +1221,7 @@ mod tests {
                 },
                 &[
                     0x41, 0xd8, 42, 0x56, 0x4c, 0xff, 0xff, 8, 7, 6, 5, 4, 3, 2, 1, b'L', b'V',
-                    b'T', 2, 2, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 23,
+                    b'T', 5, 2, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 23,
                 ],
             ),
         ];

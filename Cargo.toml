@@ -13,6 +13,7 @@ description = "Pure-Rust no_std FreeRTOS kernel translation with safe Rust APIs"
 license = "MIT"
 readme = false
 publish = false
+exclude = ["/experiments/", "/lab/"]
 repository = "https://github.com/zacharytomlinson/lattice-vertex"
 keywords = ["rtos", "embedded", "no-std", "freertos"]
 categories = ["embedded", "no-std", "concurrency"]
@@ -29,9 +30,9 @@ port-cortex-m0 = ["dep:cortex-m", "dep:cortex-m-rt", "arch-32bit", "tick-32bit"]
 port-cortex-m3 = ["dep:cortex-m", "dep:cortex-m-rt", "arch-32bit", "tick-32bit"]
 port-cortex-m4f = ["dep:cortex-m", "dep:cortex-m-rt", "arch-32bit", "tick-32bit"]
 port-cortex-m7 = ["dep:cortex-m", "dep:cortex-m-rt", "arch-32bit", "tick-32bit"]
-port-nrf52840 = ["dep:cortex-m", "dep:cortex-m-rt", "cortex-m/critical-section-single-core", "dep:embassy-nrf", "dep:embassy-sync", "arch-32bit", "tick-32bit"]
+port-nrf52840 = ["use-mutexes", "dep:cortex-m", "dep:cortex-m-rt", "cortex-m/critical-section-single-core", "dep:embassy-nrf", "dep:embassy-sync", "arch-32bit", "tick-32bit"]
 port-riscv32 = ["dep:riscv", "dep:riscv-rt", "arch-32bit", "tick-32bit"]
-port-esp32c6 = ["dep:esp-hal", "dep:esp-phy", "dep:esp-sync", "dep:esp-wifi-sys-esp32c6", "dep:embassy-sync", "dep:heapless", "arch-32bit", "tick-32bit"]
+port-esp32c6 = ["use-mutexes", "dep:esp-hal", "dep:esp-phy", "dep:esp-sync", "dep:esp-wifi-sys-esp32c6", "dep:embassy-sync", "dep:heapless", "arch-32bit", "tick-32bit"]
 port-cortex-a9 = ["arch-32bit", "tick-32bit"]
 port-cortex-a53 = ["arch-64bit", "tick-64bit"]
 port-test = ["std", "arch-32bit", "tick-32bit"]  # Deterministic host test port
@@ -142,10 +143,3 @@ esp-sync = { version = "=0.2.1", optional = true, features = ["esp32c6"] }
 esp-wifi-sys-esp32c6 = { version = "=0.2.0", optional = true }
 embassy-sync = { version = "0.8", optional = true }
 heapless = { version = "0.9", optional = true }
-
-[dev-dependencies]
-# Existing appliance contracts are used only by the formalization examples/tests.
-s3-control = { git = "ssh://git@github.com/zacharytomlinson/diffuser-fw.git", rev = "e78cbe3eb31f977222a97acd6f628534462d7ab5" }
-hal-protocol = { git = "ssh://git@github.com/zacharytomlinson/diffuser-fw.git", rev = "e78cbe3eb31f977222a97acd6f628534462d7ab5" }
-matter-topology = { git = "ssh://git@github.com/zacharytomlinson/diffuser-fw.git", rev = "e78cbe3eb31f977222a97acd6f628534462d7ab5" }
-mhz-radio-surface = { git = "ssh://git@github.com/zacharytomlinson/mhz-radio-fw.git", rev = "846da6acc2cf2980d2b14d5162cc76a5c775e9b6" }

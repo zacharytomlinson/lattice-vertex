@@ -43,6 +43,16 @@ impl Radio {
         // to use the kernel's FromISR notification API at this priority.
         hal::interrupt::RADIO.set_priority(KERNEL_INTERRUPT_PRIORITY);
         let driver = Driver::new(peripheral, RadioInterrupt);
+        // embassy-nrf 0.11 selects CarrierMode with a whole-register write,
+        // clearing the reset correlation threshold/count. Count zero disables
+        // the correlator, so CCA can miss a frame whose SFD has already passed.
+        // Restore the nRF52840 CCACTRL reset fields (0x052D0000).
+        hal::pac::RADIO.ccactrl().modify(|w| {
+            w.set_ccacorrthres(45);
+            w.set_ccacorrcnt(5);
+        });
+        #[cfg(feature = "test-support")]
+        assert_eq!(hal::pac::RADIO.ccactrl().read().0, 0x052d0001);
         Self {
             driver,
             packet: Packet::new(),
@@ -126,8 +136,11 @@ impl Radio {
                 if r.events_edend().read() == 0 {
                     return Poll::Ready(Err(Error::Aborted));
                 }
-                // nRF52840 Product Specification: ED_RSSIOFFS=-92, ED_RSSISCALE=4.
-                let dbm = -92i16 + 4 * r.edsample().read().edlvl() as i16;
+                // Raw EDSAMPLE has 1 dB steps above -92 dBm. Multiplication by
+                // four encodes the IEEE ED level, not dBm. See Nordic's
+                // nrf_802154_rssi_ed_sample_to_dbm_convert (without its optional
+                // temperature correction).
+                let dbm = -92i16 + r.edsample().read().edlvl() as i16;
                 Poll::Ready(Ok(dbm.clamp(i8::MIN as i16, i8::MAX as i16) as i8))
             } else {
                 Poll::Pending
@@ -141,6 +154,12 @@ impl Radio {
             .receive(&mut self.packet)
             .await
             .map_err(|_| Error::InvalidFrame)?;
+        // The HAL does not return packet RSSI. Test observation must not install
+        // different receive shortcuts from the ordinary kernel path.
+        #[cfg(feature = "test-support")]
+        crate::kernel::radio::testing::event(crate::kernel::radio::testing::Event::ReceiveSignal(
+            None,
+        ));
         let length = self.packet.len() as usize;
         if length > MAX_FRAME_SIZE {
             return Err(Error::InvalidFrame);

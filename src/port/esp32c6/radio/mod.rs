@@ -137,7 +137,7 @@ impl Radio {
         }
         #[cfg(feature = "test-support")]
         crate::kernel::radio::testing::event(crate::kernel::radio::testing::Event::ReceiveSignal(
-            raw.data[length - 1] as i8,
+            Some(raw.data[length - 1] as i8),
         ));
         let length = length - 2; // Hardware FCS is replaced by the receive trailer.
         out[..length].copy_from_slice(&raw.data[1..1 + length]);

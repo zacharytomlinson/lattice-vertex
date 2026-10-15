@@ -1,0 +1,462 @@
+//! Native invocation and bounded replay of its result at the appliance owner.
+//! A result records the native call's return, not a physical post-state.
+
+use super::frame::{
+    decode_arguments, Invocation, InvokeStatus, CALL_ARGUMENT_BYTES, MAX_CALL_ARGUMENTS,
+};
+use crate::{ir::Value, kernel::appliance::Native, sync::TaskContext};
+
+const RECENT: usize = 8;
+#[derive(Clone, Copy)]
+struct InvocationRecord {
+    caller: u64,
+    transformer: u64,
+    request: u32,
+    arguments: [u8; CALL_ARGUMENT_BYTES],
+    length: u8,
+    result: InvokeStatus,
+}
+impl InvocationRecord {
+    const EMPTY: Self = Self {
+        caller: 0,
+        transformer: 0,
+        request: 0,
+        arguments: [0; CALL_ARGUMENT_BYTES],
+        length: 0,
+        result: InvokeStatus::Busy,
+    };
+}
+
+pub(super) struct Invocations {
+    records: [InvocationRecord; RECENT],
+    next: usize,
+}
+const _: () = assert!(core::mem::size_of::<Invocations>() <= 768);
+
+impl Invocations {
+    pub(super) const fn new() -> Self {
+        Self {
+            records: [InvocationRecord::EMPTY; RECENT],
+            next: 0,
+        }
+    }
+
+    pub(super) fn invoke(
+        &mut self,
+        native: &dyn Native,
+        context: &TaskContext,
+        call: Invocation,
+        arguments: &[u8],
+    ) -> InvokeStatus {
+        if let Some(old) = self
+            .records
+            .iter()
+            .find(|r| r.caller == call.caller && r.request == call.request)
+        {
+            return if old.transformer == call.transformer
+                && &old.arguments[..old.length as usize] == arguments
+            {
+                old.result
+            } else {
+                InvokeStatus::ConflictingRequest
+            };
+        }
+        if arguments.len() > CALL_ARGUMENT_BYTES {
+            return InvokeStatus::Arguments;
+        }
+        let mut values = [Value::boolean(false); MAX_CALL_ARGUMENTS];
+        let result = match decode_arguments(arguments, &mut values) {
+            Some(values) => native.invoke(context, call.transformer, values),
+            None => InvokeStatus::Arguments,
+        };
+        let mut record = InvocationRecord {
+            caller: call.caller,
+            transformer: call.transformer,
+            request: call.request,
+            length: arguments.len() as u8,
+            result,
+            ..InvocationRecord::EMPTY
+        };
+        record.arguments[..arguments.len()].copy_from_slice(arguments);
+        self.records[self.next] = record;
+        self.next = (self.next + 1) % RECENT;
+        result
+    }
+}
+
+#[cfg(all(test, feature = "port-test"))]
+mod tests {
+    extern crate std;
+    use self::std::{boxed::Box, vec::Vec};
+    use super::super::{
+        forwarding::Forwarder,
+        frame::{Content, Message, MAX_HOPS},
+        Network,
+    };
+    use super::*;
+    use crate::{
+        ir::{Effect, Expr, Integer},
+        kernel::{change, Appliance},
+        observation::{self, Dependent},
+        surface::{
+            Arguments, Definition, Operation, Predicate, State, StateHandle, StateTransformer,
+            Surface, TransformerHandle,
+        },
+    };
+
+    #[derive(Default)]
+    struct Device {
+        observed: Option<bool>,
+        requested: Option<bool>,
+        other: bool,
+        calls: u32,
+    }
+    struct Power;
+    impl State for Power {
+        type Appliance = Device;
+        type Value = bool;
+        fn read(a: &Device) -> Option<bool> {
+            a.observed
+        }
+    }
+    struct Other;
+    impl State for Other {
+        type Appliance = Device;
+        type Value = bool;
+        fn read(a: &Device) -> Option<bool> {
+            Some(a.other)
+        }
+    }
+    static POWER: StateHandle<Device> = StateHandle::new::<Power>();
+    static OTHER: StateHandle<Device> = StateHandle::new::<Other>();
+    static HIDDEN: StateHandle<Device> = StateHandle::new::<Other>();
+    static TRUE: Definition<Device> = Definition {
+        body: Expr::Constant(Value::boolean(true)),
+        arguments: &[],
+        inputs: &[],
+    };
+    struct SetPower;
+    impl StateTransformer for SetPower {
+        type Appliance = Device;
+        type Arguments = (bool,);
+        type Error = ();
+        const DEFINITION: Operation<Device> = Operation {
+            precondition: Predicate {
+                definition: &TRUE,
+                inputs: &[],
+            },
+            effect: Effect {
+                inputs: &[],
+                outputs: &[POWER.definition()],
+                results: &[Expr::Argument(0)],
+                arguments: Self::Arguments::TYPES,
+            },
+        };
+        fn invoke(a: &mut Device, (value,): (bool,)) -> Result<(), ()> {
+            a.calls += 1;
+            a.requested = Some(value); // A request is not an established observation.
+            Ok(())
+        }
+    }
+    struct PartialFailure;
+    impl StateTransformer for PartialFailure {
+        type Appliance = Device;
+        type Arguments = (bool,);
+        type Error = ();
+        const DEFINITION: Operation<Device> = SetPower::DEFINITION;
+        fn invoke(a: &mut Device, (value,): (bool,)) -> Result<(), ()> {
+            a.calls += 1;
+            POWER.update(a, |a| a.observed = Some(value));
+            Err(())
+        }
+    }
+    static SET: TransformerHandle<Device, ()> = TransformerHandle::new::<SetPower>();
+    static FAIL: TransformerHandle<Device, ()> = TransformerHandle::new::<PartialFailure>();
+    static SURFACE: Surface<'static, Device, ()> = Surface {
+        states: &[&POWER, &OTHER],
+        transformers: &[&SET, &FAIL],
+        axioms: &[],
+        invariants: &[],
+    };
+    const NETWORK: Network = Network {
+        founder: 9,
+        channel: 15,
+    };
+    const ON: &[u8] = &[1, 0, 1];
+    const OFF: &[u8] = &[1, 0, 0];
+
+    struct Fixture {
+        device: &'static Appliance<Device, ()>,
+        context: TaskContext,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            crate::port::test_port_reset();
+            change::reset();
+            POWER.set_dependents(None);
+            let context = unsafe { TaskContext::assume() };
+            let device = Box::leak(Box::new(Appliance::new(&SURFACE)));
+            device.initialize(&context, Device::default());
+            change::bind(device);
+            Self { device, context }
+        }
+        fn calls(&self) -> u32 {
+            self.device.with(&self.context, |a| a.calls)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            POWER.set_dependents(None);
+            change::reset();
+        }
+    }
+    fn call(request: u32) -> Invocation {
+        Invocation {
+            caller: 1,
+            owner: 3,
+            request,
+            transformer: core::ptr::from_ref(&SET) as usize as u64,
+        }
+    }
+    fn request(call: Invocation, arguments: &[u8]) -> Message<'_> {
+        Message {
+            source: 1,
+            destination: Some(2),
+            content: Content::Invoke {
+                network: NETWORK,
+                call,
+                remaining: MAX_HOPS,
+                arguments,
+            },
+        }
+    }
+    fn drain() -> Vec<change::Change> {
+        core::iter::from_fn(change::take).collect()
+    }
+
+    #[test]
+    fn routed_native_call_replays_result_and_only_reports_established_state() {
+        let f = Fixture::new();
+        let mut invocations = Invocations::new();
+        let mut relay = Forwarder::new(2, NETWORK);
+        let mut owner = Forwarder::new(3, NETWORK);
+        let original = request(call(7), ON);
+        let forward = relay
+            .receive_control(original, 0, |_, _| panic!("relay invoked native code"))
+            .unwrap();
+        assert!(relay
+            .receive_control(original, 1, |_, _| panic!())
+            .is_none());
+        let mut wire = [0; crate::kernel::radio::MAX_FRAME_SIZE];
+        let size = forward.encode(1, &mut wire);
+        let incoming = Message::decode(&wire[..size], 3, 15).unwrap();
+        let result = owner
+            .receive_control(incoming, 2, |call, args| {
+                invocations.invoke(f.device, &f.context, call, args)
+            })
+            .unwrap();
+        assert_eq!(f.calls(), 1);
+        assert!(
+            !change::pending(),
+            "request acceptance invented an observation"
+        );
+        assert!(matches!(
+            result.content,
+            Content::InvocationResult {
+                status: InvokeStatus::Invoked,
+                hops: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            owner.receive_control(incoming, 3, |call, args| invocations
+                .invoke(f.device, &f.context, call, args)),
+            Some(result)
+        );
+        assert_eq!(f.calls(), 1);
+        let reply = relay.receive_control(result, 4, |_, _| panic!()).unwrap();
+        assert_eq!(reply.destination, Some(1));
+        assert!(matches!(
+            reply.content,
+            Content::InvocationResult { hops: 2, .. }
+        ));
+        assert_eq!(
+            relay.receive_control(original, 5, |_, _| panic!()),
+            Some(reply)
+        );
+        assert_eq!(f.calls(), 1, "lost result recovery repeated the operation");
+        // The next distinct command uses the direction learned from the result.
+        assert_eq!(
+            relay
+                .receive_control(request(call(8), OFF), 6, |_, _| panic!())
+                .unwrap()
+                .destination,
+            Some(3)
+        );
+
+        // A later physical report, independently of the invocation result.
+        f.device
+            .with(&f.context, |a| POWER.update(a, |a| a.observed = Some(true)));
+        let change = change::take().unwrap();
+        assert_eq!(change.value, Some(Value::boolean(true)));
+        assert_eq!(
+            change.attribute,
+            core::ptr::from_ref(POWER.definition()) as usize as u64
+        );
+        let delta = owner.announce_change(change.attribute, change.sequence, change.value, 7);
+        let mut sent = None;
+        assert!(relay
+            .receive_change(delta, 7, |out| sent = Some(out))
+            .is_some());
+        let forwarded = sent.unwrap();
+        let mut tablet = Forwarder::new(1, NETWORK);
+        let seen = tablet.receive_change(forwarded, 8, |_| {}).unwrap();
+        assert_eq!(
+            (seen.owner, seen.attribute, seen.value),
+            (3, change.attribute, change.value)
+        );
+        assert!(relay.receive_change(delta, 9, |_| panic!()).is_none());
+        assert!(owner.receive_change(forwarded, 9, |_| panic!()).is_none());
+        f.device
+            .with(&f.context, |a| POWER.update(a, |a| a.observed = Some(true)));
+        assert!(!change::pending(), "identical report manufactured a delta");
+    }
+
+    #[test]
+    fn native_dispatch_rejects_bad_calls_and_bounds_result_replay() {
+        let f = Fixture::new();
+        let mut invocations = Invocations::new();
+        let integer = [1, 1, 1];
+        for (call, args, expected) in [
+            (call(1), ON, InvokeStatus::Invoked),
+            (call(1), ON, InvokeStatus::Invoked),
+            (call(1), OFF, InvokeStatus::ConflictingRequest),
+            (call(2), &integer[..], InvokeStatus::Arguments),
+            (
+                Invocation {
+                    transformer: 123,
+                    ..call(3)
+                },
+                ON,
+                InvokeStatus::UnknownTransformer,
+            ),
+            (call(4), &[1, 0, 2][..], InvokeStatus::Arguments),
+        ] {
+            assert_eq!(
+                invocations.invoke(f.device, &f.context, call, args),
+                expected
+            );
+        }
+        assert_eq!(f.calls(), 1);
+        f.device.with(&f.context, |_| {
+            assert_eq!(
+                invocations.invoke(f.device, &f.context, call(5), ON),
+                InvokeStatus::Busy
+            )
+        });
+        assert_eq!(
+            invocations.invoke(f.device, &f.context, call(5), ON),
+            InvokeStatus::Busy
+        );
+        assert_eq!(f.calls(), 1);
+        assert_eq!(
+            invocations.invoke(
+                f.device,
+                &f.context,
+                Invocation {
+                    transformer: core::ptr::from_ref(&FAIL) as usize as u64,
+                    ..call(6)
+                },
+                ON
+            ),
+            InvokeStatus::ApplianceError
+        );
+        assert_eq!(
+            change::take().unwrap().value,
+            Some(Value::boolean(true)),
+            "native error discarded an actual change"
+        );
+        assert!(!change::pending());
+        // This is a bounded replay cache, not an exactly-once ledger.
+        for id in 10..18 {
+            assert_eq!(
+                invocations.invoke(f.device, &f.context, call(id), ON),
+                InvokeStatus::Invoked
+            );
+        }
+        let calls = f.calls();
+        assert_eq!(
+            invocations.invoke(f.device, &f.context, call(1), ON),
+            InvokeStatus::Invoked
+        );
+        assert_eq!(f.calls(), calls + 1);
+        let mut values = [Value::boolean(false); MAX_CALL_ARGUMENTS];
+        assert_eq!(
+            decode_arguments(&integer, &mut values).unwrap(),
+            &[Value::integer(Integer::U8, 1).unwrap()]
+        );
+    }
+
+    #[test]
+    fn observation_transport_preserves_report_order_instance_scope_and_hard_eviction() {
+        let f = Fixture::new();
+        let mut foreign = Device::default();
+        POWER.update(&mut foreign, |a| a.observed = Some(true));
+        f.device.with(&f.context, |a| HIDDEN.changed(a));
+        assert!(
+            !change::pending(),
+            "unbound instance or hidden state escaped"
+        );
+        static NEXT: Dependent<Device> = Dependent {
+            activate: |a, _| {
+                OTHER.update(a, |a| a.other = false);
+            },
+            next: None,
+        };
+        POWER.set_dependents(Some(&NEXT));
+        f.device.with(&f.context, |a| {
+            observation::update(a, &[&POWER, &OTHER], |a| {
+                a.observed = Some(true);
+                a.other = true;
+            })
+        });
+        let changes = drain();
+        assert_eq!(
+            changes.iter().map(|c| c.value).collect::<Vec<_>>(),
+            [
+                Some(Value::boolean(true)),
+                Some(Value::boolean(true)),
+                Some(Value::boolean(false))
+            ]
+        );
+        assert_eq!(
+            changes.iter().map(|c| c.sequence).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(changes[1].attribute, changes[2].attribute);
+        POWER.set_dependents(None);
+        f.device.with(&f.context, |a| {
+            POWER.update(a, |a| a.observed = None);
+            POWER.changed(a);
+        });
+        assert_eq!(
+            drain().iter().map(|c| c.value).collect::<Vec<_>>(),
+            [None, None]
+        );
+        f.device.with(&f.context, |a| {
+            for _ in 0..10 {
+                POWER.changed(a);
+            }
+        });
+        let changes = drain();
+        assert_eq!(changes.len(), 8);
+        assert_eq!(change::evicted(), 2);
+        assert_eq!(
+            (
+                changes.first().unwrap().sequence,
+                changes.last().unwrap().sequence
+            ),
+            (8, 15)
+        );
+    }
+}

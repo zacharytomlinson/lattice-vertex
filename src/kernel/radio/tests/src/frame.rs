@@ -15,7 +15,7 @@ const PAN: PanId = PanId(0xffff);
 const MAGIC: &[u8; 4] = b"LVD\x01";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Kind {
+pub enum Kind {
     Probe = 0,
     Reply = 1,
 }

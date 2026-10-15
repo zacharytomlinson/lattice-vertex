@@ -25,10 +25,9 @@ driver overwrote the baseband value with 50 after initialization. That override
 and the redundant RX-on write are removed; preserve the vendor initializer's
 settings together instead of hardcoding them again.
 
-The hardware fixture reports the baseband getter and actual MAC timing/channel/
-power registers, plus hardware error counters. This checks the programmed values;
-it does not measure radiated power. The linked library's TX-power table has 16
-entries and its final entry is 20, consistent with the current index-15 maximum.
+The linked library's TX-power table has 16 entries and its final entry is 20,
+consistent with the current index-15 maximum. Register values specify programmed
+configuration, not independently measured radiated power.
 
 The C6 port also selects combo-radio PHY initialization before enabling the PHY
 and explicitly disables Wi-Fi RX afterward. `esp-phy` 0.2.0 has that selection
@@ -44,8 +43,8 @@ labels conflict with the operational ESP-IDF C struct, so these two accesses use
 explicit masks. Initialization selects one sample/us and average accumulation.
 The unused Wi-Fi-power low-frequency clock is gated with all source selectors
 cleared; 802.15.4's shared FE/baseband, analog-I2C, and coexistence clocks remain.
-Both boards' readbacks confirm the fixes. See the
-[assay and hardware results](../../../../experiments/esp32c6-rf/RF_ASSAY.md#corrections-and-verification).
+These are retained driver corrections; their bench readbacks and comparison
+firmware are archived outside the kernel repository.
 
 The modem ETM clock is also explicitly enabled with the ZB MAC/APB clocks, matching
 the vendor's IEEE802154 dependency list. The OpenThread comparison exposed that
@@ -60,8 +59,7 @@ ED completion wakes the same resident task as packet I/O; no polling task or
 allocator is added. Changing channels stops the old operation and clears queued
 RX frames before applying new settings. TX remains fixed at 20 dBm.
 
-Channel surveying/selection is common-kernel policy. The
-[formation hardware check](../../../kernel/peer/TESTING.md#formation-validation-status--2026-10-07)
-exercised ED and retuning on both C6s, including selection, joining, founder
-restart, and simultaneous starts. The earlier register readbacks alone did not
-validate those scan operations.
+Channel surveying/selection is common-kernel policy. Prior board bring-up exercised
+ED, retuning, joining, and founder-independent operation; it does not establish
+radio range or the current protocol's complete delivery behavior. The maintained
+[peer check](../../../kernel/peer/TESTING.md) describes the reusable validation path.

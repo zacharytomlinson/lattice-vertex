@@ -50,6 +50,9 @@ extern "C" fn report(_: *mut c_void) {
             kernel::tasks::xTaskGetTickCount(),
             lattice_radio_test::surface::statistics(&context)
         );
+        if let Some(part) = lattice_radio_test::surface::take_part(&context) {
+            log!("SURFACE_PART {:?}", part);
+        }
     }
 }
 #[esp_hal::main]
@@ -73,15 +76,19 @@ fn main() -> ! {
     lattice_radio_test::start(context, radio);
     #[cfg(feature = "peer-observer")]
     {
-        let surface = if esp_hal::efuse::base_mac_address().as_bytes()[5] & 0x40 != 0 {
-            &lattice_radio_test::surface::DIMMER
-        } else {
-            &lattice_radio_test::surface::SWITCH
-        };
-        lattice_vertex::kernel::start(context, radio, surface)
+        let appliance = lattice_radio_test::surface::appliance(
+            &context,
+            esp_hal::efuse::base_mac_address().as_bytes()[5] & 0x40 != 0,
+        );
+        lattice_vertex::kernel::start(context, radio, appliance)
     }
     #[cfg(not(any(feature = "radio-probe", feature = "peer-observer")))]
-    lattice_vertex::kernel::start(context, radio, &lattice_vertex::surface::EMPTY)
+    {
+        static APPLIANCE: lattice_vertex::kernel::Appliance<(), core::convert::Infallible> =
+            lattice_vertex::kernel::Appliance::new(&lattice_vertex::surface::EMPTY);
+        APPLIANCE.initialize(&context, ());
+        lattice_vertex::kernel::start(context, radio, &APPLIANCE)
+    }
 }
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {

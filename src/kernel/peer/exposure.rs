@@ -1,9 +1,9 @@
-//! Encode this appliance's immutable IR surface for transient peer publication.
+//! Encode bounded reads of this appliance's immutable IR surface.
 //! No reader, transformer, or IR expression is executed. References identify
 //! original local declarations; no entity IDs or remote-surface catalog is built.
 
 use crate::{
-    ir::{self, Binary, Expr, Integer, Type, Unary},
+    ir::{self, Binary, Expr, Type, Unary},
     surface::{Read, Surface},
 };
 
@@ -22,12 +22,12 @@ trait Encode: Sync {
 
 /// Borrow the authored surface and its encoded length. Byte ranges are emitted
 /// on demand into the existing frame buffer, without a second resident IR copy.
-pub(crate) struct Publication {
+pub(crate) struct Description {
     source: &'static dyn Encode,
     length: u16,
 }
 
-impl Publication {
+impl Description {
     pub(crate) fn new<A: 'static, E: 'static>(
         surface: &'static Surface<'static, A, E>,
     ) -> Result<Self, EncodeError> {
@@ -113,10 +113,7 @@ impl Writer<'_> {
         self.bytes(&(core::ptr::from_ref(object) as usize as u64).to_le_bytes())
     }
     fn ty(&mut self, ty: Type) -> Result<(), EncodeError> {
-        self.byte(match ty {
-            Type::Bool => 0,
-            Type::Integer(i) => integer_tag(i),
-        })
+        self.byte(super::frame::type_tag(ty))
     }
     fn types(&mut self, types: &[Type]) -> Result<(), EncodeError> {
         self.count(types.len())?;
@@ -165,14 +162,9 @@ impl Writer<'_> {
         match expression {
             Expr::Constant(value) => {
                 self.byte(0)?;
-                self.ty(value.ty())?;
-                match value.ty() {
-                    Type::Bool => self.byte(u8::from(value.as_bool().unwrap())),
-                    Type::Integer(ty) => self.bytes(
-                        &(value.as_integer().unwrap() as u64).to_le_bytes()
-                            [..ty.width() as usize / 8],
-                    ),
-                }
+                let mut scalar = [0; 9];
+                let length = super::frame::encode_value(*value, &mut scalar);
+                self.bytes(&scalar[..length])
             }
             Expr::Read(attribute) => {
                 self.byte(1)?;
@@ -206,19 +198,19 @@ impl Writer<'_> {
                     Unary::Complement => self.byte(1)?,
                     Unary::ZeroExtend(ty) => {
                         self.byte(2)?;
-                        self.byte(integer_tag(*ty))?;
+                        self.ty(Type::Integer(*ty))?;
                     }
                     Unary::SignExtend(ty) => {
                         self.byte(3)?;
-                        self.byte(integer_tag(*ty))?;
+                        self.ty(Type::Integer(*ty))?;
                     }
                     Unary::Truncate(ty) => {
                         self.byte(4)?;
-                        self.byte(integer_tag(*ty))?;
+                        self.ty(Type::Integer(*ty))?;
                     }
                     Unary::Reinterpret(ty) => {
                         self.byte(5)?;
-                        self.byte(integer_tag(*ty))?;
+                        self.ty(Type::Integer(*ty))?;
                     }
                 }
                 self.expression(child, next)
@@ -240,19 +232,6 @@ impl Writer<'_> {
                 self.definition(definition, next)
             }
         }
-    }
-}
-
-fn integer_tag(ty: Integer) -> u8 {
-    match ty {
-        Integer::U8 => 1,
-        Integer::U16 => 2,
-        Integer::U32 => 3,
-        Integer::U64 => 4,
-        Integer::I8 => 5,
-        Integer::I16 => 6,
-        Integer::I32 => 7,
-        Integer::I64 => 8,
     }
 }
 
@@ -315,57 +294,9 @@ impl<A: 'static, E> Encode for Surface<'_, A, E> {
     }
 }
 
-/// Only local transmission progress is retained. Arrivals during publication
-/// request a subsequent full pass; incoming surface pieces never trigger one.
-pub(super) struct Publisher {
-    pub(super) publication: Publication,
-    pub(super) sequence: u16,
-    pub(super) offset: u16,
-    pending: bool,
-    active: bool,
-}
-
-impl Publisher {
-    pub(super) fn new(publication: Publication) -> Self {
-        Self {
-            publication,
-            sequence: 0,
-            offset: 0,
-            pending: true,
-            active: false,
-        }
-    }
-    pub(super) fn arrival(&mut self) {
-        self.pending = true;
-    }
-    pub(super) fn has_work(&self) -> bool {
-        self.pending || self.active
-    }
-    pub(super) fn prepare_part(&mut self, output: &mut [u8]) -> usize {
-        if !self.active {
-            if !self.pending {
-                return 0;
-            }
-            self.pending = false;
-            self.active = true;
-            self.offset = 0;
-            self.sequence = self.sequence.wrapping_add(1);
-        }
-        self.publication.encode_part(self.offset, output)
-    }
-    pub(super) fn transmitted(&mut self, length: usize) {
-        self.offset += length as u16;
-        if self.offset == self.publication.len() {
-            self.active = false;
-        }
-    }
-    pub(super) fn transmit_failed(&mut self) {
-        self.active = false;
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::ir::Integer;
     extern crate std;
     use self::std::vec::Vec;
     use super::*;
@@ -379,7 +310,7 @@ mod tests {
         type Appliance = Switch;
         type Value = bool;
         fn read(_: &Switch) -> Option<bool> {
-            panic!("publication must not read hardware")
+            panic!("exposure must not read hardware")
         }
     }
     static ON: StateHandle<Switch> = StateHandle::new::<On>();
@@ -419,7 +350,7 @@ mod tests {
             },
         };
         fn invoke(_: &mut Switch, _: ()) -> Result<(), ()> {
-            panic!("publication must not invoke hardware")
+            panic!("exposure must not invoke hardware")
         }
     }
     static TOGGLE: TransformerHandle<Switch, ()> = TransformerHandle::new::<Toggle>();
@@ -456,13 +387,13 @@ mod tests {
         expected.extend_from_slice(&[0, 0, 0, 0, 10]);
         reference(&mut expected, &TRUE);
         expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 1, 0, 0]);
-        let publication = Publication::new(&SURFACE).unwrap();
-        assert_eq!(publication.len() as usize, expected.len());
+        let description = Description::new(&SURFACE).unwrap();
+        assert_eq!(description.len() as usize, expected.len());
         for width in [1, 7, super::super::frame::SURFACE_BYTES, 256] {
             let mut result = Vec::new();
             let mut piece = [0; 256];
-            while result.len() < publication.len() as usize {
-                let n = publication.encode_part(result.len() as u16, &mut piece[..width]);
+            while result.len() < description.len() as usize {
+                let n = description.encode_part(result.len() as u16, &mut piece[..width]);
                 assert!(n > 0);
                 result.extend_from_slice(&piece[..n]);
             }
@@ -537,34 +468,26 @@ mod tests {
             axioms: &[],
             invariants: &[],
         };
-        assert!(matches!(Publication::new(&BAD), Err(EncodeError::TooDeep)));
-        assert!(matches!(Publication::new(&BIG), Err(EncodeError::TooLarge)));
+        assert!(matches!(Description::new(&BAD), Err(EncodeError::TooDeep)));
+        assert!(matches!(Description::new(&BIG), Err(EncodeError::TooLarge)));
     }
 
     #[test]
-    fn publication_is_finite_and_arrival_during_send_requests_one_fresh_pass() {
-        let mut publisher = Publisher::new(Publication::new(&SURFACE).unwrap());
-        let mut buffer = [0; super::super::frame::SURFACE_BYTES];
-        let n = publisher.prepare_part(&mut buffer);
-        publisher.arrival();
-        publisher.transmitted(n);
-        while publisher.offset < publisher.publication.len() {
-            let n = publisher.prepare_part(&mut buffer);
-            publisher.transmitted(n);
+    fn range_reads_can_repeat_or_start_at_any_offset_without_retained_progress() {
+        let description = Description::new(&SURFACE).unwrap();
+        let mut whole = self::std::vec![0; description.len() as usize];
+        assert_eq!(description.encode_part(0, &mut whole), whole.len());
+        for offset in [0, 1, 13, description.len() - 1, description.len()] {
+            let mut first = [0; 19];
+            let mut repeated = [0; 19];
+            let n = description.encode_part(offset, &mut first);
+            assert_eq!(description.encode_part(offset, &mut repeated), n);
+            assert_eq!(first, repeated);
+            assert_eq!(&first[..n], &whole[offset as usize..offset as usize + n]);
         }
-        assert!(publisher.has_work());
-        let n = publisher.prepare_part(&mut buffer);
-        assert_eq!(publisher.offset, 0);
-        assert_eq!(publisher.sequence, 2);
-        publisher.transmitted(n);
-        while publisher.has_work() {
-            let n = publisher.prepare_part(&mut buffer);
-            publisher.transmitted(n);
-        }
-        assert_eq!(publisher.prepare_part(&mut buffer), 0);
-        publisher.arrival();
-        publisher.prepare_part(&mut buffer);
-        publisher.transmit_failed();
-        assert!(!publisher.has_work());
+        assert_eq!(
+            description.encode_part(description.len() + 1, &mut [0; 19]),
+            0
+        );
     }
 }
