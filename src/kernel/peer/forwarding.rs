@@ -367,6 +367,78 @@ impl Forwarder {
         reply.map(|phase| self.link_message(incoming.source, phase, token))
     }
 
+    #[cfg(feature = "host-link")]
+    pub(super) fn local_links(&self, after: u64) -> (u32, Option<super::frame::PeerLink>) {
+        self.links.read(after)
+    }
+
+    /// A local reader shares the same bounded read paths and route learning as
+    /// relayed reads. It is not injected as a fictitious radio neighbor.
+    #[cfg(feature = "host-link")]
+    pub(super) fn originate_links(&mut self, read: LinkRead, now: u32) -> Option<Message<'static>> {
+        self.expire(now);
+        if read.reader != self.local
+            || read.owner == self.local
+            || (read.via == self.local && !self.links.contains(read.owner))
+            || self
+                .reads
+                .iter()
+                .any(|p| p.read.reader() == self.local && p.read.request() == read.request)
+        {
+            return None;
+        }
+        let request = ReadRequest::Links(read);
+        let onward = self
+            .next_hop(request.direction(self.local), self.local, MAX_HOPS)
+            .unwrap_or(0);
+        self.remember_read(request, self.local, onward, false, now);
+        Some(Message {
+            source: self.local,
+            destination: (onward != 0).then_some(onward),
+            content: Content::ReadLinks {
+                network: self.network,
+                read,
+                remaining: MAX_HOPS,
+            },
+        })
+    }
+
+    #[cfg(feature = "host-link")]
+    pub(super) fn complete_links(
+        &mut self,
+        incoming: Message<'_>,
+        now: u32,
+    ) -> Option<(LinkRead, u32, Option<super::frame::PeerLink>)> {
+        self.expire(now);
+        let Content::LinkEntry {
+            network,
+            read,
+            revision,
+            link,
+            hops,
+        } = incoming.content
+        else {
+            return None;
+        };
+        if network != self.network
+            || read.reader != self.local
+            || incoming.destination != Some(self.local)
+        {
+            return None;
+        }
+        let previous = self.return_read(ReadRequest::Links(read), incoming.source, hops, now)?;
+        (previous == self.local).then_some((read, revision, link))
+    }
+
+    #[cfg(feature = "host-link")]
+    pub(super) fn cancel_links(&mut self, read: LinkRead) {
+        for path in &mut self.reads {
+            if path.read == ReadRequest::Links(read) && read.reader == self.local {
+                *path = ReadPath::EMPTY;
+            }
+        }
+    }
+
     pub(super) fn receive_links(
         &mut self,
         incoming: Message<'_>,
@@ -1098,6 +1170,17 @@ impl Forwarder {
         } else {
             self.next_hop(read.direction(self.local), previous, remaining)
         };
+        Some(self.remember_read(read, previous, next.unwrap_or(0), owner, now))
+    }
+
+    fn remember_read(
+        &mut self,
+        read: ReadRequest,
+        previous: u64,
+        onward: u64,
+        answered: bool,
+        now: u32,
+    ) -> &ReadPath {
         let slot = self
             .reads
             .iter()
@@ -1110,11 +1193,11 @@ impl Forwarder {
         self.reads[slot] = ReadPath {
             read,
             previous,
-            onward: next.unwrap_or(0),
+            onward,
             started: now,
-            answered: owner,
+            answered,
         };
-        Some(&self.reads[slot])
+        &self.reads[slot]
     }
 
     fn return_read(&mut self, read: ReadRequest, source: u64, hops: u8, now: u32) -> Option<u64> {

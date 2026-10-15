@@ -1,0 +1,9 @@
+[package]
+name = "lattice-host-link"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Binary local-host link to a resident Lattice peer"
+
+[workspace]

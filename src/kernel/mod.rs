@@ -36,6 +36,8 @@ pub(crate) mod change;
 pub mod event_groups;
 pub mod list;
 pub(crate) mod peer;
+#[cfg(feature = "host-link")]
+pub use peer::host;
 pub mod queue;
 pub mod radio;
 #[cfg(feature = "stream-buffers")]

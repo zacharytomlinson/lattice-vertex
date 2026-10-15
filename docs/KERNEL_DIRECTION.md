@@ -524,6 +524,22 @@ dissemination remains the existing bounded broadcast behavior; adaptive coverage
 is separate. LVT v6 packs the invocation copy budget into its existing control
 byte and rejects older wire versions.
 
+## Attached tablet host
+
+The tablet and its attached nRF use one resident network identity. The new optional
+`host-link` feature adds one fixed local request/response exchange, without USB
+code in the common kernel or a new radio configuration API. The Linux client and
+maintained XIAO attachment firmware live in `lattice-tablet`. Ordinary appliance
+builds do not include this feature. Its first operations are status and link reads;
+surface/control/delta integration and Slint presentation remain subsequent work.
+
+Local read origins share the existing return-path budget and route learning.
+Disconnect invalidates host completions while peer participation continues. Radio
+read tokens persist across host reconnects. A timed-out read produces a failure,
+not an automatic retransmission. Periodic maintenance now sends either a link
+exchange or discovery in one iteration, leaving reception available for the reply
+instead of immediately transmitting a second solicitation.
+
 ## Structured memory and resident relationships
 
 Use fixed, structured memory for Lattice's node machinery. Keep a state, its
@@ -590,6 +606,10 @@ flowchart TB
     hal["esp-hal startup, timers, and interrupt routing: C6 only"]
     smoke["Nordic and C6 test firmware beside their ports"]
     usbconsole["Nordic fixture only: USB diagnostics and XIAO serial-DFU entry"]
+    hostlink["Optional kernel::host: fixed local exchange and read origin"]
+    hostwire["host/wire: shared binary local-link crate"]
+    tabletradio["lattice-tablet firmware: XIAO USB and host task"]
+    tabletpeer["lattice-tablet peer: Linux serial client"]
     sync["Existing safe synchronization API"]
 
     surface -->|native access| appliance
@@ -607,6 +627,14 @@ flowchart TB
     smoke -->|optional USB console feature| usbconsole
     usbconsole -->|low-priority reporter uses existing task API| tasks
     usbconsole -->|USB peripheral driver| nordic
+    tabletradio -->|binary requests and completions| hostlink
+    tabletradio -->|USB peripheral driver| nordic
+    tabletpeer -->|USB stream| tabletradio
+    tabletpeer -->|codec| hostwire
+    hostlink -->|codec and records| hostwire
+    hostlink -->|wake resident task| transport
+    discovery -->|service local host| hostlink
+    hostlink -->|originate and complete reads| forwarding
     probe -->|installs transport workload or observes peers and surface ranges| testentry
     testentry -->|uses normal task and scheduler startup| startup
     testentry -->|passes resident transport to workload| transport
@@ -686,8 +714,11 @@ manual-control message path has not yet had an end-to-end hardware run.
 Maintained reciprocal links, built-in `ReadLinks`, and guided traversal are now
 implemented using the existing read return paths and resident task. Cost-ranked
 alternate directions and a bounded invocation split now preserve message identity
-through independent and reconverging paths. Tablet-daemon integration, hardware
-validation, and adaptive delivery/coverage policy remain open. Native duplicate
+through independent and reconverging paths. A Linux host client and XIAO USB attachment now originate local/remote `ReadLinks`
+through that runtime. The shared local codec and optional kernel host endpoint are
+[documented beside their owner](../src/kernel/peer/host/README.md). Tablet UI/service
+integration, broader hardware validation, and adaptive delivery/coverage policy
+remain open. Native duplicate
 history is bounded and volatile; this is not an exactly-once ledger.
 
 1. **Establish the integrated boot path across Nordic and ESP.** Provide
@@ -704,8 +735,9 @@ history is bounded and volatile; this is not an exactly-once ledger.
    and state-change handling now have separate host checks; the prior task captures
    do not validate them.
    Rendezvous/discovery and relay-assisted surface reads now run through ordinary
-   kernel startup. The new forwarding behavior has host/build validation; no new
-   radio experiment or hardware validation was performed.
+   kernel startup. Forwarding/control behavior has host/build validation. A Linux host has now
+   exercised one-hop `ReadLinks` on two Nordic boards; this does not validate
+   multi-hop radio delivery or native appliance control.
 2. **Implement automatic peer participation.** Put radio configuration, bootstrap,
    discovery, and surface-exposure handling in the common kernel. Use the provided
    platform port to perform the hardware operations. Completion means two appliance

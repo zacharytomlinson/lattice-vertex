@@ -78,7 +78,7 @@ pub(crate) fn record(instance: *const (), attribute: u64, value: Option<Value>) 
     });
     if recorded {
         #[cfg(any(feature = "port-esp32c6", feature = "port-nrf52840"))]
-        super::radio::task::notify_changes();
+        super::radio::task::notify_work();
     }
 }
 

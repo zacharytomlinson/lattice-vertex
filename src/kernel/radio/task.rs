@@ -78,11 +78,19 @@ unsafe fn clone_waker(data: *const ()) -> RawWaker {
 unsafe fn drop_waker(_: *const ()) {}
 static WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(clone_waker, wake, wake, drop_waker);
 
+fn local_pending() -> bool {
+    #[cfg(feature = "host-link")]
+    if crate::kernel::peer::host::pending() {
+        return true;
+    }
+    crate::kernel::change::pending()
+}
+
 fn wait<F: Future>(
     future: F,
     waker: &Waker,
     timeout: TickType_t,
-    changes: bool,
+    local_work: bool,
 ) -> Option<F::Output> {
     let start = tasks::xTaskGetTickCount();
     let mut future = pin!(future);
@@ -91,7 +99,7 @@ fn wait<F: Future>(
         if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
             return Some(result);
         }
-        if changes && crate::kernel::change::pending() {
+        if local_work && local_pending() {
             return None;
         }
         let remaining = if timeout == portMAX_DELAY {
@@ -116,12 +124,12 @@ fn wait<F: Future>(
 /// hardware fixtures receive a scoped borrow through the test-only entry.
 pub struct Transport {
     radio: port::Radio,
-    changes: bool,
+    local_work: bool,
     waker: Waker,
     _task_context: PhantomData<*mut ()>,
 }
 
-pub(crate) fn notify_changes() {
+pub(crate) fn notify_work() {
     let target = WAKE_TARGET.load(Ordering::Acquire);
     if !target.is_null() {
         unsafe {
@@ -131,8 +139,8 @@ pub(crate) fn notify_changes() {
 }
 
 impl Transport {
-    pub(crate) fn enable_state_changes(&mut self) {
-        self.changes = true;
+    pub(crate) fn enable_local_work(&mut self) {
+        self.local_work = true;
     }
 
     pub fn address(&self) -> u64 {
@@ -167,7 +175,7 @@ impl Transport {
             self.radio.receive(frame),
             &self.waker,
             timeout,
-            self.changes,
+            self.local_work,
         )
     }
 
@@ -196,7 +204,7 @@ extern "C" fn run(_: *mut c_void) {
     };
     let mut transport = Transport {
         radio,
-        changes: false,
+        local_work: false,
         waker,
         _task_context: PhantomData,
     };

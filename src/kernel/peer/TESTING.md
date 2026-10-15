@@ -125,7 +125,13 @@ the range/forwarding checks. Two passive observers do not initiate reads.
 
 ## Validation scope
 
-The current version-6 kernel has host/build validation. Native calls, relayed
+The current version-6 kernel has host/build validation, plus a two-Nordic
+attached-host `ReadLinks` run. The Linux client obtained the attached resident's
+neighbor and read that neighbor's reciprocal link and end-of-list over radio.
+The test exposed a back-to-back discovery/link-offer conflict; maintenance now
+sends one solicitation per interval, and both links established after that change.
+USB reopen and software DFU entry also worked. This is not a range or loss-rate test.
+ Native calls, relayed
 surface/current-state reads, reciprocal link maintenance, guided traversal, owner
 discovery, scored alternate directions, bounded invocation replication, and deltas
 have deterministic host checks; their
