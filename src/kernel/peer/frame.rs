@@ -11,7 +11,7 @@ use ieee802154::mac::{
 };
 
 const PAN: PanId = PanId(PAN_ID);
-const MAGIC: &[u8; 4] = b"LVT\x05";
+const MAGIC: &[u8; 4] = b"LVT\x06";
 pub(super) const MAX_HOPS: u8 = 8;
 const MAX_PAYLOAD: usize = MAX_FRAME_SIZE - 21;
 // Worst-case addressed MAC header plus the complete routed reply envelope.
@@ -148,6 +148,7 @@ pub(super) enum Content<'a> {
         network: Network,
         call: Invocation,
         remaining: u8,
+        copies: u8,
         arguments: &'a [u8],
     },
     InvocationResult {
@@ -300,13 +301,16 @@ impl<'a> Message<'a> {
                 call,
                 remaining,
                 arguments,
+                copies,
             } => {
                 assert!(valid_arguments(arguments));
+                assert!((1..=2).contains(&copies));
+                assert!(copies == 1 || self.destination.is_some());
                 payload[4] = 8;
                 payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
                 payload[13] = network.channel;
                 call.encode(&mut payload[14..42]);
-                payload[42] = remaining;
+                payload[42] = remaining | ((copies - 1) << 4);
                 payload[43..43 + arguments.len()].copy_from_slice(arguments);
                 43 + arguments.len()
             }
@@ -648,8 +652,11 @@ impl<'a> Message<'a> {
                     return Err(InvalidFrame);
                 }
                 if p[4] == 8 {
-                    let remaining = p[42];
-                    if !(1..=MAX_HOPS).contains(&remaining)
+                    let remaining = p[42] & 0x0f;
+                    let copies = 1 + (p[42] >> 4);
+                    if copies > 2
+                        || (copies > 1 && destination.is_none())
+                        || !(1..=MAX_HOPS).contains(&remaining)
                         || (remaining == MAX_HOPS && source != call.caller)
                         || !valid_arguments(&p[43..])
                     {
@@ -659,6 +666,7 @@ impl<'a> Message<'a> {
                         network,
                         call,
                         remaining,
+                        copies,
                         arguments: &p[43..],
                     }
                 } else {
@@ -1076,6 +1084,62 @@ mod tests {
     const B: u64 = 0x1112_1314_1516_1718;
 
     #[test]
+    fn invocation_copy_budget_is_packed_and_cannot_authorize_broadcast_forks() {
+        let network = Network {
+            founder: 99,
+            channel: 15,
+        };
+        let call = Invocation {
+            caller: A,
+            owner: B,
+            request: 7,
+            transformer: 42,
+        };
+        let mut wire = [0; MAX_FRAME_SIZE];
+        for copies in [1, 2] {
+            let message = Message {
+                source: A,
+                destination: Some(B),
+                content: Content::Invoke {
+                    network,
+                    call,
+                    remaining: 8,
+                    copies,
+                    arguments: &[1, 0, 1],
+                },
+            };
+            let n = message.encode(0, &mut wire);
+            assert_eq!(n, 67);
+            assert_eq!(wire[21 + 42], 8 | ((copies - 1) << 4));
+            assert_eq!(Message::decode(&wire[..n], B, 15).unwrap(), message);
+            for invalid in [0, 9, 0x10, 0x19, 0x28, 0x88] {
+                let mut bad = wire;
+                bad[21 + 42] = invalid;
+                assert!(Message::decode(&bad[..n], B, 15).is_err());
+            }
+            wire[21 + 3] = 5;
+            assert!(
+                Message::decode(&wire[..n], B, 15).is_err(),
+                "v5 lacks the copy budget"
+            );
+        }
+        let message = Message {
+            source: A,
+            destination: None,
+            content: Content::Invoke {
+                network,
+                call,
+                remaining: 8,
+                copies: 1,
+                arguments: &[0],
+            },
+        };
+        let n = message.encode(0, &mut wire);
+        wire[15 + 42] |= 0x10;
+        assert!(Message::decode(&wire[..n], B, 15).is_err());
+    }
+
+    #[test]
     fn link_exchange_and_cursor_records_fit_individual_frames_and_validate_direction() {
         let network = Network {
             founder: 99,
@@ -1112,7 +1176,7 @@ mod tests {
                     b'L',
                     b'V',
                     b'T',
-                    5,
+                    6,
                     13,
                     99,
                     0,
@@ -1162,7 +1226,7 @@ mod tests {
         assert_eq!(
             &wire[21..n],
             &[
-                b'L', b'V', b'T', 5, 14, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
+                b'L', b'V', b'T', 6, 14, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
                 23, 22, 21, 20, 19, 18, 17, 0x34, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 9, 7, 6, 5, 4, 3,
                 2, 1, 8,
             ]
@@ -1310,7 +1374,7 @@ mod tests {
         assert_eq!(
             &wire[21..n],
             &[
-                b'L', b'V', b'T', 5, 11, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
+                b'L', b'V', b'T', 6, 11, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
                 23, 22, 21, 20, 19, 18, 17, 0x34, 0x12, 42, 0, 0, 0, 0, 0, 0, 0, 8,
             ]
         );
@@ -1513,6 +1577,7 @@ mod tests {
             source: A,
             destination: Some(B),
             content: Content::Invoke {
+                copies: 1,
                 network: Network {
                     founder: 99,
                     channel: 15,
@@ -1551,6 +1616,7 @@ mod tests {
             source: A,
             destination: Some(B),
             content: Content::Invoke {
+                copies: 1,
                 network,
                 call,
                 remaining: MAX_HOPS,
@@ -1563,7 +1629,7 @@ mod tests {
         assert_eq!(
             &wire[21..n],
             &[
-                b'L', b'V', b'T', 5, 8, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
+                b'L', b'V', b'T', 6, 8, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
                 23, 22, 21, 20, 19, 18, 17, 1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8, 8, 1, 0, 1,
             ]
         );
@@ -1693,7 +1759,7 @@ mod tests {
                 },
                 None,
                 &[
-                    b'L', b'V', b'T', 5, 3, 99, 0, 0, 0, 0, 0, 0, 0, 23, 8, 7, 6, 5, 4, 3, 2, 1,
+                    b'L', b'V', b'T', 6, 3, 99, 0, 0, 0, 0, 0, 0, 0, 23, 8, 7, 6, 5, 4, 3, 2, 1,
                     0x34, 0x12, 195, 0, 1,
                 ],
             ),
@@ -1706,7 +1772,7 @@ mod tests {
                 },
                 None,
                 &[
-                    b'L', b'V', b'T', 5, 6, 99, 0, 0, 0, 0, 0, 0, 0, 23, 8, 7, 6, 5, 4, 3, 2, 1,
+                    b'L', b'V', b'T', 6, 6, 99, 0, 0, 0, 0, 0, 0, 0, 23, 8, 7, 6, 5, 4, 3, 2, 1,
                     0x34, 0x12, 8,
                 ],
             ),
@@ -1720,7 +1786,7 @@ mod tests {
                 },
                 Some(B),
                 &[
-                    b'L', b'V', b'T', 5, 7, 99, 0, 0, 0, 0, 0, 0, 0, 23, 0x18, 0x17, 0x16, 0x15,
+                    b'L', b'V', b'T', 6, 7, 99, 0, 0, 0, 0, 0, 0, 0, 23, 0x18, 0x17, 0x16, 0x15,
                     0x14, 0x13, 0x12, 0x11, 0x34, 0x12, 8, 7, 6, 5, 4, 3, 2, 1, 195, 0, 1,
                 ],
             ),
@@ -1890,7 +1956,7 @@ mod tests {
             assert_eq!(
                 &out[p..n],
                 &[
-                    b'L', b'V', b'T', 5, 4, 99, 0, 0, 0, 0, 0, 0, 0, 23, 0x18, 0x17, 0x16, 0x15,
+                    b'L', b'V', b'T', 6, 4, 99, 0, 0, 0, 0, 0, 0, 0, 23, 0x18, 0x17, 0x16, 0x15,
                     0x14, 0x13, 0x12, 0x11, 8, 7, 6, 5, 4, 3, 2, 1, 0x34, 0x12, 0x78, 0x56, 8
                 ]
             );
@@ -1919,7 +1985,7 @@ mod tests {
                 },
                 &[
                     0x41, 0xd8, 42, 0x56, 0x4c, 0xff, 0xff, 8, 7, 6, 5, 4, 3, 2, 1, b'L', b'V',
-                    b'T', 5, 0,
+                    b'T', 6, 0,
                 ],
             ),
             (
@@ -1930,7 +1996,7 @@ mod tests {
                 },
                 &[
                     0x41, 0xdc, 42, 0x56, 0x4c, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 8,
-                    7, 6, 5, 4, 3, 2, 1, b'L', b'V', b'T', 5, 1, 0x28, 0x27, 0x26, 0x25, 0x24,
+                    7, 6, 5, 4, 3, 2, 1, b'L', b'V', b'T', 6, 1, 0x28, 0x27, 0x26, 0x25, 0x24,
                     0x23, 0x22, 0x21, 23,
                 ],
             ),
@@ -1942,7 +2008,7 @@ mod tests {
                 },
                 &[
                     0x41, 0xd8, 42, 0x56, 0x4c, 0xff, 0xff, 8, 7, 6, 5, 4, 3, 2, 1, b'L', b'V',
-                    b'T', 5, 2, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 23,
+                    b'T', 6, 2, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 23,
                 ],
             ),
         ];

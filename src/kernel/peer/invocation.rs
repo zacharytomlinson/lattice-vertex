@@ -223,6 +223,7 @@ mod tests {
             source: 1,
             destination: Some(2),
             content: Content::Invoke {
+                copies: 1,
                 network: NETWORK,
                 call,
                 remaining: MAX_HOPS,
@@ -232,6 +233,187 @@ mod tests {
     }
     fn drain() -> Vec<change::Change> {
         core::iter::from_fn(change::take).collect()
+    }
+
+    #[test]
+    fn redundant_encoded_routes_reconverge_or_lose_a_branch_without_repeating_native_work() {
+        use super::super::frame::{LinkRead, StateRead, StateReadResult};
+        // disjoint branches, reconvergence, one lost branch, late reconvergence
+        for (merge, drop_first, late_second) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let f = Fixture::new();
+            let mut invocations = Invocations::new();
+            let mut nodes = [
+                Forwarder::new(2, NETWORK),
+                Forwarder::new(3, NETWORK),
+                Forwarder::new(4, NETWORK),
+                Forwarder::new(5, NETWORK),
+                Forwarder::new(7, NETWORK),
+            ];
+            let ids = [2, 3, 4, 5, 7];
+            // Seed directions through correlated reads, including an alternate
+            // guided approach at the fork. No test-only routing API is needed.
+            for (i, next, hops, via, token) in [
+                (0, 3, if merge { 3 } else { 2 }, 0, 1),
+                (0, 4, if merge { 3 } else { 2 }, 4, 2),
+                (
+                    1,
+                    if merge { 5 } else { 7 },
+                    if merge { 2 } else { 1 },
+                    0,
+                    3,
+                ),
+                (
+                    2,
+                    if merge { 5 } else { 7 },
+                    if merge { 2 } else { 1 },
+                    0,
+                    4,
+                ),
+                (3, 7, 1, 0, 5),
+            ] {
+                let read = LinkRead {
+                    reader: 1,
+                    owner: 7,
+                    request: token,
+                    after: 0,
+                    via,
+                };
+                let q = Message {
+                    source: if i == 0 { 1 } else { 2 },
+                    destination: Some(ids[i]),
+                    content: Content::ReadLinks {
+                        network: NETWORK,
+                        read,
+                        remaining: 7,
+                    },
+                };
+                let started = u32::from(token) * 10;
+                nodes[i].receive_links(q, started).unwrap();
+                let reply = Message {
+                    source: next,
+                    destination: Some(ids[i]),
+                    content: Content::LinkEntry {
+                        network: NETWORK,
+                        read,
+                        revision: 0,
+                        link: None,
+                        hops,
+                    },
+                };
+                nodes[i].receive_links(reply, started + 1).unwrap();
+            }
+            let call = Invocation {
+                owner: 7,
+                ..call(91)
+            };
+            let initial = Message {
+                source: 1,
+                destination: Some(2),
+                content: Content::Invoke {
+                    network: NETWORK,
+                    call,
+                    remaining: 8,
+                    copies: 2,
+                    arguments: ON,
+                },
+            };
+            let mut wire = [0; crate::kernel::radio::MAX_FRAME_SIZE];
+            let size = initial.encode(0, &mut wire);
+            let mut pending = self::std::vec![(1, 2, wire, size)];
+            let mut deferred = None;
+            let mut cursor = 0;
+            let mut responses = 0;
+            let mut owner_deliveries = 0;
+            loop {
+                if cursor == pending.len() {
+                    if let Some(delayed) = deferred.take() {
+                        pending.push(delayed);
+                    } else {
+                        break;
+                    }
+                }
+                assert!(pending.len() < 32, "duplicate forwarding did not terminate");
+                let (source, destination, wire, size) = pending[cursor];
+                cursor += 1;
+                if source == 2 && destination == 3 && drop_first {
+                    continue;
+                }
+                if source == 2
+                    && destination == 4
+                    && late_second
+                    && deferred.is_none()
+                    && responses == 0
+                {
+                    deferred = Some((source, destination, wire, size));
+                    continue;
+                }
+                let incoming = Message::decode(&wire[..size], destination, 15).unwrap();
+                if destination == 1 {
+                    assert!(
+                        matches!(incoming.content,Content::InvocationResult {call:c,status:InvokeStatus::Invoked,..} if c==call)
+                    );
+                    responses += 1;
+                    continue;
+                }
+                let index = ids.iter().position(|id| *id == destination).unwrap();
+                let output =
+                    nodes[index].receive_control(incoming, 100 + cursor as u32, |c, args| {
+                        assert_eq!(destination, 7, "relay executed native code");
+                        owner_deliveries += 1;
+                        invocations.invoke(f.device, &f.context, c, args)
+                    });
+                for out in output.into_iter().flatten() {
+                    let next = out.destination.expect("known path unexpectedly flooded");
+                    let mut bytes = [0; crate::kernel::radio::MAX_FRAME_SIZE];
+                    let n = out.encode(cursor as u8, &mut bytes);
+                    pending.push((out.source, next, bytes, n));
+                }
+            }
+            assert_eq!(f.calls(), 1);
+            assert_eq!(
+                owner_deliveries,
+                if merge { 1 } else { 2 },
+                "merge={merge} drop={drop_first} late={late_second}, transmissions={:?}",
+                pending
+                    .iter()
+                    .map(|(s, d, _, _)| (*s, *d))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(responses, if drop_first { 1 } else { 2 });
+            assert!(
+                !change::pending(),
+                "network copies fabricated physical observations"
+            );
+            f.device
+                .with(&f.context, |a| POWER.update(a, |a| a.observed = Some(true)));
+            assert_eq!(drain().len(), 1);
+            if drop_first {
+                nodes[0].expire(10_101);
+                let q = Message {
+                    source: 1,
+                    destination: Some(2),
+                    content: Content::ReadState {
+                        network: NETWORK,
+                        read: StateRead {
+                            reader: 1,
+                            owner: 7,
+                            request: 99,
+                            attribute: 42,
+                        },
+                        remaining: 8,
+                    },
+                };
+                let next = nodes[0]
+                    .receive_state(q, 10_102, |_| StateReadResult::UnknownAttribute)
+                    .unwrap();
+                assert_eq!(next.destination, Some(4));
+            }
+        }
     }
 
     #[test]
@@ -405,18 +587,15 @@ mod tests {
         let mut owner = Forwarder::new(3, NETWORK);
         let original = request(call(7), ON);
         let forward = relay
-            .receive_control(original, 0, |_, _| panic!("relay invoked native code"))
+            .receive_control(original, 0, |_, _| panic!("relay invoked native code"))[0]
             .unwrap();
-        assert!(relay
-            .receive_control(original, 1, |_, _| panic!())
-            .is_none());
+        assert!(relay.receive_control(original, 1, |_, _| panic!())[0].is_none());
         let mut wire = [0; crate::kernel::radio::MAX_FRAME_SIZE];
         let size = forward.encode(1, &mut wire);
         let incoming = Message::decode(&wire[..size], 3, 15).unwrap();
-        let result = owner
-            .receive_control(incoming, 2, |call, args| {
-                invocations.invoke(f.device, &f.context, call, args)
-            })
+        let result = owner.receive_control(incoming, 2, |call, args| {
+            invocations.invoke(f.device, &f.context, call, args)
+        })[0]
             .unwrap();
         assert_eq!(f.calls(), 1);
         assert!(
@@ -433,25 +612,24 @@ mod tests {
         ));
         assert_eq!(
             owner.receive_control(incoming, 3, |call, args| invocations
-                .invoke(f.device, &f.context, call, args)),
+                .invoke(f.device, &f.context, call, args))[0],
             Some(result)
         );
         assert_eq!(f.calls(), 1);
-        let reply = relay.receive_control(result, 4, |_, _| panic!()).unwrap();
+        let reply = relay.receive_control(result, 4, |_, _| panic!())[0].unwrap();
         assert_eq!(reply.destination, Some(1));
         assert!(matches!(
             reply.content,
             Content::InvocationResult { hops: 2, .. }
         ));
         assert_eq!(
-            relay.receive_control(original, 5, |_, _| panic!()),
+            relay.receive_control(original, 5, |_, _| panic!())[0],
             Some(reply)
         );
         assert_eq!(f.calls(), 1, "lost result recovery repeated the operation");
         // The next distinct command uses the direction learned from the result.
         assert_eq!(
-            relay
-                .receive_control(request(call(8), OFF), 6, |_, _| panic!())
+            relay.receive_control(request(call(8), OFF), 6, |_, _| panic!())[0]
                 .unwrap()
                 .destination,
             Some(3)

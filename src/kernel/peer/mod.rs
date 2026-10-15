@@ -126,9 +126,13 @@ pub(crate) fn run(
                 if matches!(message.content, Content::Invoke { .. }) {
                     super::radio::testing::event(super::radio::testing::Event::InvocationReceived);
                 }
-                if let Some(reply) = forwarder.receive_control(message, now, |call, arguments| {
-                    invocations.invoke(native, &context, call, arguments)
-                }) {
+                for reply in forwarder
+                    .receive_control(message, now, |call, arguments| {
+                        invocations.invoke(native, &context, call, arguments)
+                    })
+                    .into_iter()
+                    .flatten()
+                {
                     if !send(radio, reply, &mut sequence, &mut outgoing) {
                         forwarder.transmit_failed(&reply);
                     }

@@ -61,7 +61,8 @@ complete response frame along that reverse path. The matching response teaches
 relays which neighbor leads toward the owner. The MAC source identifies the
 immediate sender; the range record retains the original reader and actual owner.
 
-The shared forwarder holds three learned owner directions, eight recent paths shared
+The shared forwarder holds three cached owners with two candidate directions each,
+eight recent paths shared
 by surface and current-state reads,
 four owner-query return paths, eight recent owner notices, four invocation paths,
 eight delta duplicate keys, and eight maintained adjacent-peer records, within a
@@ -72,8 +73,9 @@ matching reply; expiry uses wrapping millisecond arithmetic. Full storage evicts
 the oldest record. A failed addressed TX removes that direction. An expired
 unanswered read removes its unconfirmed direction unless a newer response has
 confirmed it. Subsequent requests then explore again. There is no automatic
-retry, route-quality optimizer, guaranteed delivery, or acknowledgement of
-executable work in this slice.
+retry or guaranteed delivery for reads. Selection uses hop count then observed
+exchange latency; discovery can learn a second direction from a correlated later
+owner reply while suppressing duplicate owner notices upstream.
 
 A reader must use a fresh 16-bit request token for each attempt, including a retry
 of the same range. Tokens must be fresh across surface, current-state, and link reads
@@ -84,8 +86,9 @@ reboot can shorten duplicate retention, so the eight-hop bound remains necessary
 This identity is for immutable reads, not an exactly-once execution mechanism.
 
 Arrival and owner discovery now cross relays within the same eight-link bound.
-Channel formation remains link-local. Adaptive relay selection, content-addressed
-sharing, and installed-fragment delivery remain later extensions.
+Channel formation remains link-local. Probabilistic delivery scoring, broadcast
+coverage optimization, content-addressed sharing, and installed-fragment delivery
+remain later extensions.
 The network tag and matching responses are not authentication credentials.
 Startup arrival/query tags use local tick values, not durable boot identities.
 A rapid restart or reused token may be suppressed by retained history. Retries
@@ -95,11 +98,11 @@ exactly-once delivery or complete membership protocol. Mutation calls have separ
 
 ## Read envelope
 
-`LVT` **version 5** retains version-4 discovery, arrival, owner-query, and range-read
-layouts (opcodes 0–7), native invocation/result and deltas (8–10), and current-state
-read/result (11–12). Link maintenance and enumeration add opcodes 13–15 as specified
-in [LINKS.md](LINKS.md#wire-format). These extensions preserve existing v5 layouts;
-older version-5 images ignore unsupported opcodes. Earlier versions do not interoperate. MAC framing still uses numeric 2006 data frames,
+`LVT` **version 6** retains discovery/arrival/search (0–3, 6–7), surface/state
+reads (4–5, 11–12), native invocation/result and deltas (8–10), and link operations
+(13–15). The invocation control byte now encodes hop and copy budgets; see
+[INVOCATION.md](INVOCATION.md#one-frame-per-call-read-result-or-delta). Older wire
+versions are rejected. MAC framing still uses numeric 2006 data frames,
 compressed PAN `0x4c56`, extended source, and broadcast or extended destination.
 No MAC ACK is requested. Integers are little-endian.
 
@@ -223,4 +226,4 @@ no surface traffic. A consumer is needed to exercise reads on hardware.
 
 RF/range investigation remains paused. This revision is validated by host tests
 and both MCU builds, not a new hardware run. Older broadcast-capture results do
-not validate the current version-5 behavior; see [validation scope](TESTING.md#validation-scope).
+not validate the current version-6 behavior; see [validation scope](TESTING.md#validation-scope).

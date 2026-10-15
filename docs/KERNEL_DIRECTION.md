@@ -324,7 +324,7 @@ PAN `0x4c56` remains a common discovery filter, not an allocated PAN or membersh
 credential. The network tag distinguishes advertised networks; startup currently
 adopts the first established network it hears. Choosing between independently
 owned deployments and authorizing operations are not decided by that tag or PAN.
-The `LVT` version-5 envelope carries discovery, proposals, surface reads, native
+The `LVT` version-6 envelope carries discovery, proposals, surface reads, native
 calls/results, and deltas; it rejects earlier wire versions. Ordinary discovery still
 repeats every 2–3 seconds after selection. Presence never causes an echo. MAC ACKs
 are not requested for these frames. No peer table, appliance formation/join knob,
@@ -398,8 +398,9 @@ it is not an atomic census or evidence that an unreachable vertex ceased to exis
 traversal through an advertising vertex now run in the common peer task. The
 [link protocol](../src/kernel/peer/LINKS.md) defines admission/refresh, enumeration,
 and the route hint. Host tests exercise a chained walk followed by a surface read;
-both MCU ports build. Cost ranking and redundant-path delivery remain subsequent
-work; the destination cache still retains one next hop per owner.
+both MCU ports build. Destination records now retain two next-hop candidates,
+ranked by hops and observed exchange latency. Addressed invocations can split
+once into two copies; adaptive probability/coverage scoring remains subsequent work.
 
 ## Forwarding learned from communication
 
@@ -432,8 +433,8 @@ arrival carries the original owner, description length, sequence, and distance;
 relays preserve that origin while replacing the immediate MAC sender. A separate
 owner query retains its first incoming neighbor. Each reached vertex replies
 with its own address/description length and relays the query within its remaining
-scope. Multiple owners' responses can follow the same return path. A matching
-reply teaches a direction; an unsolicited announcement alone does not.
+scope. Multiple owners' responses can follow the same return path. Correlated
+replies can teach alternate directions; an unsolicited announcement alone does not.
 
 The runtime announces itself and maintains local relationships after joining.
 There is no automatic owner search. `FindOwners` remains an explicit bounded search operation; it is not
@@ -441,7 +442,8 @@ a compulsory startup census. An incoming arrival does not trigger surface transf
 Interested peers progressively follow maintained links and fetch only the data they
 need. Ordinary vertices retain no complete owner list.
 
-The current fixed forwarder budget is three learned directions, eight recent paths
+The current fixed forwarder budget is three cached owners with two directions each,
+eight recent paths
 shared by surface, current-state, and link reads, four owner-query return paths,
 eight recent owner notices, four call paths, and eight delta duplicate keys. Eight
 adjacent-peer records are maintained separately from destination paths, inside a
@@ -459,9 +461,9 @@ membership, and a missing response does not prove absence. Startup tokens use
 local ticks, not durable boot identities; rapid restart or token reuse can collide
 with retained history until it expires. Fresh-query attempts recover independently.
 
-This establishes bounded dissemination and path reuse, not an adaptive coverage
-optimizer. Delivery/latency/airtime scoring, alternative-path retention, and
-protection of unique bridges remain to be implemented. Arrival, owner discovery,
+The current selector ranks hop count then measured request/reply latency and
+retains an alternate direction. Probability/airtime/energy scoring, adaptive
+broadcast coverage, and coordinated protection of unique bridges remain open. Arrival, owner discovery,
 reads, calls/results, and deltas are bounded to eight links. Channel survey/formation remains local and
 requires an existing radio neighbor; forwarding requires the same selected network
 and channel. Partition merging and coordinated channel migration remain separate.
@@ -489,6 +491,38 @@ not emit a delta or invoke dependents. It reuses the surface-read path budget an
 token namespace; there is no periodic poller or foreign-state mirror. A consumer
 can compare that attribute's read watermark against later deltas within a boot;
 this is not an atomic multi-attribute snapshot or a reboot ordering mechanism.
+
+### Alternate directions and bounded redundant invocation
+
+Each cached owner retains up to two learned next-hop candidates. Selection
+uses hop count as a transmission-count proxy, then observed request/reply latency
+as a tie-breaker. These are local measurements, not a global optimum, calibrated
+energy estimate, or independent delivery probability. Failures withdraw the
+specific direction; they must not erase a successful alternate for the same owner.
+Candidates come from correlated exchanges and guided traversal. Until an alternate
+is learned, the owner has only one known direction; no background path-probing
+workload is introduced.
+
+An addressed invocation can carry a budget for two copies. A relay with two
+eligible directions splits once and passes one-copy budgets onward. A route with
+only one candidate carries the unused split budget farther. Broadcast exploration
+consumes that budget: it already reaches several neighbors and must not authorize
+another directed split at every recipient. The existing hop bound still applies.
+
+Copies preserve caller/request, transformer, and exact arguments. Reconverging
+copies retain up to two incoming directions and share downstream work; matching
+results can return through both. Owner dispatch uses the existing bounded result
+history. This adds transport redundancy, not an automatic retry of native work;
+it does not extend duplicate guarantees past history eviction or reboot.
+
+This is implemented in the common forwarder and validated with encoded host
+exchanges, including a lost branch and reconvergence before/after a result.
+Reconverging copies join return paths only when their remaining scope is at least
+that of the first copy; this prevents downstream echoes becoming upstream paths.
+Later longer branches are not retained at the convergence point. Delta/arrival
+dissemination remains the existing bounded broadcast behavior; adaptive coverage
+is separate. LVT v6 packs the invocation copy budget into its existing control
+byte and rejects older wire versions.
 
 ## Structured memory and resident relationships
 
@@ -544,7 +578,7 @@ flowchart TB
     discovery["kernel::peer: channel survey, computed rendezvous, arrival and message dispatch"]
     exposure["peer::exposure: borrowed local IR and bounded range encoding"]
     links["peer::links: maintained adjacent peers, confirmation, refresh and cursor enumeration"]
-    forwarding["peer::forwarding: bounded arrivals, owner discovery/read/call return paths, learned directions, delta duplicates"]
+    forwarding["peer::forwarding: bounded dissemination, return paths, cost-ranked directions, one invocation split"]
     radio["Nordic/C6 radio ports: fixed buffers, energy/CCA setup, hardware IRQs"]
     transport["kernel::radio: resident driver and notification waits"]
     probe["src/kernel/radio/tests: transport probe, discovery counters and surface-range observer"]
@@ -599,7 +633,7 @@ flowchart TB
     forwarding -->|retains neighbors, enumerates and follows advertised links| links
     links -->|expired neighbors invalidate directions| forwarding
     forwarding -->|owner encodes requested range| exposure
-    forwarding -->|bounded announcements, exploration, and reverse replies| transport
+    forwarding -->|bounded dissemination, selected invocation copies, and reverse replies| transport
     discovery -->|surveys energy, selects channel, exchanges frames through| transport
     transport -->|receives and transmits frames| radio
     transport -->|blocks on notifications while hardware works| tasks
@@ -635,7 +669,7 @@ exchange through the kernel. RF quality remains unresolved and the investigation
 is paused. Historical captures used older wire revisions and live in the external
 lab; they do not establish current protocol delivery or general loss-free operation.
 
-The current LVT v5 path has host tests and both MCU builds: borrowed surface range
+The current LVT v6 path has host tests and both MCU builds: borrowed surface range
 reads, maintained adjacent links and guided traversal, bounded relay directions,
 native appliance binding,
 owner-directed invocation/results, current-state reads, and registered observation
@@ -650,10 +684,11 @@ manual-control message path has not yet had an end-to-end hardware run.
 ## Next implementation sequence
 
 Maintained reciprocal links, built-in `ReadLinks`, and guided traversal are now
-implemented using the existing read return paths and resident task. Next, develop
-cost-based retention/selection of alternative destination paths and bounded
-redundant delivery. Preserve message identity and native duplicate handling.
-Tablet-daemon integration and hardware validation of the current protocol remain open.
+implemented using the existing read return paths and resident task. Cost-ranked
+alternate directions and a bounded invocation split now preserve message identity
+through independent and reconverging paths. Tablet-daemon integration, hardware
+validation, and adaptive delivery/coverage policy remain open. Native duplicate
+history is bounded and volatile; this is not an exactly-once ledger.
 
 1. **Establish the integrated boot path across Nordic and ESP.** Provide
    the timer, interrupt, and context-switch integration needed by the existing scheduler. Establish the

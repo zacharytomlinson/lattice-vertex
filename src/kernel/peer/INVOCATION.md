@@ -32,20 +32,25 @@ remain responsible for hardware limits; the kernel does not interpret IR precond
 
 ## One frame per call, read, result, or delta
 
-These use **LVT version 5** and the MAC/network profile in
-[EXPOSURE.md](EXPOSURE.md#read-envelope). State reads add opcodes 11–12 without
-changing existing messages. Earlier version-5 firmware ignores those new opcodes;
-versions before 5 remain incompatible. All numbers are little-endian; no strings or Rust layouts travel
-on the wire. The common payload prefix is magic/version (4), opcode (1), network
-founder (8), and channel (1).
+These use **LVT version 6** and the MAC/network profile in
+[EXPOSURE.md](EXPOSURE.md#read-envelope). Versions before 6 are incompatible.
+All numbers are little-endian; no strings or Rust layouts travel on the wire.
+The common payload prefix is magic/version (4), opcode (1), network founder (8),
+and channel (1).
 
 | Opcode | Fields after the common prefix | MAC bytes including payload, before FCS |
 | --- | --- | --- |
-| 8: invoke | Caller `u64`, owner `u64`, request `u32`, transformer reference `u64`, remaining scope `u8`, argument count `u8`, typed scalar arguments | Addressed: 65–125; one Boolean argument: 67 |
+| 8: invoke | Caller `u64`, owner `u64`, request `u32`, transformer reference `u64`, packed scope/copy budget `u8`, argument count `u8`, typed scalar arguments | Addressed: 65–125; one Boolean argument: 67 |
 | 9: invocation result | Same caller/owner/request/transformer, status `u8`, distance `u8` | Addressed: 65 |
 | 10: state changed | Owner `u64`, attribute reference `u64`, sequence `u32`, distance `u8`, typed scalar value or unavailable tag | Broadcast: 51–59; Boolean: 52 |
 | 11: read state | Reader `u64`, owner `u64`, request `u16`, attribute reference `u64`, remaining scope `u8` | Addressed: 62; broadcast exploration: 56 |
 | 12: state value | Same reader/owner/request/attribute, distance `u8`, result tag `u8`; successful read adds change sequence `u32` and typed scalar or unavailable tag | Addressed: 63 for a failure; 68–76 for a value; Boolean: 69 |
+
+The invocation control byte keeps remaining hops (1–8) in bits 0–3. Bit 4 is
+`copies - 1`: zero permits one copy, one permits a single split into two copies.
+Bits 5–7 are reserved and must be zero. An addressed origin can request two-copy
+delivery; a broadcast invocation must carry a one-copy budget. This is protocol
+metadata, not an appliance setting, and it adds no frame overhead.
 
 Scalar tags and declared-width values are identical to surface literals: 0 is
 Boolean (only 0/1 accepted), 1–4 are unsigned 8/16/32/64-bit, 5–8 are signed
@@ -62,18 +67,42 @@ An error can follow a real partial change; that observation still emits its delt
 
 ## Forwarding and duplicate commands
 
-Invocations reuse owner directions learned by discovery, surface replies, or
-invocation results. Without a direction they explore by bounded broadcast. Each
-relay retains the first incoming neighbor; the owner returns its result along
-that path. Scope is at most eight links. The owner invokes only its own exposed
-handle. Relays do not execute the call or evaluate mathematical definitions.
+Invocations reuse owner directions learned from correlated discovery, read, or
+invocation replies. Each of three cached owners can retain up to two different next
+hops. Selection favors fewer hops, then lower observed request/reply latency,
+then the next-hop address to break ties. A maintained direct neighbor takes
+precedence. Latency includes remote processing and local scheduling; this is a
+local heuristic, not a calibrated airtime/energy or loss-probability model.
+Alternates must first be learned from actual correlated exchanges or guided
+traversal; this increment does not add a background route-probing workload.
 
-Four fixed call-path records retain the full request, exact argument bytes,
-incoming/onward directions, and optional returned status. A pending duplicate is
-suppressed. A matching duplicate after the result arrived can recover the saved
-result without another native invocation. Paths expire after 10 seconds or are
-evicted oldest-first. Failed addressed TX or an expired unanswered call invalidates
-its unconfirmed direction, using the same rule as surface reads.
+With two eligible directions and a two-copy budget, a relay emits a pair of
+addressed copies immediately and gives each a one-copy budget. A single known
+direction carries an unused budget onward. Unknown directions use the existing
+bounded broadcast exploration with a one-copy budget. That flood can reach more
+than two receivers, but none may split it into another addressed pair. Delta and
+arrival broadcasts retain their existing behavior. No execution timeout triggers
+another native operation.
+
+The four call records retain exact arguments, up to two incoming directions,
+up to two outgoing directions, and the returned status. A pending matching copy
+from another upstream direction joins the return paths without forwarding the
+work again. Only equal/shorter incoming branches (remaining hops at least the
+first copy's) are admitted; a copy arriving back from downstream must not create
+a return-path cycle. Thus reconvergence through a later, longer incoming branch
+is not retained as an additional return path in this increment.
+
+A matching result can return through both retained incoming directions. Up to two
+distinct returning neighbors can establish owner directions; repeats from the
+same neighbor or conflicting statuses are discarded. A late matching request
+receives the saved status along its own retained incoming direction. Cached
+results never contain or substitute for physical state.
+
+Paths expire after 10 seconds or oldest eviction. Failed addressed TX removes
+only that candidate. When a call expires, each unanswered outgoing direction is
+withdrawn unless newer evidence confirmed it; success through the other branch
+does not preserve a silent direction. Candidates expire independently after 60
+seconds without confirmation. No route record or radio completion proves execution.
 
 At the owner, eight recent invocation records retain caller/request, transformer,
 exact arguments, and returned status. An identical duplicate returns that status.
@@ -156,8 +185,9 @@ ordering across reboot, compensate for packet loss, or prove physical convergenc
 
 ## Storage and validation
 
-The common forwarder has a 2,048-byte compile-time ceiling, including maintained
-adjacent links, read/discovery records, four call paths, and eight delta duplicate keys. Owner
+The common forwarder retains its 2,048-byte compile-time ceiling, including three
+owners with two candidate directions each, maintained adjacent links, read/discovery
+records, four call paths with two-way branch bookkeeping, and eight delta duplicate keys. Owner
 invocation history has a 768-byte ceiling. Appliance and transport storage are
 static; argument decoding uses bounded stack storage. No allocator is enabled.
 
@@ -166,6 +196,10 @@ command replay, changed-token content rejection, delayed observations, errors
 after physical changes, grouped-report ordering, instance filtering, unavailable
 values, hard eviction, relayed results/deltas, scope/expiry, and numeric wire bounds.
 State-read checks also cover unavailable/busy/unknown results, delayed replies versus newer deltas, two-relay delivery, shared-path
-correlation/eviction, and preserving pending changes.
+correlation/eviction, and preserving pending changes. Multipath checks cover
+cost ordering, independent failure/expiry, split-budget conservation, reconvergence,
+a late second copy, and a lost branch using encoded frames and the native fixture.
+They prove single invocation while its result remains retained; they do not extend
+that guarantee across owner-history eviction or reboot.
 Ordinary and observer C6/nRF images build. These are host/build checks: this new
 path has not been exercised on boards, and RF investigation remains paused.

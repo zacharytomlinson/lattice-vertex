@@ -46,7 +46,7 @@ The on-air discovery profile is:
 | Discovery destination | PAN `0x4c56`, short broadcast `0xffff` |
 | Presence destination | PAN `0x4c56`, requesting peer's extended address |
 | Proposal destination | Broadcast solicits an answer; directed reply carries the candidate's preferred record |
-| Discovery payload | `4c 56 54 05` (`LVT`, version 5), then kind 0 (discover), 1 (present), or 2 (propose) |
+| Discovery payload | `4c 56 54 06` (`LVT`, version 6), then kind 0 (discover), 1 (present), or 2 (propose) |
 | Present/propose fields | Founding address: 8 bytes little-endian; channel: 1 byte |
 | Size before hardware FCS | 20 bytes discovery; 35 bytes directed presence/proposal; 29 bytes broadcast proposal |
 
@@ -91,7 +91,7 @@ wrong resident channel, invalid network tags, and wrong addressing for a kind
 are rejected. Candidates advertise and answer broadcasts while visiting channels,
 with their proposed operating channel in the payload. That proposal
 may name another channel; established presence must match the receive channel.
-Versions 1–4 are intentionally incompatible with the current version 5.
+Versions 1–5 are intentionally incompatible with the current version 6.
 Host checks cover wire vectors, rejection boundaries, channel selection, proposal
 ordering, inherited network replies, response termination, and rendezvous overlap:
 
@@ -125,9 +125,10 @@ the range/forwarding checks. Two passive observers do not initiate reads.
 
 ## Validation scope
 
-The current version-5 kernel has host/build validation. Native calls, relayed
+The current version-6 kernel has host/build validation. Native calls, relayed
 surface/current-state reads, reciprocal link maintenance, guided traversal, owner
-discovery, and deltas have deterministic host checks; their
+discovery, scored alternate directions, bounded invocation replication, and deltas
+have deterministic host checks; their
 complete tablet-to-appliance path still needs hardware validation. Earlier images
 exercised channel formation and peer exchange on C6 and Nordic. Those results do
 not establish the current wire version's end-to-end behavior or radio range.

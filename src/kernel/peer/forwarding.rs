@@ -21,20 +21,64 @@ const CHANGE_NOTICES: usize = 8;
 const READ_MS: u32 = 10_000;
 const ROUTE_MS: u32 = 60_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Direction {
+    next: u64,
+    confirmed: u32,
+    round_trip_ms: u16,
+    hops: u8,
+}
+impl Direction {
+    const EMPTY: Self = Self {
+        next: 0,
+        confirmed: 0,
+        round_trip_ms: 0,
+        hops: 0,
+    };
+    fn cost(self) -> (u8, u16, u64) {
+        (self.hops, self.round_trip_ms, self.next)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Route {
     owner: u64,
-    next: u64,
-    confirmed: u32,
-    hops: u8,
+    directions: [Direction; 2],
 }
 impl Route {
     const EMPTY: Self = Self {
         owner: 0,
-        next: 0,
-        confirmed: 0,
-        hops: 0,
+        directions: [Direction::EMPTY; 2],
     };
+    fn age(&self, now: u32) -> u32 {
+        self.directions
+            .iter()
+            .filter(|d| d.next != 0)
+            .map(|d| now.wrapping_sub(d.confirmed))
+            .min()
+            .unwrap_or(u32::MAX)
+    }
+    fn remove(&mut self, next: u64) {
+        for d in &mut self.directions {
+            if d.next == next {
+                *d = Direction::EMPTY;
+            }
+        }
+        self.clear_empty();
+    }
+    fn clear_empty(&mut self) {
+        if self.directions.iter().all(|d| d.next == 0) {
+            *self = Self::EMPTY;
+        }
+    }
+    fn unanswered(&mut self, next: u64, started: u32, now: u32) {
+        for d in &mut self.directions {
+            if d.next == next && now.wrapping_sub(d.confirmed) >= now.wrapping_sub(started) {
+                *d = Direction::EMPTY;
+            }
+        }
+        self.clear_empty();
+    }
 }
 
 /// All read kinds share one bounded reverse-path budget and token namespace.
@@ -134,11 +178,13 @@ impl OwnerNotice {
 #[derive(Clone, Copy)]
 struct CallPath {
     call: Invocation,
-    previous: u64,
-    onward: u64,
+    previous: [u64; 2],
+    onward: [u64; 2],
+    returned: [u64; 2],
     started: u32,
     arguments: [u8; CALL_ARGUMENT_BYTES],
     length: u8,
+    remaining: u8,
     result: Option<(InvokeStatus, u8)>,
 }
 impl CallPath {
@@ -149,11 +195,13 @@ impl CallPath {
             request: 0,
             transformer: 0,
         },
-        previous: 0,
-        onward: 0,
+        previous: [0; 2],
+        onward: [0; 2],
+        returned: [0; 2],
         started: 0,
         arguments: [0; CALL_ARGUMENT_BYTES],
         length: 0,
+        remaining: 0,
         result: None,
     };
 }
@@ -209,20 +257,17 @@ impl Forwarder {
         let routes = &mut self.routes;
         self.links.expire(now, |peer| {
             for route in &mut *routes {
-                if route.next == peer {
-                    *route = Route::EMPTY;
-                }
+                route.remove(peer);
             }
         });
         for path in &mut self.calls {
             if path.call.caller != 0 && now.wrapping_sub(path.started) >= READ_MS {
-                if path.result.is_none() && path.onward != 0 {
-                    for route in &mut self.routes {
-                        if route.owner == path.call.owner
-                            && route.next == path.onward
-                            && now.wrapping_sub(route.confirmed) >= now.wrapping_sub(path.started)
-                        {
-                            *route = Route::EMPTY;
+                for next in path.onward {
+                    if next != 0 && !path.returned.contains(&next) {
+                        for route in &mut self.routes {
+                            if route.owner == path.call.owner {
+                                route.unanswered(next, path.started, now);
+                            }
                         }
                     }
                 }
@@ -248,11 +293,8 @@ impl Forwarder {
             if path.read.reader() != 0 && now.wrapping_sub(path.started) >= READ_MS {
                 if !path.answered && path.onward != 0 {
                     for route in &mut self.routes {
-                        if route.owner == path.read.direction(self.local)
-                            && route.next == path.onward
-                            && now.wrapping_sub(route.confirmed) >= now.wrapping_sub(path.started)
-                        {
-                            *route = Route::EMPTY;
+                        if route.owner == path.read.direction(self.local) {
+                            route.unanswered(path.onward, path.started, now);
                         }
                     }
                 }
@@ -260,9 +302,12 @@ impl Forwarder {
             }
         }
         for route in &mut self.routes {
-            if route.owner != 0 && now.wrapping_sub(route.confirmed) >= ROUTE_MS {
-                *route = Route::EMPTY;
+            for d in &mut route.directions {
+                if d.next != 0 && now.wrapping_sub(d.confirmed) >= ROUTE_MS {
+                    *d = Direction::EMPTY;
+                }
             }
+            route.clear_empty();
         }
     }
 
@@ -316,9 +361,7 @@ impl Forwarder {
         let reply = self.links.receive(incoming.source, phase, token, now);
         if was_linked && !self.links.contains(incoming.source) {
             for route in &mut self.routes {
-                if route.next == incoming.source {
-                    *route = Route::EMPTY;
-                }
+                route.remove(incoming.source);
             }
         }
         reply.map(|phase| self.link_message(incoming.source, phase, token))
@@ -399,63 +442,91 @@ impl Forwarder {
         }
     }
 
+    /// At most two immediate transmissions. Copies keep the same invocation
+    /// identity; a split consumes the budget so descendants cannot split again.
     pub(super) fn receive_control<'a>(
         &mut self,
         incoming: Message<'a>,
         now: u32,
         invoke: impl FnOnce(Invocation, &[u8]) -> InvokeStatus,
-    ) -> Option<Message<'a>> {
+    ) -> [Option<Message<'a>>; 2] {
         self.expire(now);
         match incoming.content {
             Content::Invoke {
                 network,
                 call,
                 remaining,
+                copies,
                 arguments,
             } => {
                 if network != self.network || call.caller == self.local {
-                    return None;
+                    return [None; 2];
                 }
                 if call.owner == self.local {
                     let status = invoke(call, arguments);
-                    return Some(Message {
-                        source: self.local,
-                        destination: Some(incoming.source),
-                        content: Content::InvocationResult {
-                            network,
-                            call,
-                            status,
-                            hops: 1,
-                        },
-                    });
+                    return [
+                        Some(Message {
+                            source: self.local,
+                            destination: Some(incoming.source),
+                            content: Content::InvocationResult {
+                                network,
+                                call,
+                                status,
+                                hops: 1,
+                            },
+                        }),
+                        None,
+                    ];
                 }
                 if let Some(path) = self
                     .calls
-                    .iter()
+                    .iter_mut()
                     .find(|p| p.call.caller == call.caller && p.call.request == call.request)
                 {
                     if path.call != call
-                        || path.previous != incoming.source
                         || &path.arguments[..path.length as usize] != arguments
+                        || path.onward.contains(&incoming.source)
                     {
-                        return None;
+                        return [None; 2];
                     }
-                    // A duplicate can recover a lost result without dispatching again.
-                    return path.result.map(|(status, hops)| Message {
-                        source: self.local,
-                        destination: Some(path.previous),
-                        content: Content::InvocationResult {
-                            network,
-                            call,
-                            status,
-                            hops: hops + 1,
-                        },
-                    });
+                    if !path.previous.contains(&incoming.source) {
+                        // A copy returning from downstream has spent more hops.
+                        // Only equal/shorter incoming branches join the return paths.
+                        if remaining < path.remaining {
+                            return [None; 2];
+                        }
+                        let Some(slot) = path.previous.iter_mut().find(|p| **p == 0) else {
+                            return [None; 2];
+                        };
+                        *slot = incoming.source;
+                    }
+                    // A second incoming branch joins the retained return paths.
+                    // Cached results answer just that copy; pending work is not forwarded again.
+                    return [
+                        path.result.map(|(status, hops)| Message {
+                            source: self.local,
+                            destination: Some(incoming.source),
+                            content: Content::InvocationResult {
+                                network,
+                                call,
+                                status,
+                                hops: hops + 1,
+                            },
+                        }),
+                        None,
+                    ];
                 }
                 if remaining <= 1 {
-                    return None;
+                    return [None; 2];
                 }
-                let next = self.next_hop(call.owner, incoming.source, remaining);
+                let mut next = self.next_hops(call.owner, incoming.source, remaining);
+                if copies == 1 {
+                    next[1] = 0;
+                }
+                let split = next[1] != 0;
+                // Broadcast exploration already fans out. It never grants each
+                // recipient another directed fork of the same packet.
+                let copies = if split || next[0] == 0 { 1 } else { copies };
                 let slot = self
                     .calls
                     .iter()
@@ -467,24 +538,33 @@ impl Forwarder {
                     });
                 let mut path = CallPath {
                     call,
-                    previous: incoming.source,
-                    onward: next.unwrap_or(0),
+                    previous: [incoming.source, 0],
+                    onward: next,
                     started: now,
                     length: arguments.len() as u8,
+                    remaining,
                     ..CallPath::EMPTY
                 };
                 path.arguments[..arguments.len()].copy_from_slice(arguments);
                 self.calls[slot] = path;
-                Some(Message {
+                let first = Message {
                     source: self.local,
-                    destination: next,
+                    destination: (next[0] != 0).then_some(next[0]),
                     content: Content::Invoke {
                         network,
                         call,
                         remaining: remaining - 1,
+                        copies,
                         arguments,
                     },
-                })
+                };
+                [
+                    Some(first),
+                    split.then_some(Message {
+                        destination: Some(next[1]),
+                        ..first
+                    }),
+                ]
             }
             Content::InvocationResult {
                 network,
@@ -493,30 +573,46 @@ impl Forwarder {
                 hops,
             } => {
                 if network != self.network || hops >= MAX_HOPS {
-                    return None;
+                    return [None; 2];
                 }
-                let path = self.calls.iter_mut().find(|p| p.call == call)?;
-                if path.result.is_some()
-                    || path.previous == incoming.source
-                    || (path.onward != 0 && path.onward != incoming.source)
+                let Some(path) = self.calls.iter_mut().find(|p| p.call == call) else {
+                    return [None; 2];
+                };
+                if path.previous.contains(&incoming.source)
+                    || path.returned.contains(&incoming.source)
+                    || (path.onward[0] != 0 && !path.onward.contains(&incoming.source))
+                    || path.result.is_some_and(|(old, _)| old != status)
                 {
-                    return None;
+                    return [None; 2];
                 }
-                path.result = Some((status, hops));
+                let Some(returned) = path.returned.iter_mut().find(|p| **p == 0) else {
+                    return [None; 2];
+                };
+                *returned = incoming.source;
+                let distance = path.result.map_or(hops, |(_, old)| old.min(hops));
+                path.result = Some((status, distance));
                 let previous = path.previous;
-                self.learn(call.owner, incoming.source, hops, now);
-                Some(Message {
+                let elapsed = now.wrapping_sub(path.started);
+                self.learn(call.owner, incoming.source, hops, now, elapsed);
+                let first = Message {
                     source: self.local,
-                    destination: Some(previous),
+                    destination: Some(previous[0]),
                     content: Content::InvocationResult {
                         network,
                         call,
                         status,
                         hops: hops + 1,
                     },
-                })
+                };
+                [
+                    Some(first),
+                    (previous[1] != 0).then_some(Message {
+                        destination: Some(previous[1]),
+                        ..first
+                    }),
+                ]
             }
-            _ => None,
+            _ => [None; 2],
         }
     }
 
@@ -742,13 +838,27 @@ impl Forwarder {
                     .discovery
                     .iter()
                     .find(|p| p.seeker == seeker && p.request == request)?;
-                if incoming.source == path.previous
-                    || (seeker != self.local && hops >= MAX_HOPS)
-                    || !self.notice(owner.address, seeker, request, now)
-                {
+                if incoming.source == path.previous || (seeker != self.local && hops >= MAX_HOPS) {
                     return None;
                 }
-                self.learn(owner.address, incoming.source, hops, now);
+                let first = self.notice(owner.address, seeker, request, now);
+                if first
+                    || !self.routes.iter().any(|r| {
+                        r.owner == owner.address
+                            && r.directions.iter().any(|d| d.next == incoming.source)
+                    })
+                {
+                    self.learn(
+                        owner.address,
+                        incoming.source,
+                        hops,
+                        now,
+                        now.wrapping_sub(path.started),
+                    );
+                }
+                if !first {
+                    return None;
+                }
                 if seeker != self.local {
                     send(Message {
                         source: self.local,
@@ -1018,21 +1128,50 @@ impl Forwarder {
         path.answered = true;
         let previous = path.previous;
         // A correlated response confirms reachability, including Busy/UnknownAttribute.
-        self.learn(read.owner(), source, hops, now);
+        let elapsed = now.wrapping_sub(path.started);
+        self.learn(read.owner(), source, hops, now, elapsed);
         Some(previous)
     }
 
-    fn next_hop(&self, owner: u64, previous: u64, remaining: u8) -> Option<u64> {
-        if remaining > 1 && owner != previous && self.links.contains(owner) {
-            return Some(owner);
+    fn next_hops(&self, owner: u64, previous: u64, remaining: u8) -> [u64; 2] {
+        let direct = remaining > 1 && owner != previous && self.links.contains(owner);
+        let mut candidates = [Direction::EMPTY; 2];
+        if let Some(route) = self.routes.iter().find(|r| r.owner == owner) {
+            candidates = route.directions;
         }
-        self.routes
-            .iter()
-            .find(|r| r.owner == owner && r.next != previous && r.hops < remaining)
-            .map(|r| r.next)
+        if candidates[1].next != 0
+            && (candidates[0].next == 0 || candidates[1].cost() < candidates[0].cost())
+        {
+            candidates.swap(0, 1);
+        }
+        let mut selected = [0; 2];
+        let mut count = 0;
+        if direct {
+            selected[0] = owner;
+            count = 1;
+        }
+        for d in candidates {
+            if count == 2 {
+                break;
+            }
+            if d.next != 0
+                && d.next != previous
+                && d.hops < remaining
+                && !selected.contains(&d.next)
+            {
+                selected[count] = d.next;
+                count += 1;
+            }
+        }
+        selected
     }
 
-    fn learn(&mut self, owner: u64, next: u64, hops: u8, now: u32) {
+    fn next_hop(&self, owner: u64, previous: u64, remaining: u8) -> Option<u64> {
+        let next = self.next_hops(owner, previous, remaining)[0];
+        (next != 0).then_some(next)
+    }
+
+    fn learn(&mut self, owner: u64, next: u64, hops: u8, now: u32, elapsed: u32) {
         let slot = self
             .routes
             .iter()
@@ -1040,15 +1179,39 @@ impl Forwarder {
             .or_else(|| self.routes.iter().position(|r| r.owner == 0))
             .unwrap_or_else(|| {
                 (0..ROUTES)
-                    .max_by_key(|&i| now.wrapping_sub(self.routes[i].confirmed))
+                    .max_by_key(|&i| self.routes[i].age(now))
                     .unwrap()
             });
-        self.routes[slot] = Route {
-            owner,
+        let route = &mut self.routes[slot];
+        if route.owner != owner {
+            *route = Route {
+                owner,
+                ..Route::EMPTY
+            };
+        }
+        let measured = Direction {
             next,
             hops,
             confirmed: now,
+            round_trip_ms: elapsed.clamp(1, u16::MAX as u32) as u16,
         };
+        let index = route
+            .directions
+            .iter()
+            .position(|d| d.next == next)
+            .or_else(|| route.directions.iter().position(|d| d.next == 0));
+        if let Some(index) = index {
+            route.directions[index] = measured;
+        } else {
+            let worst = if route.directions[0].cost() > route.directions[1].cost() {
+                0
+            } else {
+                1
+            };
+            if measured.cost() < route.directions[worst].cost() {
+                route.directions[worst] = measured;
+            }
+        }
     }
 
     pub(super) fn transmit_failed(&mut self, outgoing: &Message<'_>) {
@@ -1060,8 +1223,10 @@ impl Forwarder {
             _ => return,
         };
         for route in &mut self.routes {
-            if route.owner == owner && Some(route.next) == outgoing.destination {
-                *route = Route::EMPTY;
+            if route.owner == owner {
+                if let Some(next) = outgoing.destination {
+                    route.remove(next);
+                }
             }
         }
     }
@@ -1249,6 +1414,145 @@ mod tests {
     }
 
     #[test]
+    fn alternate_directions_rank_observed_cost_and_fail_independently() {
+        let mut node = Forwarder::new(2, NET);
+        for (next, hops, latency, expected) in [
+            (3, 3, 1, [3, 0]),
+            (4, 2, 40, [4, 3]),
+            (5, 2, 10, [5, 4]),
+            (6, 4, 1, [5, 4]),
+            (4, 2, 5, [4, 5]),
+            (4, 2, 80, [5, 4]),
+        ] {
+            node.learn(9, next, hops, 0, latency);
+            assert_eq!(node.next_hops(9, 1, 8), expected);
+        }
+        assert_eq!(node.next_hops(9, 5, 8), [4, 0]);
+        assert_eq!(node.next_hops(9, 1, 2), [0, 0]);
+        let failed = Message {
+            source: 2,
+            destination: Some(5),
+            content: Content::ReadState {
+                network: NET,
+                read: StateRead {
+                    reader: 1,
+                    owner: 9,
+                    request: 1,
+                    attribute: 42,
+                },
+                remaining: 7,
+            },
+        };
+        node.transmit_failed(&failed);
+        assert_eq!(node.next_hops(9, 1, 8), [4, 0]);
+        node.learn(9, 5, 2, 100, 10);
+        node.expire(ROUTE_MS);
+        assert_eq!(
+            node.next_hops(9, 1, 8),
+            [5, 0],
+            "expiry erased a newer alternate"
+        );
+        // Owner capacity stays bounded independently of candidates per owner.
+        node.learn(10, 3, 2, ROUTE_MS + 1, 3);
+        node.learn(11, 3, 2, ROUTE_MS + 2, 3);
+        node.learn(12, 3, 2, ROUTE_MS + 3, 3);
+        assert_eq!(node.next_hops(9, 1, 8), [0, 0]);
+        assert_eq!(node.next_hops(12, 1, 8), [3, 0]);
+    }
+
+    #[test]
+    fn invocation_split_budget_and_partial_success_keep_the_surviving_direction() {
+        let mut node = Forwarder::new(2, NET);
+        node.learn(9, 3, 2, 0, 4);
+        node.learn(9, 4, 2, 0, 6);
+        let call = Invocation {
+            caller: 1,
+            owner: 9,
+            request: 1,
+            transformer: 42,
+        };
+        let request = Message {
+            source: 1,
+            destination: Some(2),
+            content: Content::Invoke {
+                network: NET,
+                call,
+                remaining: 8,
+                copies: 2,
+                arguments: &[0],
+            },
+        };
+        let sent = node.receive_control(request, 1, |_, _| panic!());
+        assert_eq!(
+            sent.map(|m| m.map(|m| m.destination)),
+            [Some(Some(3)), Some(Some(4))]
+        );
+        for copy in sent.into_iter().flatten() {
+            assert!(
+                matches!(copy.content,Content::Invoke {call:c,copies:1,remaining:7,arguments:&[0],..} if c==call)
+            );
+        }
+        let result = Message {
+            source: 4,
+            destination: Some(2),
+            content: Content::InvocationResult {
+                network: NET,
+                call,
+                status: InvokeStatus::Invoked,
+                hops: 2,
+            },
+        };
+        assert!(node.receive_control(result, 10, |_, _| panic!())[0].is_some());
+        assert!(node
+            .receive_control(result, 11, |_, _| panic!())
+            .iter()
+            .all(Option::is_none));
+        node.expire(READ_MS + 1);
+        assert_eq!(
+            node.next_hops(9, 1, 8),
+            [4, 0],
+            "one successful copy masked the unanswered direction"
+        );
+        let mut downstream = Forwarder::new(4, NET);
+        downstream.learn(9, 6, 2, 0, 1);
+        downstream.learn(9, 7, 2, 0, 2);
+        let one = downstream.receive_control(sent[1].unwrap(), 2, |_, _| panic!());
+        assert!(
+            one[0].is_some() && one[1].is_none(),
+            "a descendant split again"
+        );
+        let mut empty = Forwarder::new(2, NET);
+        let exploration = empty.receive_control(request, 0, |_, _| panic!());
+        assert!(exploration[1].is_none());
+        assert!(matches!(
+            exploration[0].unwrap(),
+            Message {
+                destination: None,
+                content: Content::Invoke { copies: 1, .. },
+                ..
+            }
+        ));
+        // No split is consumed while there is only one known direction.
+        empty.learn(9, 3, 2, 0, 4);
+        let next = Message {
+            content: Content::Invoke {
+                network: NET,
+                call: Invocation { request: 2, ..call },
+                remaining: 8,
+                copies: 2,
+                arguments: &[0],
+            },
+            ..request
+        };
+        assert!(matches!(
+            empty.receive_control(next, 1, |_, _| panic!())[0]
+                .unwrap()
+                .content,
+            Content::Invoke { copies: 2, .. }
+        ));
+    }
+
+    #[test]
     fn link_walk_discovers_beyond_radio_range_and_teaches_surface_read_directions() {
         let mut nodes = [
             Forwarder::new(2, NET),
@@ -1333,7 +1637,7 @@ mod tests {
         assert!(matches!(answer.content,Content::SurfacePart {read:r,hops:4,..} if r==read));
         // A local route-cache replacement cannot erase the maintained neighbor.
         for owner in 90..95 {
-            nodes[0].learn(owner, 3, 2, 102);
+            nodes[0].learn(owner, 3, 2, 102, 1);
         }
         let read = LinkRead {
             reader: 1,
@@ -1456,7 +1760,7 @@ mod tests {
         // Failed routing toward a via removes that direction, not a target route
         // which this request had not yet established.
         let mut relay = Forwarder::new(2, NET);
-        relay.learn(4, 3, 2, 0);
+        relay.learn(4, 3, 2, 0, 1);
         let q = Message {
             content: Content::ReadLinks {
                 network: NET,
@@ -1711,6 +2015,7 @@ mod tests {
             source: 1,
             destination: Some(2),
             content: Content::Invoke {
+                copies: 1,
                 network,
                 call,
                 remaining: MAX_HOPS,
@@ -1727,39 +2032,43 @@ mod tests {
                 hops: 2,
             },
         };
-        assert!(relay
-            .receive_control(response, 0, |_, _| panic!())
-            .is_none());
-        let out = relay.receive_control(request, 0, |_, _| panic!()).unwrap();
+        assert!(relay.receive_control(response, 0, |_, _| panic!())[0].is_none());
+        let out = relay.receive_control(request, 0, |_, _| panic!())[0].unwrap();
         assert_eq!(out.destination, None);
         assert!(matches!(out.content, Content::Invoke { remaining: 7, .. }));
-        assert!(relay
-            .receive_control(
-                Message {
-                    source: 3,
-                    ..request
+        assert!(relay.receive_control(
+            Message {
+                source: 3,
+                content: Content::Invoke {
+                    network,
+                    call,
+                    remaining: 6,
+                    copies: 1,
+                    arguments: &[0]
                 },
-                1,
-                |_, _| panic!()
-            )
-            .is_none());
-        assert!(relay
-            .receive_control(
-                Message {
-                    source: 1,
-                    ..response
-                },
-                2,
-                |_, _| panic!()
-            )
-            .is_none());
-        let reply = relay.receive_control(response, 3, |_, _| panic!()).unwrap();
+                ..request
+            },
+            1,
+            |_, _| panic!()
+        )[0]
+        .is_none());
+        assert!(relay.receive_control(
+            Message {
+                source: 1,
+                ..response
+            },
+            2,
+            |_, _| panic!()
+        )[0]
+        .is_none());
+        let reply = relay.receive_control(response, 3, |_, _| panic!())[0].unwrap();
         assert!(matches!(
             reply.content,
             Content::InvocationResult { hops: 3, .. }
         ));
         let next = Message {
             content: Content::Invoke {
+                copies: 1,
                 network,
                 call: Invocation { request: 2, ..call },
                 remaining: MAX_HOPS,
@@ -1767,7 +2076,7 @@ mod tests {
             },
             ..request
         };
-        let directed = relay.receive_control(next, 4, |_, _| panic!()).unwrap();
+        let directed = relay.receive_control(next, 4, |_, _| panic!())[0].unwrap();
         assert_eq!(directed.destination, Some(3));
         // A reply from an unrelated neighbor cannot settle a directed request.
         let wrong = Message {
@@ -1780,17 +2089,17 @@ mod tests {
             },
             ..response
         };
-        assert!(relay.receive_control(wrong, 5, |_, _| panic!()).is_none());
+        assert!(relay.receive_control(wrong, 5, |_, _| panic!())[0].is_none());
         relay.expire(READ_MS + 4);
         assert_eq!(
-            relay
-                .receive_control(next, READ_MS + 5, |_, _| panic!())
+            relay.receive_control(next, READ_MS + 5, |_, _| panic!())[0]
                 .unwrap()
                 .destination,
             None
         );
         let exhausted = Message {
             content: Content::Invoke {
+                copies: 1,
                 network,
                 call: Invocation { request: 3, ..call },
                 remaining: 1,
@@ -1798,28 +2107,26 @@ mod tests {
             },
             ..request
         };
-        assert!(relay
-            .receive_control(exhausted, READ_MS + 6, |_, _| panic!())
-            .is_none());
+        assert!(relay.receive_control(exhausted, READ_MS + 6, |_, _| panic!())[0].is_none());
         let other = Network {
             founder: 10,
             ..network
         };
-        assert!(relay
-            .receive_control(
-                Message {
-                    content: Content::Invoke {
-                        network: other,
-                        call,
-                        remaining: 8,
-                        arguments: &[0]
-                    },
-                    ..request
+        assert!(relay.receive_control(
+            Message {
+                content: Content::Invoke {
+                    copies: 1,
+                    network: other,
+                    call,
+                    remaining: 8,
+                    arguments: &[0]
                 },
-                READ_MS + 7,
-                |_, _| panic!()
-            )
-            .is_none());
+                ..request
+            },
+            READ_MS + 7,
+            |_, _| panic!()
+        )[0]
+        .is_none());
         let change = Message {
             source: 4,
             destination: None,
@@ -1945,13 +2252,10 @@ mod tests {
             [2, 3, 4]
         );
         assert!(owners.iter().all(|o| o.surface_bytes == description.len()));
-        assert_eq!(
-            nodes[0].routes.iter().find(|r| r.owner == 4).unwrap().next,
-            2
-        );
+        assert_eq!(nodes[0].next_hop(4, 0, MAX_HOPS).unwrap(), 2);
         // The known owner and directions came from discovery, not test setup.
         let mut read = query(43, 0);
-        read.destination = Some(nodes[0].routes.iter().find(|r| r.owner == 4).unwrap().next);
+        read.destination = Some(nodes[0].next_hop(4, 0, MAX_HOPS).unwrap());
         let (bytes, reads, _) = exchange(&mut nodes, &links, read, 102);
         assert_eq!(bytes.len(), SURFACE_BYTES);
         assert_eq!(reads, [(2, Some(3)), (3, Some(4))]);
@@ -2226,7 +2530,7 @@ mod tests {
         let description = Description::new(&SURFACE).unwrap();
         let mut node = Forwarder::new(2, NET);
         let mut piece = [0; SURFACE_BYTES];
-        node.learn(4, 3, 2, 0);
+        node.learn(4, 3, 2, 0, 1);
         let out = node
             .receive(query(1, 0), &description, &mut piece, 1)
             .unwrap();
@@ -2265,7 +2569,7 @@ mod tests {
             Some(3)
         );
         let mut wrap = Forwarder::new(2, NET);
-        wrap.learn(4, 3, 2, u32::MAX - 100);
+        wrap.learn(4, 3, 2, u32::MAX - 100, 1);
         wrap.receive(query(1, 0), &description, &mut piece, u32::MAX - 99)
             .unwrap();
         wrap.expire(READ_MS);
@@ -2276,7 +2580,7 @@ mod tests {
             None
         );
         for (i, owner) in (4..8).enumerate() {
-            node.learn(owner, 3, 2, 100 + i as u32);
+            node.learn(owner, 3, 2, 100 + i as u32, 1);
         }
         assert!(node.routes.iter().all(|r| r.owner != 4));
         node.expire(ROUTE_MS + 104);

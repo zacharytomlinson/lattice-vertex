@@ -8,8 +8,10 @@ maintenance callbacks, network configuration, or enumeration handler.
 A link is distinct from a learned path toward a farther owner and from an
 installed program edge. The local link records provide a bounded piece of network
 memory and a direct forwarding direction. Destination paths can be learned through
-those links. Cost ranking and bounded redundant delivery remain subsequent work;
-the current destination cache still retains one direction per owner.
+those links. The destination cache now retains two directions per owner, ranks
+hop count then observed exchange latency, and supports a bounded invocation split.
+See [invocation forwarding](INVOCATION.md#forwarding-and-duplicate-commands).
+These local cost observations do not establish independent end-to-end failure probabilities.
 
 ## Establishment and maintenance
 
@@ -85,8 +87,8 @@ Direct maintained neighbors take precedence over cached indirect directions.
 
 ## Wire format
 
-These are additive **LVT v5** opcodes. Existing messages retain their layouts;
-older v5 firmware ignores these opcodes and cannot establish/enumerate these links.
+These use **LVT v6**. The link-operation layouts are unchanged, but v6 introduces
+invocation copy budgets and rejects older wire versions.
 The common payload prefix remains magic/version (4 bytes), opcode (1), network
 founder (8), and channel (1). Integers are little-endian.
 
