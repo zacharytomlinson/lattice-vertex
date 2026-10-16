@@ -109,14 +109,14 @@ struct Pending {
     started: u32,
 }
 pub(super) struct Host {
-    next_token: u16,
+    next_token: Option<u16>,
     pending: Option<Pending>,
     arguments: [u8; CALL_ARGUMENT_BYTES],
 }
 impl Host {
     pub(super) const fn new() -> Self {
         Self {
-            next_token: 0,
+            next_token: None,
             pending: None,
             arguments: [0; CALL_ARGUMENT_BYTES],
         }
@@ -276,25 +276,29 @@ impl Host {
             deliver(generation, response);
             return None;
         }
-        self.next_token = self.next_token.wrapping_add(1);
+        // A reboot must not deliberately reuse read 1 while another resident
+        // still holds that caller/token. Seed once from the host's random token,
+        // then keep one monotonic namespace across read kinds and USB sessions.
+        let radio_token = self.next_token.map_or(token as u16, |n| n.wrapping_add(1));
+        self.next_token = Some(radio_token);
         let read = match request {
             Packet::ReadLinks { after, via, .. } => ReadRequest::Links(LinkRead {
                 reader: local,
                 owner,
-                request: self.next_token,
+                request: radio_token,
                 after,
                 via,
             }),
             Packet::ReadSurface { offset, .. } => ReadRequest::Surface(SurfaceRead {
                 reader: local,
                 owner,
-                request: self.next_token,
+                request: radio_token,
                 offset,
             }),
             Packet::ReadState { attribute, .. } => ReadRequest::State(StateRead {
                 reader: local,
                 owner,
-                request: self.next_token,
+                request: radio_token,
                 attribute,
             }),
             _ => unreachable!(),

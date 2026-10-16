@@ -17,7 +17,9 @@ the existing description/native binding. Remote requests use the ordinary radio
 messages, bounded read/call paths, duplicate handling, and route learning. Replies
 terminate at the local caller. Host tokens are not radio neighbors or credentials.
 
-Reads allocate fresh 16-bit radio tokens across kinds and USB reconnects. Calls
+Reads seed their 16-bit radio counter once from the first host read token, then
+advance it across kinds and USB reconnects. This avoids deliberately reusing
+read 1 after an MCU reboot, while retaining probabilistic collision limits. Calls
 carry the host's 32-bit token as their invocation identity. The Linux client seeds
 its token sequence from OS entropy on each open; reconnecting or rebooting the MCU
 does not deliberately restart call numbering at one. This is probabilistic identity

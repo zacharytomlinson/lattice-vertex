@@ -526,3 +526,37 @@ fn surface_state_and_calls_preserve_native_results_and_never_retry_mutations() {
     assert_eq!(device.calls.load(Ordering::Relaxed), 3);
     disconnect(&context);
 }
+
+#[test]
+fn rebooted_reader_does_not_deliberately_restart_at_token_one() {
+    crate::port::test_port_reset();
+    access(|m| *m = Mailbox::new());
+    let context = unsafe { TaskContext::assume() };
+    let network = Network {
+        founder: 1,
+        channel: 15,
+    };
+    let mut remote = Forwarder::new(2, network);
+    for (now, token) in [(0, 100u32), (1, 200u32)] {
+        disconnect(&context);
+        let mut host = Host::new();
+        let mut local = Forwarder::new(1, network);
+        submit(
+            &context,
+            Packet::ReadLinks {
+                token,
+                owner: 2,
+                after: 0,
+                via: 0,
+            },
+        )
+        .unwrap();
+        let request = poll(&mut host, &mut local, now).unwrap();
+        let reply = remote
+            .receive_links(delivered(request, 2), now)
+            .expect("new boot was suppressed as an old read");
+        host.complete(&mut local, delivered(reply, 1), now);
+        assert!(matches!(receive(&context), Some(Packet::Link { .. })));
+    }
+    disconnect(&context);
+}
