@@ -30,9 +30,11 @@ registers both actual fixture changes through the kernel. Use it with
 validation, and state reads from the tablet's attached radio. `peer-observer` can
 be added for passive kernel-event diagnostics; it supplies no networking behavior.
 This verifies native dispatch and registered state, not a physical dimmer output.
-The current two-board run succeeded with the remote diagnostic serial port open;
-closing that port reproduced read timeouts. This USB/liveness condition remains
-unresolved and must not be presented as RF-range or delivery-reliability validation.
+The final two-board run consumed the full surface, invoked the native operation,
+and read registered changes. A read after closing the diagnostic console also
+succeeded. Earlier closed-console and post-reflash reads timed out; console state
+alone was not established as their cause. This is functional validation, not RF
+range or delivery-reliability validation.
 
 ## XIAO nRF52840 Sense: USB upload and diagnostics
 

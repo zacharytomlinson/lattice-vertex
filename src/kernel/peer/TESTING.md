@@ -135,12 +135,15 @@ the maintained dimmer's complete surface, invoked its typed native transformer,
 and read back registered state. Wrong argument types and out-of-range values
 returned distinct native errors. The fixture is software-backed; this is not
 physical actuator verification or a range/loss-rate test. Some reads timed out;
-no mutation was automatically retried. The current remote fixture also needs
-its diagnostic USB port open for the successful path; closed-console reads timed
-out even with matching channels. This unresolved port/liveness condition is kept
-separate from the host operation semantics. The radio stack now reserves 8 KiB
-for the measured ~5 KiB entry frame plus callers/callees; that change did not fix
-the closed-console condition.
+no mutation was automatically retried. A final read after closing the diagnostic
+console succeeded too. Earlier console-closed and post-reflash reads timed out,
+including a rerun with that console open; console state alone was not established
+as their cause. One concrete restart defect was fixed: host-originated reads now
+seed their counter from the host token instead of deliberately reusing read 1
+while another node retains that identity. A regression check covers that case.
+The radio stack reserves 8 KiB for the measured ~5 KiB entry frame plus callers,
+callees, and exception context. Neither that allocation nor the diagnostic USB
+polling cleanup established the cause of every earlier timeout.
  Native calls, relayed
 surface/current-state reads, reciprocal link maintenance, guided traversal, owner
 discovery, scored alternate directions, bounded invocation replication, and deltas
