@@ -69,7 +69,7 @@ pub(crate) fn run(
     #[cfg(feature = "host-link")]
     let mut host = host::Host::new();
     let context = unsafe { crate::sync::TaskContext::assume() };
-    radio.enable_local_work();
+    radio.enable_peer_runtime();
     let started = tasks::xTaskGetTickCount();
     let milliseconds = ((started as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
     let arrival = forwarder.announce(started as u16, description.len(), milliseconds);

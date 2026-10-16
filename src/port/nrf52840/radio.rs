@@ -149,7 +149,17 @@ impl Radio {
         .await
     }
 
+    /// The PHY has received the length field and has not completed the frame.
+    /// This is hardware progress, not a software assumption that RX was started.
+    pub(crate) fn receiving_frame() -> bool {
+        let r = hal::pac::RADIO;
+        r.state().read().state() == hal::pac::radio::vals::State::Rx
+            && r.events_framestart().read() != 0
+            && r.events_phyend().read() == 0
+    }
+
     pub async fn receive(&mut self, out: &mut [u8; MAX_FRAME_SIZE]) -> Result<usize, Error> {
+        hal::pac::RADIO.events_framestart().write_value(0);
         self.driver
             .receive(&mut self.packet)
             .await

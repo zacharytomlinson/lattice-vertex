@@ -161,5 +161,12 @@ complete tablet-to-appliance path still needs hardware validation. Earlier image
 exercised channel formation and peer exchange on C6 and Nordic. Those results do
 not establish the current wire version's end-to-end behavior or radio range.
 
+The subsequent transport investigation identified the repeated second-delta loss
+as a half-duplex turnaround failure. The common transport now receives between
+sends, preserves captured bytes for ordinary dispatch, and bounds completion of
+an already-started frame before interruption. See the [radio validation](../radio/TESTING.md#receive-turns-in-the-resident-peer)
+for the controlled comparison and remaining losses. Forwarding and native replay
+semantics are unchanged; no retry engine was added.
+
 Historical board captures and RF comparisons live in an external lab archive.
 They are not dependencies of these checks. RF investigation remains paused.

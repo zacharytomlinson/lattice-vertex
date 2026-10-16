@@ -16,6 +16,9 @@ pub(crate) use task::start;
 #[doc(hidden)]
 pub mod testing;
 
+#[cfg(any(test, feature = "port-nrf52840", feature = "port-esp32c6"))]
+mod receive;
+
 /// Maximum MAC frame size, excluding the hardware checksum.
 pub const MAX_FRAME_SIZE: usize = 125;
 

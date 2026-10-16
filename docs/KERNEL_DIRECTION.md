@@ -13,9 +13,10 @@ Nordic nRF52840 and ESP32-C6 are both hardware targets. C6 support is needed for
 the Shelly devices as well as the existing prototypes. Keep each platform's
 dependencies isolated and the common kernel's interfaces and protocol portable.
 
-RF range investigation is paused at the user's request. Its source, captures,
-and vendor comparisons are kept in an external local lab. Continue kernel and
-protocol development without restarting range/RSSI experiments as routine work.
+RF delivery investigation has resumed after the tablet coprocessor proof. Keep
+captures, diagnostic images, and vendor comparisons in the external local lab.
+Reproduce a concrete failure before changing radio behavior; successful delivery
+checks do not establish RF range or explain earlier absolute RSSI measurements.
 
 Read this plan alongside the
 [architecture white paper](Lattice-DRTOS-Architecture-White-Paper.docx). This file
@@ -142,6 +143,25 @@ The selected driver is created inside the kernel's resident radio task, after th
 scheduler has valid task storage. Driver futures register a waker for that task;
 when pending, the task blocks on a notification. The IRQ wakes it to resume the
 same operation. There is no additional executor task or graph work queue.
+
+Once formation completes, every successful transmission gives neighbors a receive
+turn before another transmission. Pending local deltas cannot immediately cancel
+that turn. It ends with the first valid frame or a bounded deadline sized for one
+maximum 250-kbit/s frame plus radio turnaround and tick rounding (six ticks at
+1 kHz). CRC failures can consume the remaining window without ending it early.
+If hardware has already started a frame when local work or a timeout requests
+interruption, a separately bounded completion interval lets that frame finish.
+A stuck hardware indication still times out. Nordic reports actual PHY length
+reception; C6 reports its existing MAC RX state.
+Captured bytes enter four fixed receive records and pass through the ordinary
+MAC/peer validation on the next receive call. Oldest eviction is explicit under
+buffer pressure. Formation keeps its existing rendezvous windows.
+
+This addresses the reproduced collision between a producer's next delta and a
+neighbor's rebroadcast of the preceding one. It also preserves immediate replies
+received before the transmitting peer returns to normal dispatch. The bounded
+receive opportunity is not an acknowledgement or a guarantee of delivery. No frame or native
+invocation is automatically retried; forwarding remains enabled.
 
 `kernel::Appliance::new(&SURFACE)` reserves the native instance's static storage
 and RTOS mutex. Firmware initializes it once before scheduler startup, then passes
@@ -570,7 +590,10 @@ with explicit eviction are transport storage, not a graph-job queue. Choose pack
 layout, and hardware offload against the target's actual memory and latency needs.
 The radio task has a fixed 8 KiB stack and a static task control block. Nordic
 uses the HAL's caller-owned DMA packet. C6 has an aligned static DMA buffer and
-four fixed receive entries, evicting the oldest frame on overflow. Test builds
+four fixed receive entries, evicting the oldest frame on overflow. The common
+transport separately owns four raw-frame records for captures made while a send
+call gives the neighbors their receive turn; those bytes have left the port's DMA
+or ISR storage but have not yet reached peer dispatch. Test builds
 report evictions to fixture-owned counters. Transmit storage remains owned by the driver until completion.
 No transport buffer is used as storage for queued graph activations.
 
@@ -606,8 +629,9 @@ flowchart TB
     exposure["peer::exposure: borrowed local IR and bounded range encoding"]
     links["peer::links: maintained adjacent peers, confirmation, refresh and cursor enumeration"]
     forwarding["peer::forwarding: bounded dissemination, return paths, cost-ranked directions, one invocation split"]
-    radio["Nordic/C6 radio ports: fixed buffers, energy/CCA setup, hardware IRQs"]
-    transport["kernel::radio: resident driver and notification waits"]
+    radio["Nordic/C6 radio ports: fixed buffers, energy/CCA, RX progress, hardware IRQs"]
+    transport["kernel::radio: resident driver, notification waits and receive turns"]
+    rxbuffer["radio::receive: four owned frames captured before peer dispatch"]
     probe["src/kernel/radio/tests: transport probe, discovery counters and surface-range observer"]
     testentry["test-support only: scoped transport access and event hooks"]
     tasks["Existing RTOS tasks, notifications, synchronization, static storage"]
@@ -668,6 +692,8 @@ flowchart TB
     startup -->|creates static radio task| tasks
     startup -->|creates resident transport| transport
     startup -->|checks and borrows local description| exposure
+    transport -->|retains frames captured after TX| rxbuffer
+    rxbuffer -->|FIFO delivery through normal receive| transport
     transport -->|owns selected driver| radio
     transport -->|ordinary resident task runs| discovery
     discovery -->|local exchanges, maintenance, and validated peer messages| forwarding

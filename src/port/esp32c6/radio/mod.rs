@@ -124,6 +124,10 @@ impl Radio {
         .await
     }
 
+    pub(crate) fn receiving_frame() -> bool {
+        registers::is_current_rx_frame()
+    }
+
     pub async fn receive(&mut self, out: &mut [u8; MAX_FRAME_SIZE]) -> Result<usize, Error> {
         mac::ieee802154_receive();
         let raw = poll_fn(|cx| {

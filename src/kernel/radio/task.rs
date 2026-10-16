@@ -1,7 +1,10 @@
 //! One resident radio task. Driver futures suspend through task notifications;
 //! no executor thread, allocation, or graph scheduling is introduced.
 
-use super::{Error, MAX_FRAME_SIZE};
+use super::{
+    receive::{finish_frame_ticks, receive_turn_ticks, ReceiveBuffer},
+    Error, MAX_FRAME_SIZE,
+};
 use crate::{
     kernel::tasks,
     port,
@@ -88,29 +91,42 @@ fn local_pending() -> bool {
     crate::kernel::change::pending()
 }
 
+#[derive(Clone, Copy)]
+enum WaitMode {
+    Hardware,
+    Receive { local_work: bool },
+}
+
 fn wait<F: Future>(
     future: F,
     waker: &Waker,
     timeout: TickType_t,
-    local_work: bool,
+    mode: WaitMode,
 ) -> Option<F::Output> {
     let start = tasks::xTaskGetTickCount();
+    let mut finish_started = None;
     let mut future = pin!(future);
     let mut cx = Context::from_waker(waker);
     loop {
         if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
             return Some(result);
         }
-        if local_work && local_pending() {
-            return None;
-        }
-        let remaining = if timeout == portMAX_DELAY {
+        let interrupted = matches!(mode, WaitMode::Receive { local_work: true }) && local_pending();
+        let now = tasks::xTaskGetTickCount();
+        let mut remaining = if timeout == portMAX_DELAY {
             timeout
         } else {
-            timeout.saturating_sub(tasks::xTaskGetTickCount().wrapping_sub(start))
+            timeout.saturating_sub(now.wrapping_sub(start))
         };
-        if remaining == 0 {
-            return None;
+        if interrupted || remaining == 0 {
+            let receiving =
+                matches!(mode, WaitMode::Receive { .. }) && port::Radio::receiving_frame();
+            remaining = finish_frame_ticks(
+                &mut finish_started,
+                now as u32,
+                receiving,
+                receive_turn_ticks(crate::configTICK_RATE_HZ as u32),
+            )? as TickType_t;
         }
         // A notification between poll and wait is retained by FreeRTOS, avoiding
         // a missed IRQ. A stale notification only causes another driver poll.
@@ -126,7 +142,8 @@ fn wait<F: Future>(
 /// hardware fixtures receive a scoped borrow through the test-only entry.
 pub struct Transport {
     radio: port::Radio,
-    local_work: bool,
+    peer_runtime: bool,
+    received: ReceiveBuffer,
     waker: Waker,
     _task_context: PhantomData<*mut ()>,
 }
@@ -141,8 +158,10 @@ pub(crate) fn notify_work() {
 }
 
 impl Transport {
-    pub(crate) fn enable_local_work(&mut self) {
-        self.local_work = true;
+    /// Formation uses its own receive windows. Resident traffic also gives
+    /// neighbors a receive turn between transmissions and accepts local work.
+    pub(crate) fn enable_peer_runtime(&mut self) {
+        self.peer_runtime = true;
     }
 
     pub fn address(&self) -> u64 {
@@ -150,6 +169,7 @@ impl Transport {
     }
 
     pub fn configure(&mut self, channel: u8, pan_id: u16) -> Result<(), Error> {
+        self.received.clear();
         self.radio.configure(channel, pan_id)
     }
 
@@ -163,7 +183,7 @@ impl Transport {
             self.radio.energy_detect(duration_us),
             &self.waker,
             timeout,
-            false,
+            WaitMode::Hardware,
         )
         .unwrap_or(Err(Error::Aborted))
     }
@@ -173,24 +193,70 @@ impl Transport {
         frame: &mut [u8; MAX_FRAME_SIZE],
         timeout: TickType_t,
     ) -> Option<Result<usize, Error>> {
+        if let Some(length) = self.received.pop(frame) {
+            return Some(Ok(length));
+        }
         wait(
             self.radio.receive(frame),
             &self.waker,
             timeout,
-            self.local_work,
+            if self.peer_runtime {
+                WaitMode::Receive { local_work: true }
+            } else {
+                WaitMode::Hardware
+            },
         )
     }
 
     pub fn transmit(&mut self, frame: &[u8]) -> Result<(), Error> {
         // No timeout drops active DMA. The driver retains its buffer until the
         // hardware completes or aborts this single attempt.
-        wait(
+        let result = wait(
             self.radio.transmit(frame),
             &self.waker,
             portMAX_DELAY,
-            false,
+            WaitMode::Hardware,
         )
-        .unwrap()
+        .unwrap();
+        if result.is_ok() && self.peer_runtime {
+            self.receive_turn();
+        }
+        result
+    }
+
+    fn receive_turn(&mut self) {
+        let start = tasks::xTaskGetTickCount();
+        let window = receive_turn_ticks(crate::configTICK_RATE_HZ as u32) as TickType_t;
+        let mut frame = [0; MAX_FRAME_SIZE];
+        loop {
+            let remaining = window.saturating_sub(tasks::xTaskGetTickCount().wrapping_sub(start));
+            if remaining == 0 {
+                return;
+            }
+            // Pending local changes must not cancel this receive opportunity.
+            // Retain the first valid frame for ordinary dispatch after send returns.
+            match wait(
+                self.radio.receive(&mut frame),
+                &self.waker,
+                remaining,
+                WaitMode::Receive { local_work: false },
+            ) {
+                Some(Ok(length)) => {
+                    let evicted = self.received.push(&frame[..length]);
+                    #[cfg(feature = "test-support")]
+                    if evicted {
+                        super::testing::event(super::testing::Event::ReceiveEvicted);
+                    }
+                    let _ = evicted;
+                    return;
+                }
+                Some(Err(_)) => {
+                    #[cfg(feature = "test-support")]
+                    super::testing::event(super::testing::Event::ReceiveFailed);
+                }
+                None => return,
+            }
+        }
     }
 }
 
@@ -206,7 +272,8 @@ extern "C" fn run(_: *mut c_void) {
     };
     let mut transport = Transport {
         radio,
-        local_work: false,
+        peer_runtime: false,
+        received: ReceiveBuffer::new(),
         waker,
         _task_context: PhantomData,
     };

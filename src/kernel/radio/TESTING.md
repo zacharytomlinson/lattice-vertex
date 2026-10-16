@@ -125,3 +125,33 @@ Run that command from the repository root. The probe handler does not implement
 network enrollment, discovery, surface exposure, or graph execution. Hardware
 runs exercise radio IRQ → notification → resident task → transmission; no separate
 scheduler-only test is required.
+
+
+## Receive turns in the resident peer
+
+Ordinary peer startup enables a receive opportunity after each successful TX.
+It is independent of pending local deltas and returns the first valid captured
+frame through the ordinary receive path. The maximum wait accounts for a full
+250-kbit/s frame, turnaround, and tick quantization; at 1 kHz it is six ticks.
+An in-progress PHY frame gets a bounded completion interval before cancellation
+for a deadline or new local work. Four owned frame records preserve captures across consecutive send calls, with
+oldest eviction under pressure. Neither packet transmission nor native execution
+is retried. Raw probe workloads and bootstrap retain their own receive windows.
+
+Portable checks beside `receive.rs` cover owned-byte retention, FIFO/eviction,
+channel reset, tick rounding, in-progress frame completion across tick wrap, and
+the cap on a stuck receiver. C6 and Nordic
+builds check the common integration. Hardware validation must use ordinary peers,
+not assume that a successful spaced probe covers back-to-back state changes.
+
+
+A two-Nordic A/B/A isolated the deterministic paired-delta failure: the source
+completed all 16 delta transmissions, but only eight reached the attached host.
+Disabling only the companion's delta rebroadcast delivered 15/16; restoring it
+restored the repeated second-delta loss. With receive turns and bounded completion
+of active frames, an uninstrumented 32-call run delivered 57 of 58 registered
+changes, 29/32 native results, and 28/30 surface ranges. The owner watermark was
+read before/after to count generated changes independently of command results.
+No mutation or packet was automatically retried. Residual losses and absolute
+RSSI/range remain unresolved; this run is not a reliability guarantee. Diagnostic
+images, traces, and the rebroadcast bypass remain exclusively in the external lab.
