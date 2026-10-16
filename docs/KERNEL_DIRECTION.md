@@ -530,13 +530,18 @@ The tablet and its attached nRF use one resident network identity. The new optio
 `host-link` feature adds one fixed local request/response exchange, without USB
 code in the common kernel or a new radio configuration API. The Linux client and
 maintained XIAO attachment firmware live in `lattice-tablet`. Ordinary appliance
-builds do not include this feature. Its first operations are status and link reads;
-surface/control/delta integration and Slint presentation remain subsequent work.
+builds do not include this feature. Its operations now include status, link/surface/state reads, and native calls.
+The Linux client can inspect a complete LSF description and consume its exposed
+references. Host delta streaming and Slint presentation remain subsequent work.
 
-Local read origins share the existing return-path budget and route learning.
-Disconnect invalidates host completions while peer participation continues. Radio
-read tokens persist across host reconnects. A timed-out read produces a failure,
-not an automatic retransmission. Periodic maintenance now sends either a link
+Local read and call origins share the existing return-path budgets and route
+learning. Local native requests use the same appliance binding and result replay
+as radio requests; success is not a physical observation. Typed scalar encoding is
+shared in `peer/wire`, with no radio-wire or IR-language change.
+Disconnect invalidates host completions while peer participation continues. Radio read tokens persist across host reconnects. Native call identities use the
+host token sequence seeded from OS entropy, with bounded/volatile replay protection.
+A timeout produces a failure without retransmitting; for a mutation, its outcome
+remains unconfirmed until observed. Periodic maintenance now sends either a link
 exchange or discovery in one iteration, leaving reception available for the reply
 instead of immediately transmitting a second solicitation.
 
@@ -557,7 +562,7 @@ global object registry, auto-incremented entity IDs, or relational edge tables.
 Use static task/control storage and bounded communication buffers. Fixed rings
 with explicit eviction are transport storage, not a graph-job queue. Choose packing,
 layout, and hardware offload against the target's actual memory and latency needs.
-The radio task has a fixed 6 KiB stack and a static task control block. Nordic
+The radio task has a fixed 8 KiB stack and a static task control block. Nordic
 uses the HAL's caller-owned DMA packet. C6 has an aligned static DMA buffer and
 four fixed receive entries, evicting the oldest frame on overflow. Test builds
 report evictions to fixture-owned counters. Transmit storage remains owned by the driver until completion.
@@ -606,8 +611,8 @@ flowchart TB
     hal["esp-hal startup, timers, and interrupt routing: C6 only"]
     smoke["Nordic and C6 test firmware beside their ports"]
     usbconsole["Nordic fixture only: USB diagnostics and XIAO serial-DFU entry"]
-    hostlink["Optional kernel::host: fixed local exchange and read origin"]
-    hostwire["host/wire: shared binary local-link crate"]
+    hostlink["Optional kernel::host: fixed local exchange, read/call origins"]
+    hostwire["peer/wire: shared scalar codec and optional host records"]
     tabletradio["lattice-tablet firmware: XIAO USB and host task"]
     tabletpeer["lattice-tablet peer: Linux serial client"]
     sync["Existing safe synchronization API"]
@@ -632,6 +637,8 @@ flowchart TB
     tabletpeer -->|USB stream| tabletradio
     tabletpeer -->|codec| hostwire
     hostlink -->|codec and records| hostwire
+    discovery -->|shared scalar/status encoding| hostwire
+    exposure -->|shared typed literals| hostwire
     hostlink -->|wake resident task| transport
     discovery -->|service local host| hostlink
     hostlink -->|originate and complete reads| forwarding
@@ -714,8 +721,9 @@ manual-control message path has not yet had an end-to-end hardware run.
 Maintained reciprocal links, built-in `ReadLinks`, and guided traversal are now
 implemented using the existing read return paths and resident task. Cost-ranked
 alternate directions and a bounded invocation split now preserve message identity
-through independent and reconverging paths. A Linux host client and XIAO USB attachment now originate local/remote `ReadLinks`
-through that runtime. The shared local codec and optional kernel host endpoint are
+through independent and reconverging paths. A Linux host client and XIAO USB
+attachment now originate local/remote link,
+surface, and state reads plus native calls through that runtime. The shared local codec and optional kernel host endpoint are
 [documented beside their owner](../src/kernel/peer/host/README.md). Tablet UI/service
 integration, broader hardware validation, and adaptive delivery/coverage policy
 remain open. Native duplicate
@@ -735,9 +743,9 @@ history is bounded and volatile; this is not an exactly-once ledger.
    and state-change handling now have separate host checks; the prior task captures
    do not validate them.
    Rendezvous/discovery and relay-assisted surface reads now run through ordinary
-   kernel startup. Forwarding/control behavior has host/build validation. A Linux host has now
-   exercised one-hop `ReadLinks` on two Nordic boards; this does not validate
-   multi-hop radio delivery or native appliance control.
+   kernel startup. Forwarding/control behavior has host/build validation. A Linux host has now exercised one-hop links, complete surface reads, registered
+   state reads, and native control on two Nordic boards using a software appliance.
+   This does not validate multi-hop radio delivery or physical appliance completion.
 2. **Implement automatic peer participation.** Put radio configuration, bootstrap,
    discovery, and surface-exposure handling in the common kernel. Use the provided
    platform port to perform the hardware operations. Completion means two appliance

@@ -504,6 +504,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-peer-wire"
+version = "0.1.0"
+dependencies = [
+ "lattice-ir",
+]
+
+[[package]]
 name = "lattice-radio-test"
 version = "0.1.0"
 dependencies = [
@@ -523,6 +530,7 @@ dependencies = [
  "embassy-sync 0.8.0",
  "ieee802154",
  "lattice-ir",
+ "lattice-peer-wire",
 ]
 
 [[package]]

@@ -18,7 +18,9 @@ use core::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-static mut STACK: [StackType_t; 1536] = [0; 1536];
+// The peer frame reserves about 5 KiB on Nordic before callees and exception
+// frames; leave fixed headroom for native dispatch and attached-host operations.
+static mut STACK: [StackType_t; 2048] = [0; 2048];
 static mut CONTROL: tasks::StaticTask_t = tasks::StaticTask_t::new();
 static mut PERIPHERAL: Option<port::RadioPeripheral> = None;
 static WAKE_TARGET: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());

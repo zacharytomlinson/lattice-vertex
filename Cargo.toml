@@ -40,7 +40,7 @@ port-test = ["std", "arch-32bit", "tick-32bit"]  # Deterministic host test port
 # Hardware-test access to the resident radio task; contains no test workload.
 test-support = []
 # Optional local host attachment; ordinary appliances carry no USB/host state.
-host-link = ["dep:lattice-host-link", "use-mutexes"]
+host-link = ["lattice-peer-wire/host", "use-mutexes"]
 
 # Architecture width for BaseType_t, UBaseType_t, StackType_t
 arch-32bit = []
@@ -120,7 +120,7 @@ tickless-idle = []            # configUSE_TICKLESS_IDLE
 # mini-list-item = []  # configUSE_MINI_LIST_ITEM optimization
 
 [dependencies]
-lattice-host-link = { path = "src/kernel/peer/host/wire", optional = true }
+lattice-peer-wire = { path = "src/kernel/peer/wire" }
 lattice-ir = { git = "ssh://git@github.com/zacharytomlinson/lattice-ir.git", rev = "8cc8629fc6b94f32848d0fc0336db8cbcea79596" }
 # Portable MAC framing for common peer discovery; no allocator or radio driver.
 ieee802154 = "=0.6.1"

@@ -20,6 +20,20 @@ reset fields, disabling correlator-assisted carrier detection. Test images
 assert the hardware readback is `0x052d0001` (CarrierMode with restored fields).
 This correction alone does not provide CSMA backoff or reliable publication.
 
+## Native appliance path
+
+`test-appliance` binds the existing portable dimmer fixture to ordinary kernel
+startup, without a radio probe or passive observer. Its software-backed states are
+power and an unsigned 8-bit level; its transformer accepts levels 0..=200 and
+registers both actual fixture changes through the kernel. Use it with
+`xiao-bootloader,usb-console` to exercise surface reads, native argument/range
+validation, and state reads from the tablet's attached radio. `peer-observer` can
+be added for passive kernel-event diagnostics; it supplies no networking behavior.
+This verifies native dispatch and registered state, not a physical dimmer output.
+The current two-board run succeeded with the remote diagnostic serial port open;
+closing that port reproduced read timeouts. This USB/liveness condition remains
+unresolved and must not be presented as RF-range or delivery-reliability validation.
+
 ## XIAO nRF52840 Sense: USB upload and diagnostics
 
 The `xiao-bootloader` feature selects `memory-xiao.x`: application flash starts

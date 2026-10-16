@@ -96,90 +96,82 @@ pub fn run(context: &TaskContext) -> ! {
         &mut control,
     );
     let class = CdcAcmClass::new(&mut builder, &mut state, 64);
-    let (mut sender, receiver, changed) = class.split_with_control();
+    let (mut sender, receiver) = class.split();
     let mut device = builder.build();
-    let control_changes = async {
-        loop {
-            changed.control_changed().await;
-            // Match Seeed/Adafruit's application-to-serial-DFU handoff. This
-            // hook is only present in the XIAO diagnostic image.
-            #[cfg(feature = "xiao-bootloader")]
-            if receiver.line_coding().data_rate() == 1200 && !receiver.dtr() {
-                // Let the host finish opening/closing the port. Resetting in
-                // the control transfer itself can make that transfer fail.
-                let started = tasks::xTaskGetTickCount();
-                let reset = poll_fn(|_| {
-                    if receiver.line_coding().data_rate() != 1200 || receiver.dtr() {
-                        Poll::Ready(false)
-                    } else if tasks::xTaskGetTickCount().wrapping_sub(started)
-                        >= lattice_vertex::milliseconds_to_ticks_checked(100).unwrap()
-                    {
-                        Poll::Ready(true)
-                    } else {
-                        Poll::Pending
-                    }
-                })
-                .await;
-                if reset {
-                    hal::pac::POWER.gpregret().write(|w| w.set_gpregret(0x4e));
-                    cortex_m::peripheral::SCB::sys_reset();
-                }
-            }
-            #[cfg(not(feature = "xiao-bootloader"))]
-            let _ = &receiver;
-        }
-    };
     let reporter = async {
+        let mut last = tasks::xTaskGetTickCount();
+        let mut reset_since = None;
         loop {
-            sender.wait_connection().await;
             poll_fn(|_| {
-                if sender.dtr() {
+                check_bootloader(
+                    receiver.line_coding().data_rate(),
+                    receiver.dtr(),
+                    &mut reset_since,
+                );
+                let now = tasks::xTaskGetTickCount();
+                if !sender.dtr() {
+                    last = now;
+                    return Poll::Pending;
+                }
+                if now.wrapping_sub(last)
+                    >= lattice_vertex::milliseconds_to_ticks_checked(1000).unwrap()
+                {
                     Poll::Ready(())
                 } else {
                     Poll::Pending
                 }
             })
             .await;
-            if sender
-                .write_packet(b"START kernel radio: nRF52840 Cortex-M4F\r\n")
-                .await
-                .is_err()
-            {
-                continue;
+            last = tasks::xTaskGetTickCount();
+            let mut text = Text::<1536>::new();
+            if crate::report_once(context, &mut text).is_err() {
+                text.len = 0;
+                writeln!(text, "LOG report exceeds console buffer").unwrap();
             }
-            let mut last = tasks::xTaskGetTickCount();
-            'connected: loop {
-                poll_fn(|_| {
-                    if tasks::xTaskGetTickCount().wrapping_sub(last)
-                        >= lattice_vertex::milliseconds_to_ticks_checked(1000).unwrap()
-                    {
-                        Poll::Ready(())
-                    } else {
-                        Poll::Pending
-                    }
+            for bytes in text.bytes[..text.len]
+                .chunks(64)
+                .chain((text.len % 64 == 0).then_some(&[][..]))
+            {
+                let mut write = pin!(sender.write_packet(bytes));
+                let result = poll_fn(|cx| {
+                    check_bootloader(
+                        receiver.line_coding().data_rate(),
+                        receiver.dtr(),
+                        &mut reset_since,
+                    );
+                    write.as_mut().poll(cx)
                 })
                 .await;
-                last = tasks::xTaskGetTickCount();
-                let mut text = Text::<1536>::new();
-                if crate::report_once(context, &mut text).is_err() {
-                    text.len = 0;
-                    writeln!(text, "LOG report exceeds console buffer").unwrap();
-                }
-                for bytes in text.bytes[..text.len].chunks(64) {
-                    if !sender.dtr() || sender.write_packet(bytes).await.is_err() {
-                        break 'connected;
-                    }
-                }
-                if text.len % 64 == 0 && sender.write_packet(&[]).await.is_err() {
+                if result.is_err() {
                     break;
                 }
             }
         }
     };
-    let mut work = pin!(join(device.run(), join(reporter, control_changes)));
+    let mut work = pin!(join(device.run(), reporter));
     let mut cx = Context::from_waker(Waker::noop());
     loop {
         let _ = work.as_mut().poll(&mut cx);
         lattice_vertex::delay_ms(context, 1);
     }
+}
+
+// Sample USB control state on every fixture poll, including while an IN transfer
+// is pending. A control-change notification must never spin or block device.run.
+fn check_bootloader(rate: u32, dtr: bool, started: &mut Option<lattice_vertex::types::TickType_t>) {
+    #[cfg(feature = "xiao-bootloader")]
+    {
+        if rate != 1200 || dtr {
+            *started = None;
+            return;
+        }
+        let now = tasks::xTaskGetTickCount();
+        let since = *started.get_or_insert(now);
+        if now.wrapping_sub(since) >= lattice_vertex::milliseconds_to_ticks_checked(100).unwrap() {
+            hal::pac::POWER.gpregret().write(|w| w.set_gpregret(0x4e));
+            cortex_m::peripheral::SCB::sys_reset();
+        }
+    }
+    #[cfg(not(feature = "xiao-bootloader"))]
+    let _ = (rate, dtr, started);
 }

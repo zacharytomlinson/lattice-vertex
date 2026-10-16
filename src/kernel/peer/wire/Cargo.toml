@@ -1,0 +1,15 @@
+[package]
+name = "lattice-peer-wire"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Shared Lattice scalar encoding and attached-host messages"
+
+[workspace]
+
+[features]
+host = []
+
+[dependencies]
+lattice-ir = { git = "ssh://git@github.com/zacharytomlinson/lattice-ir.git", rev = "8cc8629fc6b94f32848d0fc0336db8cbcea79596" }

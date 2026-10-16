@@ -2,22 +2,32 @@
 //! PHY length/FCS belong to the port. Network tags are not credentials.
 
 use super::{Network, PAN_ID};
-use crate::ir::{Integer, Type, Value};
+#[cfg(test)]
+use crate::ir::Integer;
+use crate::ir::Value;
 use crate::kernel::radio::MAX_FRAME_SIZE;
 use byte::BytesExt;
 use ieee802154::mac::{
     Address, ExtendedAddress, FooterMode, Frame, FrameContent, FrameSerDesContext, FrameType,
     FrameVersion, Header, PanId, ShortAddress,
 };
+#[cfg(test)]
+pub(super) use lattice_peer_wire::scalar::encode_arguments;
+use lattice_peer_wire::scalar::valid_arguments;
+pub(super) use lattice_peer_wire::scalar::{
+    decode_arguments, decode_value, encode_value, type_tag,
+};
+pub(crate) use lattice_peer_wire::{InvokeStatus, StateReadResult};
 
 const PAN: PanId = PanId(PAN_ID);
 const MAGIC: &[u8; 4] = b"LVT\x06";
 pub(super) const MAX_HOPS: u8 = 8;
 const MAX_PAYLOAD: usize = MAX_FRAME_SIZE - 21;
 // Worst-case addressed MAC header plus the complete routed reply envelope.
-pub(super) const SURFACE_BYTES: usize = MAX_PAYLOAD - 37;
-pub(super) const CALL_ARGUMENT_BYTES: usize = MAX_PAYLOAD - 43;
-pub(super) const MAX_CALL_ARGUMENTS: usize = (CALL_ARGUMENT_BYTES - 1) / 2;
+pub(super) use lattice_peer_wire::SURFACE_BYTES;
+const _: () = assert!(SURFACE_BYTES == MAX_PAYLOAD - 37);
+pub(super) use lattice_peer_wire::{CALL_ARGUMENT_BYTES, MAX_CALL_ARGUMENTS};
+const _: () = assert!(CALL_ARGUMENT_BYTES == MAX_PAYLOAD - 43);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Invocation {
@@ -25,18 +35,6 @@ pub(super) struct Invocation {
     pub owner: u64,
     pub request: u32,
     pub transformer: u64,
-}
-
-/// Result of dispatch, never a claim that physical state has converged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub(crate) enum InvokeStatus {
-    Invoked = 0,
-    Arguments = 1,
-    UnknownTransformer = 2,
-    ApplianceError = 3,
-    Busy = 4,
-    ConflictingRequest = 5,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,14 +69,6 @@ pub(super) struct StateRead {
     pub owner: u64,
     pub request: u16,
     pub attribute: u64,
-}
-
-/// Established state and the owner's change watermark, or a distinct read failure.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StateReadResult {
-    Value { sequence: u32, value: Option<Value> },
-    UnknownAttribute,
-    Busy,
 }
 
 /// One-hop admission/refresh exchange. These messages are never relayed.
@@ -937,122 +927,6 @@ impl StateRead {
             attribute: u64::from_le_bytes(bytes[18..26].try_into().unwrap()),
         }
     }
-}
-
-pub(super) fn type_tag(ty: Type) -> u8 {
-    match ty {
-        Type::Bool => 0,
-        Type::Integer(i) => match i {
-            Integer::U8 => 1,
-            Integer::U16 => 2,
-            Integer::U32 => 3,
-            Integer::U64 => 4,
-            Integer::I8 => 5,
-            Integer::I16 => 6,
-            Integer::I32 => 7,
-            Integer::I64 => 8,
-        },
-    }
-}
-
-pub(super) fn encode_value(value: Value, out: &mut [u8]) -> usize {
-    out[0] = type_tag(value.ty());
-    match value.ty() {
-        Type::Bool => {
-            out[1] = u8::from(value.as_bool().unwrap());
-            2
-        }
-        Type::Integer(ty) => {
-            let n = ty.width() as usize / 8;
-            out[1..1 + n].copy_from_slice(&(value.as_integer().unwrap() as u64).to_le_bytes()[..n]);
-            1 + n
-        }
-    }
-}
-
-pub(super) fn decode_value(bytes: &[u8]) -> Option<(Value, usize)> {
-    let tag = *bytes.first()?;
-    if tag == 0 {
-        return match bytes.get(1)? {
-            0 => Some((Value::boolean(false), 2)),
-            1 => Some((Value::boolean(true), 2)),
-            _ => None,
-        };
-    }
-    let ty = match tag {
-        1 => Integer::U8,
-        2 => Integer::U16,
-        3 => Integer::U32,
-        4 => Integer::U64,
-        5 => Integer::I8,
-        6 => Integer::I16,
-        7 => Integer::I32,
-        8 => Integer::I64,
-        _ => return None,
-    };
-    let n = ty.width() as usize / 8;
-    let mut raw = [0; 8];
-    raw[..n].copy_from_slice(bytes.get(1..1 + n)?);
-    let bits = u64::from_le_bytes(raw);
-    let mut value = i128::from(bits);
-    if ty.signed() && bits & (1u64 << (ty.width() - 1)) != 0 {
-        value -= 1i128 << ty.width();
-    }
-    Some((Value::integer(ty, value).ok()?, 1 + n))
-}
-
-fn valid_arguments(bytes: &[u8]) -> bool {
-    let Some(&count) = bytes.first() else {
-        return false;
-    };
-    if bytes.len() > CALL_ARGUMENT_BYTES || usize::from(count) > MAX_CALL_ARGUMENTS {
-        return false;
-    }
-    let mut offset = 1;
-    for _ in 0..count {
-        let Some((_, n)) = decode_value(&bytes[offset..]) else {
-            return false;
-        };
-        offset += n;
-    }
-    offset == bytes.len()
-}
-
-pub(super) fn decode_arguments<'a>(
-    bytes: &[u8],
-    out: &'a mut [Value; MAX_CALL_ARGUMENTS],
-) -> Option<&'a [Value]> {
-    if !valid_arguments(bytes) {
-        return None;
-    }
-    let count = bytes[0] as usize;
-    let mut offset = 1;
-    for value in &mut out[..count] {
-        let (v, n) = decode_value(&bytes[offset..])?;
-        *value = v;
-        offset += n;
-    }
-    Some(&out[..count])
-}
-
-#[cfg(test)]
-pub(super) fn encode_arguments(
-    values: &[Value],
-    out: &mut [u8; CALL_ARGUMENT_BYTES],
-) -> Option<usize> {
-    if values.len() > MAX_CALL_ARGUMENTS {
-        return None;
-    }
-    out[0] = values.len() as u8;
-    let mut offset = 1;
-    for &value in values {
-        let mut scalar = [0; 9];
-        let n = encode_value(value, &mut scalar);
-        out.get_mut(offset..offset + n)?
-            .copy_from_slice(&scalar[..n]);
-        offset += n;
-    }
-    Some(offset)
 }
 
 fn valid_address(address: u64) -> bool {

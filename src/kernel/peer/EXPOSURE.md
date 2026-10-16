@@ -11,8 +11,9 @@ discovery, and receiving another arrival never broadcast complete surfaces. A
 bounded owner search locates preexisting appliances. Any interested peer can request a
 range from a known owner. There is no privileged nucleus read API. Ordinary
 vertices serve their own definitions and relay reads/replies, retaining no foreign
-IR. The tablet/nucleus consumer, content-based lookup, and surface reconstruction
-are not implemented here. [Native control and current-state reads](INVOCATION.md)
+IR. The Linux client in `lattice-tablet` now requests and reconstructs one selected
+surface and inspects its declarations without executing IR. Content-based lookup
+and nucleus integration remain separate work. [Native control and current-state reads](INVOCATION.md)
 use separate messages; surface reads continue to expose immutable mathematics only.
 
 ## Progressive discovery direction
@@ -222,8 +223,10 @@ The passive board observer supplies a switch or dimmer surface and logs
 `SURFACE_PART` ranges with reader, owner, token, offset, total, RSSI, and per-range
 checksum. Its counters count requests and parts, not completed surfaces. It
 originates no reads, and pairing two uninterested vertices intentionally produces
-no surface traffic. A consumer is needed to exercise reads on hardware.
+no surface traffic. The attached Linux consumer has now reconstructed the complete 195-byte dimmer
+surface over three requested ranges, including its axiom and invariant.
 
-RF/range investigation remains paused. This revision is validated by host tests
-and both MCU builds, not a new hardware run. Older broadcast-capture results do
+RF/range investigation remains paused. The attached-host path has a two-Nordic
+hardware check; it validates surface/current-state reads and native calls against
+a software appliance, not physical device completion or RF delivery reliability. Older broadcast-capture results do
 not validate the current version-6 behavior; see [validation scope](TESTING.md#validation-scope).

@@ -35,7 +35,10 @@ static mut STACK: [StackType_t; 2048] = [0; 2048];
     feature = "usb-console"
 ))]
 static mut CONTROL: kernel::tasks::StaticTask_t = kernel::tasks::StaticTask_t::new();
-#[cfg(all(feature = "radio-probe", feature = "peer-observer"))]
+#[cfg(all(
+    feature = "radio-probe",
+    any(feature = "peer-observer", feature = "test-appliance")
+))]
 compile_error!("select either the RF probe workload or the normal discovery observer");
 
 #[cfg(any(
@@ -128,15 +131,20 @@ fn main() -> ! {
     log!("START kernel radio: {}", port::portARCH_NAME);
     #[cfg(feature = "radio-probe")]
     lattice_radio_test::start(context, radio);
-    #[cfg(feature = "peer-observer")]
+    #[cfg(any(feature = "peer-observer", feature = "test-appliance"))]
     {
         let appliance = lattice_radio_test::surface::appliance(
             &context,
-            port::nrf52840::hal::pac::FICR.deviceid(0).read() & 1 != 0,
+            cfg!(feature = "test-appliance")
+                || port::nrf52840::hal::pac::FICR.deviceid(0).read() & 1 != 0,
         );
         lattice_vertex::kernel::start(context, radio, appliance)
     }
-    #[cfg(not(any(feature = "radio-probe", feature = "peer-observer")))]
+    #[cfg(not(any(
+        feature = "radio-probe",
+        feature = "peer-observer",
+        feature = "test-appliance"
+    )))]
     {
         static APPLIANCE: lattice_vertex::kernel::Appliance<(), core::convert::Infallible> =
             lattice_vertex::kernel::Appliance::new(&lattice_vertex::surface::EMPTY);

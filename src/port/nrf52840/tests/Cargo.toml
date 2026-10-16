@@ -9,6 +9,7 @@ publish = false
 [features]
 radio-probe = ["dep:lattice-radio-test"]
 peer-observer = ["dep:lattice-radio-test"]
+test-appliance = ["dep:lattice-radio-test"]
 xiao-bootloader = ["cortex-m-rt/set-vtor", "cortex-m-rt/set-sp"]
 usb-console = ["dep:embassy-usb", "dep:embassy-futures"]
 

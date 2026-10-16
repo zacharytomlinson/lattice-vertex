@@ -130,7 +130,17 @@ attached-host `ReadLinks` run. The Linux client obtained the attached resident's
 neighbor and read that neighbor's reciprocal link and end-of-list over radio.
 The test exposed a back-to-back discovery/link-offer conflict; maintenance now
 sends one solicitation per interval, and both links established after that change.
-USB reopen and software DFU entry also worked. This is not a range or loss-rate test.
+USB reopen and software DFU entry also worked. The subsequent host v2 path read
+the maintained dimmer's complete surface, invoked its typed native transformer,
+and read back registered state. Wrong argument types and out-of-range values
+returned distinct native errors. The fixture is software-backed; this is not
+physical actuator verification or a range/loss-rate test. Some reads timed out;
+no mutation was automatically retried. The current remote fixture also needs
+its diagnostic USB port open for the successful path; closed-console reads timed
+out even with matching channels. This unresolved port/liveness condition is kept
+separate from the host operation semantics. The radio stack now reserves 8 KiB
+for the measured ~5 KiB entry frame plus callers/callees; that change did not fix
+the closed-console condition.
  Native calls, relayed
 surface/current-state reads, reciprocal link maintenance, guided traversal, owner
 discovery, scored alternate directions, bounded invocation replication, and deltas

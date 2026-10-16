@@ -83,20 +83,20 @@ impl Route {
 
 /// All read kinds share one bounded reverse-path budget and token namespace.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ReadRequest {
+pub(super) enum ReadRequest {
     Surface(SurfaceRead),
     State(StateRead),
     Links(LinkRead),
 }
 impl ReadRequest {
-    fn reader(self) -> u64 {
+    pub(super) fn reader(self) -> u64 {
         match self {
             Self::Surface(r) => r.reader,
             Self::State(r) => r.reader,
             Self::Links(r) => r.reader,
         }
     }
-    fn owner(self) -> u64 {
+    pub(super) fn owner(self) -> u64 {
         match self {
             Self::Surface(r) => r.owner,
             Self::State(r) => r.owner,
@@ -375,19 +375,24 @@ impl Forwarder {
     /// A local reader shares the same bounded read paths and route learning as
     /// relayed reads. It is not injected as a fictitious radio neighbor.
     #[cfg(feature = "host-link")]
-    pub(super) fn originate_links(&mut self, read: LinkRead, now: u32) -> Option<Message<'static>> {
+    pub(super) fn originate_read(
+        &mut self,
+        request: ReadRequest,
+        now: u32,
+    ) -> Option<Message<'static>> {
+        let reader = request.reader();
+        let owner = request.owner();
         self.expire(now);
-        if read.reader != self.local
-            || read.owner == self.local
-            || (read.via == self.local && !self.links.contains(read.owner))
+        if reader != self.local
+            || owner == self.local
+            || matches!(request, ReadRequest::Links(read) if read.via == self.local && !self.links.contains(owner))
             || self
                 .reads
                 .iter()
-                .any(|p| p.read.reader() == self.local && p.read.request() == read.request)
+                .any(|p| p.read.reader() == self.local && p.read.request() == request.request())
         {
             return None;
         }
-        let request = ReadRequest::Links(read);
         let onward = self
             .next_hop(request.direction(self.local), self.local, MAX_HOPS)
             .unwrap_or(0);
@@ -395,46 +400,133 @@ impl Forwarder {
         Some(Message {
             source: self.local,
             destination: (onward != 0).then_some(onward),
-            content: Content::ReadLinks {
-                network: self.network,
-                read,
-                remaining: MAX_HOPS,
+            content: match request {
+                ReadRequest::Links(read) => Content::ReadLinks {
+                    network: self.network,
+                    read,
+                    remaining: MAX_HOPS,
+                },
+                ReadRequest::Surface(read) => Content::ReadSurface {
+                    network: self.network,
+                    read,
+                    remaining: MAX_HOPS,
+                },
+                ReadRequest::State(read) => Content::ReadState {
+                    network: self.network,
+                    read,
+                    remaining: MAX_HOPS,
+                },
             },
         })
     }
 
     #[cfg(feature = "host-link")]
-    pub(super) fn complete_links(
+    pub(super) fn complete_read<'a>(
         &mut self,
-        incoming: Message<'_>,
+        incoming: Message<'a>,
         now: u32,
-    ) -> Option<(LinkRead, u32, Option<super::frame::PeerLink>)> {
+    ) -> Option<Message<'a>> {
         self.expire(now);
-        let Content::LinkEntry {
-            network,
-            read,
-            revision,
-            link,
-            hops,
-        } = incoming.content
-        else {
-            return None;
+        let (network, request, hops) = match incoming.content {
+            Content::LinkEntry {
+                network,
+                read,
+                hops,
+                ..
+            } => (network, ReadRequest::Links(read), hops),
+            Content::SurfacePart {
+                network,
+                read,
+                hops,
+                ..
+            } => (network, ReadRequest::Surface(read), hops),
+            Content::StateValue {
+                network,
+                read,
+                hops,
+                ..
+            } => (network, ReadRequest::State(read), hops),
+            _ => return None,
         };
         if network != self.network
-            || read.reader != self.local
+            || request.reader() != self.local
             || incoming.destination != Some(self.local)
         {
             return None;
         }
-        let previous = self.return_read(ReadRequest::Links(read), incoming.source, hops, now)?;
-        (previous == self.local).then_some((read, revision, link))
+        let previous = self.return_read(request, incoming.source, hops, now)?;
+        (previous == self.local).then_some(incoming)
     }
 
     #[cfg(feature = "host-link")]
-    pub(super) fn cancel_links(&mut self, read: LinkRead) {
+    pub(super) fn cancel_read(&mut self, request: ReadRequest) {
         for path in &mut self.reads {
-            if path.read == ReadRequest::Links(read) && read.reader == self.local {
+            if path.read == request && request.reader() == self.local {
                 *path = ReadPath::EMPTY;
+            }
+        }
+    }
+
+    #[cfg(feature = "host-link")]
+    pub(super) fn identity(&self) -> (u64, Network) {
+        (self.local, self.network)
+    }
+
+    #[cfg(feature = "host-link")]
+    pub(super) fn originate_call<'a>(
+        &mut self,
+        call: Invocation,
+        arguments: &'a [u8],
+        now: u32,
+    ) -> Option<Message<'a>> {
+        self.expire(now);
+        if call.caller != self.local
+            || call.owner == self.local
+            || self
+                .calls
+                .iter()
+                .any(|p| p.call.caller == self.local && p.call.request == call.request)
+        {
+            return None;
+        }
+        let next = self.next_hop(call.owner, self.local, MAX_HOPS).unwrap_or(0);
+        self.remember_call(call, arguments, self.local, [next, 0], MAX_HOPS, now);
+        Some(Message {
+            source: self.local,
+            destination: (next != 0).then_some(next),
+            content: Content::Invoke {
+                network: self.network,
+                call,
+                remaining: MAX_HOPS,
+                copies: if next == 0 { 1 } else { 2 },
+                arguments,
+            },
+        })
+    }
+
+    #[cfg(feature = "host-link")]
+    pub(super) fn complete_call(
+        &mut self,
+        incoming: Message<'_>,
+        now: u32,
+    ) -> Option<(Invocation, InvokeStatus)> {
+        if !matches!(incoming.content, Content::InvocationResult { call, .. } if call.caller == self.local)
+            || incoming.destination != Some(self.local)
+        {
+            return None;
+        }
+        let replies = self.receive_control(incoming, now, |_, _| unreachable!());
+        let Content::InvocationResult { call, status, .. } = replies[0]?.content else {
+            return None;
+        };
+        Some((call, status))
+    }
+
+    #[cfg(feature = "host-link")]
+    pub(super) fn cancel_call(&mut self, call: Invocation) {
+        for path in &mut self.calls {
+            if path.call == call && call.caller == self.local {
+                *path = CallPath::EMPTY;
             }
         }
     }
@@ -599,26 +691,7 @@ impl Forwarder {
                 // Broadcast exploration already fans out. It never grants each
                 // recipient another directed fork of the same packet.
                 let copies = if split || next[0] == 0 { 1 } else { copies };
-                let slot = self
-                    .calls
-                    .iter()
-                    .position(|p| p.call.caller == 0)
-                    .unwrap_or_else(|| {
-                        (0..CALL_PATHS)
-                            .max_by_key(|&i| now.wrapping_sub(self.calls[i].started))
-                            .unwrap()
-                    });
-                let mut path = CallPath {
-                    call,
-                    previous: [incoming.source, 0],
-                    onward: next,
-                    started: now,
-                    length: arguments.len() as u8,
-                    remaining,
-                    ..CallPath::EMPTY
-                };
-                path.arguments[..arguments.len()].copy_from_slice(arguments);
-                self.calls[slot] = path;
+                self.remember_call(call, arguments, incoming.source, next, remaining, now);
                 let first = Message {
                     source: self.local,
                     destination: (next[0] != 0).then_some(next[0]),
@@ -686,6 +759,37 @@ impl Forwarder {
             }
             _ => [None; 2],
         }
+    }
+
+    fn remember_call(
+        &mut self,
+        call: Invocation,
+        arguments: &[u8],
+        previous: u64,
+        next: [u64; 2],
+        remaining: u8,
+        now: u32,
+    ) {
+        let slot = self
+            .calls
+            .iter()
+            .position(|p| p.call.caller == 0)
+            .unwrap_or_else(|| {
+                (0..CALL_PATHS)
+                    .max_by_key(|&i| now.wrapping_sub(self.calls[i].started))
+                    .unwrap()
+            });
+        let mut path = CallPath {
+            call,
+            previous: [previous, 0],
+            onward: next,
+            started: now,
+            length: arguments.len() as u8,
+            remaining,
+            ..CallPath::EMPTY
+        };
+        path.arguments[..arguments.len()].copy_from_slice(arguments);
+        self.calls[slot] = path;
     }
 
     pub(super) fn announce_change(
@@ -998,7 +1102,7 @@ impl Forwarder {
     /// Consume an already validated frame and produce at most one transmission.
     /// A request's first incoming neighbor fixes its reverse path. A fresh
     /// request token is required to retry a lost read within the recent window.
-    pub(super) fn receive<'a>(
+    pub(super) fn receive_surface<'a>(
         &mut self,
         incoming: Message<'a>,
         description: &Description,
@@ -1440,7 +1544,7 @@ mod tests {
                 {
                     owners.push((local, owner));
                 }
-                if let Some(out) = node.receive(incoming, &description, &mut piece, now) {
+                if let Some(out) = node.receive_surface(incoming, &description, &mut piece, now) {
                     transmit(out);
                 }
             }
@@ -1706,7 +1810,7 @@ mod tests {
             let incoming = Message::decode(&wire[..n], local, 15).unwrap();
             let mut piece = [0; SURFACE_BYTES];
             let outgoing = nodes[index]
-                .receive(incoming, &description, &mut piece, 101)
+                .receive_surface(incoming, &description, &mut piece, 101)
                 .unwrap();
             let target = outgoing
                 .destination
@@ -1955,7 +2059,7 @@ mod tests {
         };
         assert!(
             relay
-                .receive(surface_query, &description, &mut part, 2)
+                .receive_surface(surface_query, &description, &mut part, 2)
                 .is_none(),
             "different read kind reused a live token"
         );
@@ -1971,7 +2075,7 @@ mod tests {
         };
         assert!(
             relay
-                .receive(surface_reply, &description, &mut part, 2)
+                .receive_surface(surface_reply, &description, &mut part, 2)
                 .is_none(),
             "surface bytes answered a state read"
         );
@@ -2072,7 +2176,7 @@ mod tests {
                 ..query
             };
             mixed
-                .receive(q, &description, &mut part, u32::from(id))
+                .receive_surface(q, &description, &mut part, u32::from(id))
                 .unwrap();
         }
         assert!(
@@ -2538,22 +2642,22 @@ mod tests {
         let mut node = Forwarder::new(2, NET);
         let mut piece = [0; SURFACE_BYTES];
         assert!(node
-            .receive(reply(1, 0), &description, &mut piece, 0)
+            .receive_surface(reply(1, 0), &description, &mut piece, 0)
             .is_none());
-        node.receive(query(1, 0), &description, &mut piece, 1)
+        node.receive_surface(query(1, 0), &description, &mut piece, 1)
             .unwrap();
         for (request, offset) in [(2, 0), (1, 1)] {
             assert!(node
-                .receive(reply(request, offset), &description, &mut piece, 2)
+                .receive_surface(reply(request, offset), &description, &mut piece, 2)
                 .is_none());
         }
         assert!(node.routes.iter().all(|r| r.owner == 0));
         let out = node
-            .receive(reply(1, 0), &description, &mut piece, 3)
+            .receive_surface(reply(1, 0), &description, &mut piece, 3)
             .unwrap();
         assert_eq!(out.destination, Some(1));
         assert!(node
-            .receive(reply(1, 0), &description, &mut piece, 4)
+            .receive_surface(reply(1, 0), &description, &mut piece, 4)
             .is_none());
         assert_eq!(node.routes.iter().filter(|r| r.owner != 0).count(), 1);
         let mut bad = query(3, 0);
@@ -2563,7 +2667,9 @@ mod tests {
         {
             network.founder = 99;
         }
-        assert!(node.receive(bad, &description, &mut piece, 5).is_none());
+        assert!(node
+            .receive_surface(bad, &description, &mut piece, 5)
+            .is_none());
     }
 
     #[test]
@@ -2580,20 +2686,24 @@ mod tests {
         {
             *remaining = 1;
         }
-        assert!(relay.receive(last, &description, &mut piece, 0).is_none());
-        assert!(owner.receive(last, &description, &mut piece, 0).is_some());
+        assert!(relay
+            .receive_surface(last, &description, &mut piece, 0)
+            .is_none());
         assert!(owner
-            .receive(query(2, description.len() + 1), &description, &mut piece, 0)
+            .receive_surface(last, &description, &mut piece, 0)
+            .is_some());
+        assert!(owner
+            .receive_surface(query(2, description.len() + 1), &description, &mut piece, 0)
             .is_none());
         let eof = owner
-            .receive(query(3, description.len()), &description, &mut piece, 0)
+            .receive_surface(query(3, description.len()), &description, &mut piece, 0)
             .unwrap();
         assert!(matches!(
             eof.content,
             Content::SurfacePart { bytes: [], .. }
         ));
         for request in 0..=READ_PATHS as u16 {
-            relay.receive(
+            relay.receive_surface(
                 query(request, 0),
                 &description,
                 &mut piece,
@@ -2601,10 +2711,10 @@ mod tests {
             );
         }
         assert!(relay
-            .receive(reply(0, 0), &description, &mut piece, 100)
+            .receive_surface(reply(0, 0), &description, &mut piece, 100)
             .is_none());
         assert!(relay
-            .receive(reply(READ_PATHS as u16, 0), &description, &mut piece, 100)
+            .receive_surface(reply(READ_PATHS as u16, 0), &description, &mut piece, 100)
             .is_some());
     }
 
@@ -2615,49 +2725,49 @@ mod tests {
         let mut piece = [0; SURFACE_BYTES];
         node.learn(4, 3, 2, 0, 1);
         let out = node
-            .receive(query(1, 0), &description, &mut piece, 1)
+            .receive_surface(query(1, 0), &description, &mut piece, 1)
             .unwrap();
         assert_eq!(out.destination, Some(3));
         node.transmit_failed(&out);
         assert_eq!(
-            node.receive(query(2, 0), &description, &mut piece, 2)
+            node.receive_surface(query(2, 0), &description, &mut piece, 2)
                 .unwrap()
                 .destination,
             None
         );
-        node.receive(reply(2, 0), &description, &mut piece, 3)
+        node.receive_surface(reply(2, 0), &description, &mut piece, 3)
             .unwrap();
-        node.receive(query(3, 0), &description, &mut piece, 4)
+        node.receive_surface(query(3, 0), &description, &mut piece, 4)
             .unwrap(); // no response
         node.expire(READ_MS + 4);
         assert_eq!(
-            node.receive(query(4, 0), &description, &mut piece, READ_MS + 5)
+            node.receive_surface(query(4, 0), &description, &mut piece, READ_MS + 5)
                 .unwrap()
                 .destination,
             None
         );
-        node.receive(reply(4, 0), &description, &mut piece, READ_MS + 6)
+        node.receive_surface(reply(4, 0), &description, &mut piece, READ_MS + 6)
             .unwrap();
-        node.receive(query(5, 0), &description, &mut piece, READ_MS + 7)
+        node.receive_surface(query(5, 0), &description, &mut piece, READ_MS + 7)
             .unwrap();
-        node.receive(query(6, 0), &description, &mut piece, READ_MS + 8)
+        node.receive_surface(query(6, 0), &description, &mut piece, READ_MS + 8)
             .unwrap();
-        node.receive(reply(6, 0), &description, &mut piece, READ_MS + 9)
+        node.receive_surface(reply(6, 0), &description, &mut piece, READ_MS + 9)
             .unwrap();
         node.expire(2 * READ_MS + 7);
         assert_eq!(
-            node.receive(query(7, 0), &description, &mut piece, 2 * READ_MS + 8)
+            node.receive_surface(query(7, 0), &description, &mut piece, 2 * READ_MS + 8)
                 .unwrap()
                 .destination,
             Some(3)
         );
         let mut wrap = Forwarder::new(2, NET);
         wrap.learn(4, 3, 2, u32::MAX - 100, 1);
-        wrap.receive(query(1, 0), &description, &mut piece, u32::MAX - 99)
+        wrap.receive_surface(query(1, 0), &description, &mut piece, u32::MAX - 99)
             .unwrap();
         wrap.expire(READ_MS);
         assert_eq!(
-            wrap.receive(query(2, 0), &description, &mut piece, READ_MS + 1)
+            wrap.receive_surface(query(2, 0), &description, &mut piece, READ_MS + 1)
                 .unwrap()
                 .destination,
             None

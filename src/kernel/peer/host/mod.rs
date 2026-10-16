@@ -3,12 +3,15 @@
 //! No allocation, configuration override, retry, or foreign-surface registry.
 
 use super::{
-    forwarding::Forwarder,
-    frame::{LinkRead, Message},
-    Network,
+    exposure::Description,
+    forwarding::{Forwarder, ReadRequest},
+    frame::{Content, Invocation, LinkRead, Message, StateRead, SurfaceRead},
+    invocation::Invocations,
 };
+use crate::kernel::appliance::Native;
 use crate::{port, sync::TaskContext, types::UBaseType_t};
-pub use lattice_host_link::{Decoder, Failure, Packet, MAX_PACKET};
+pub use lattice_peer_wire::host::{Arguments, Bytes, Decoder, Failure, Packet, MAX_PACKET};
+use lattice_peer_wire::{CALL_ARGUMENT_BYTES, SURFACE_BYTES};
 const READ_TIMEOUT_MS: u32 = 8_000;
 
 struct Mailbox {
@@ -86,40 +89,57 @@ fn deliver(generation: u32, packet: Packet) {
         }
     });
 }
-struct PendingRead {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Operation {
+    Read(ReadRequest),
+    Call(Invocation),
+}
+impl Operation {
+    fn cancel(self, forwarder: &mut Forwarder) {
+        match self {
+            Self::Read(read) => forwarder.cancel_read(read),
+            Self::Call(call) => forwarder.cancel_call(call),
+        }
+    }
+}
+struct Pending {
     generation: u32,
     host_token: u32,
-    read: LinkRead,
+    operation: Operation,
     started: u32,
 }
 pub(super) struct Host {
     next_token: u16,
-    read: Option<PendingRead>,
+    pending: Option<Pending>,
+    arguments: [u8; CALL_ARGUMENT_BYTES],
 }
 impl Host {
     pub(super) const fn new() -> Self {
         Self {
             next_token: 0,
-            read: None,
+            pending: None,
+            arguments: [0; CALL_ARGUMENT_BYTES],
         }
     }
-    pub(super) fn poll(
-        &mut self,
+    pub(super) fn poll<'a>(
+        &'a mut self,
         forwarder: &mut Forwarder,
-        local: u64,
-        network: Network,
+        description: &Description,
+        native: &dyn Native,
+        invocations: &mut Invocations,
+        context: &TaskContext,
         now: u32,
-    ) -> Option<Message<'static>> {
-        if let Some(read) = &self.read {
-            let connected = access(|m| m.generation == read.generation);
-            if !connected || now.wrapping_sub(read.started) >= READ_TIMEOUT_MS {
-                let read = self.read.take().unwrap();
-                forwarder.cancel_links(read.read);
+    ) -> Option<Message<'a>> {
+        if let Some(pending) = &self.pending {
+            let connected = access(|m| m.generation == pending.generation);
+            if !connected || now.wrapping_sub(pending.started) >= READ_TIMEOUT_MS {
+                let pending = self.pending.take().unwrap();
+                pending.operation.cancel(forwarder);
                 if connected {
                     deliver(
-                        read.generation,
+                        pending.generation,
                         Packet::Error {
-                            token: read.host_token,
+                            token: pending.host_token,
                             failure: Failure::Timeout,
                         },
                     );
@@ -127,8 +147,10 @@ impl Host {
             }
         }
         let (generation, request) = access(|m| m.request.take().map(|r| (m.generation, r)))?;
-        match request {
-            Packet::Status { token } => deliver(
+        let (local, network) = forwarder.identity();
+        let token = request.token();
+        if let Packet::Status { .. } = request {
+            deliver(
                 generation,
                 Packet::Ready {
                     token,
@@ -136,312 +158,253 @@ impl Host {
                     founder: network.founder,
                     channel: network.channel,
                 },
-            ),
-            Packet::ReadLinks {
-                token,
+            );
+            return None;
+        }
+        let owner = match request {
+            Packet::ReadLinks { owner, .. }
+            | Packet::ReadSurface { owner, .. }
+            | Packet::ReadState { owner, .. }
+            | Packet::Invoke { owner, .. } => owner,
+            _ => unreachable!("submit rejects replies"),
+        };
+        let valid = |a| a != 0 && a != u64::MAX;
+        let invalid = !valid(owner)
+            || match request {
+                Packet::ReadLinks { after, via, .. } => {
+                    after == u64::MAX || (via != 0 && (!valid(via) || via == local || via == owner))
+                }
+                Packet::ReadState { attribute, .. } => !valid(attribute),
+                Packet::Invoke { transformer, .. } => !valid(transformer),
+                _ => false,
+            };
+        if invalid {
+            deliver(
+                generation,
+                Packet::Error {
+                    token,
+                    failure: Failure::InvalidRequest,
+                },
+            );
+            return None;
+        }
+        if let Packet::Invoke {
+            transformer,
+            arguments,
+            ..
+        } = request
+        {
+            // Host tokens for calls are invocation identities. The Linux client
+            // seeds them from OS entropy on open; reconnect is never a retry.
+            let call = Invocation {
+                caller: local,
                 owner,
-                after,
-                via,
-            } => {
-                if owner == 0
-                    || owner == u64::MAX
-                    || after == u64::MAX
-                    || via == u64::MAX
-                    || (via != 0 && (via == local || via == owner))
-                {
-                    deliver(
-                        generation,
-                        Packet::Error {
-                            token,
-                            failure: Failure::InvalidRequest,
-                        },
-                    );
-                } else if owner == local && via == 0 {
-                    let (revision, link) = forwarder.local_links(after);
-                    deliver(
-                        generation,
-                        Packet::Link {
-                            token,
-                            owner,
-                            after,
-                            via,
-                            revision,
-                            peer: link.map_or(0, |l| l.peer),
-                            round_trip_ms: link.map_or(0, |l| l.round_trip_ms),
-                        },
-                    );
-                } else {
-                    self.next_token = self.next_token.wrapping_add(1);
-                    let read = LinkRead {
-                        reader: local,
+                request: token,
+                transformer,
+            };
+            if owner == local {
+                let status = invocations.invoke(native, context, call, arguments.as_slice());
+                deliver(
+                    generation,
+                    Packet::Invoked {
+                        token,
                         owner,
-                        request: self.next_token,
+                        transformer,
+                        status,
+                    },
+                );
+            } else {
+                let args = arguments.as_slice();
+                self.arguments[..args.len()].copy_from_slice(args);
+                if let Some(outgoing) =
+                    forwarder.originate_call(call, &self.arguments[..args.len()], now)
+                {
+                    self.pending = Some(Pending {
+                        generation,
+                        host_token: token,
+                        operation: Operation::Call(call),
+                        started: now,
+                    });
+                    return Some(outgoing);
+                }
+                deliver(
+                    generation,
+                    Packet::Error {
+                        token,
+                        failure: Failure::InvalidRequest,
+                    },
+                );
+            }
+            return None;
+        }
+        if owner == local {
+            let response = match request {
+                Packet::ReadLinks { after, via, .. } => {
+                    let (revision, link) = forwarder.local_links(after);
+                    Packet::Link {
+                        token,
+                        owner,
                         after,
                         via,
-                    };
-                    if let Some(outgoing) = forwarder.originate_links(read, now) {
-                        self.read = Some(PendingRead {
-                            generation,
-                            host_token: token,
-                            read,
-                            started: now,
-                        });
-                        return Some(outgoing);
+                        revision,
+                        peer: link.map_or(0, |l| l.peer),
+                        round_trip_ms: link.map_or(0, |l| l.round_trip_ms),
                     }
-                    deliver(
-                        generation,
-                        Packet::Error {
-                            token,
-                            failure: Failure::InvalidRequest,
-                        },
-                    );
                 }
-            }
-            _ => unreachable!("submit rejects replies"),
+                Packet::ReadSurface { offset, .. } if offset <= description.len() => {
+                    let mut bytes = [0; SURFACE_BYTES];
+                    let n = description.encode_part(offset, &mut bytes);
+                    Packet::Surface {
+                        token,
+                        owner,
+                        offset,
+                        total: description.len(),
+                        data: Bytes::new(&bytes[..n]).unwrap(),
+                    }
+                }
+                Packet::ReadState { attribute, .. } => Packet::State {
+                    token,
+                    owner,
+                    attribute,
+                    result: native.read(context, attribute),
+                },
+                _ => Packet::Error {
+                    token,
+                    failure: Failure::InvalidRequest,
+                },
+            };
+            deliver(generation, response);
+            return None;
         }
+        self.next_token = self.next_token.wrapping_add(1);
+        let read = match request {
+            Packet::ReadLinks { after, via, .. } => ReadRequest::Links(LinkRead {
+                reader: local,
+                owner,
+                request: self.next_token,
+                after,
+                via,
+            }),
+            Packet::ReadSurface { offset, .. } => ReadRequest::Surface(SurfaceRead {
+                reader: local,
+                owner,
+                request: self.next_token,
+                offset,
+            }),
+            Packet::ReadState { attribute, .. } => ReadRequest::State(StateRead {
+                reader: local,
+                owner,
+                request: self.next_token,
+                attribute,
+            }),
+            _ => unreachable!(),
+        };
+        if let Some(outgoing) = forwarder.originate_read(read, now) {
+            self.pending = Some(Pending {
+                generation,
+                host_token: token,
+                operation: Operation::Read(read),
+                started: now,
+            });
+            return Some(outgoing);
+        }
+        deliver(
+            generation,
+            Packet::Error {
+                token,
+                failure: Failure::InvalidRequest,
+            },
+        );
         None
     }
     pub(super) fn wait_ms(&self, now: u32) -> Option<u32> {
-        self.read
+        self.pending
             .as_ref()
             .map(|r| READ_TIMEOUT_MS.saturating_sub(now.wrapping_sub(r.started)))
     }
     pub(super) fn transmit_failed(&mut self, forwarder: &mut Forwarder) {
-        if let Some(read) = self.read.take() {
-            forwarder.cancel_links(read.read);
+        if let Some(pending) = self.pending.take() {
+            pending.operation.cancel(forwarder);
             deliver(
-                read.generation,
+                pending.generation,
                 Packet::Error {
-                    token: read.host_token,
+                    token: pending.host_token,
                     failure: Failure::Transmit,
                 },
             );
         }
     }
     pub(super) fn complete(&mut self, forwarder: &mut Forwarder, incoming: Message<'_>, now: u32) {
-        let Some((read, revision, link)) = forwarder.complete_links(incoming, now) else {
+        let Some(pending) = &self.pending else {
             return;
         };
-        if !self
-            .read
-            .as_ref()
-            .is_some_and(|pending| pending.read == read)
-        {
+        let token = pending.host_token;
+        let (operation, response) = if let Content::InvocationResult { .. } = incoming.content {
+            let Some((call, status)) = forwarder.complete_call(incoming, now) else {
+                return;
+            };
+            (
+                Operation::Call(call),
+                Packet::Invoked {
+                    token,
+                    owner: call.owner,
+                    transformer: call.transformer,
+                    status,
+                },
+            )
+        } else {
+            let Some(message) = forwarder.complete_read(incoming, now) else {
+                return;
+            };
+            match message.content {
+                Content::LinkEntry {
+                    read,
+                    revision,
+                    link,
+                    ..
+                } => (
+                    Operation::Read(ReadRequest::Links(read)),
+                    Packet::Link {
+                        token,
+                        owner: read.owner,
+                        after: read.after,
+                        via: read.via,
+                        revision,
+                        peer: link.map_or(0, |l| l.peer),
+                        round_trip_ms: link.map_or(0, |l| l.round_trip_ms),
+                    },
+                ),
+                Content::SurfacePart {
+                    read, total, bytes, ..
+                } => (
+                    Operation::Read(ReadRequest::Surface(read)),
+                    Packet::Surface {
+                        token,
+                        owner: read.owner,
+                        offset: read.offset,
+                        total,
+                        data: Bytes::new(bytes).unwrap(),
+                    },
+                ),
+                Content::StateValue { read, result, .. } => (
+                    Operation::Read(ReadRequest::State(read)),
+                    Packet::State {
+                        token,
+                        owner: read.owner,
+                        attribute: read.attribute,
+                        result,
+                    },
+                ),
+                _ => return,
+            }
+        };
+        if pending.operation != operation {
             return;
         }
-        let pending = self.read.take().unwrap();
-        deliver(
-            pending.generation,
-            Packet::Link {
-                token: pending.host_token,
-                owner: read.owner,
-                after: read.after,
-                via: read.via,
-                revision,
-                peer: link.map_or(0, |l| l.peer),
-                round_trip_ms: link.map_or(0, |l| l.round_trip_ms),
-            },
-        );
+        let pending = self.pending.take().unwrap();
+        deliver(pending.generation, response);
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::kernel::peer::frame::Content;
-    fn delivered(message: Message<'_>, recipient: u64) -> Message<'static> {
-        // Link messages borrow no payload; reconstruct after exercising the real MAC codec.
-        let mut bytes = [0; crate::kernel::radio::MAX_FRAME_SIZE];
-        let n = message.encode(1, &mut bytes);
-        let decoded = Message::decode(&bytes[..n], recipient, 15).unwrap();
-        let content = match decoded.content {
-            Content::ReadLinks {
-                network,
-                read,
-                remaining,
-            } => Content::ReadLinks {
-                network,
-                read,
-                remaining,
-            },
-            Content::LinkEntry {
-                network,
-                read,
-                revision,
-                link,
-                hops,
-            } => Content::LinkEntry {
-                network,
-                read,
-                revision,
-                link,
-                hops,
-            },
-            _ => panic!("unexpected message"),
-        };
-        Message {
-            source: decoded.source,
-            destination: decoded.destination,
-            content,
-        }
-    }
-    #[test]
-    fn local_host_reads_use_real_routes_and_disconnect_cannot_reuse_a_completion() {
-        crate::port::test_port_reset();
-        access(|m| *m = Mailbox::new());
-        let context = unsafe { TaskContext::assume() };
-        let network = Network {
-            founder: 1,
-            channel: 15,
-        };
-        let mut local = Forwarder::new(1, network);
-        let mut remote = Forwarder::new(2, network);
-        local.record_presence(2, 0);
-        let offer = local.maintain_links(1).unwrap();
-        let accept = remote.receive_link(offer, 2).unwrap();
-        let confirm = local.receive_link(accept, 3).unwrap();
-        remote.receive_link(confirm, 4);
-        let mut host = Host::new();
-        submit(&context, Packet::Status { token: 1 }).unwrap();
-        assert_eq!(
-            submit(&context, Packet::Status { token: 2 }),
-            Err(Failure::Busy)
-        );
-        assert!(host.poll(&mut local, 1, network, 5).is_none());
-        assert_eq!(
-            receive(&context),
-            Some(Packet::Ready {
-                token: 1,
-                address: 1,
-                founder: 1,
-                channel: 15
-            })
-        );
-        submit(
-            &context,
-            Packet::ReadLinks {
-                token: 2,
-                owner: 1,
-                after: 0,
-                via: 0,
-            },
-        )
-        .unwrap();
-        assert!(host.poll(&mut local, 1, network, 6).is_none());
-        assert!(matches!(
-            receive(&context),
-            Some(Packet::Link {
-                owner: 1,
-                peer: 2,
-                ..
-            })
-        ));
-        let request = Packet::ReadLinks {
-            token: 77,
-            owner: 2,
-            after: 0,
-            via: 0,
-        };
-        submit(&context, request).unwrap();
-        let outgoing = host.poll(&mut local, 1, network, 7).unwrap();
-        assert_eq!(outgoing.destination, Some(2));
-        let reply = remote.receive_links(delivered(outgoing, 2), 8).unwrap();
-        let mut wrong = reply;
-        if let Content::LinkEntry { ref mut read, .. } = wrong.content {
-            read.request = read.request.wrapping_add(1);
-        }
-        host.complete(&mut local, delivered(wrong, 1), 9);
-        assert_eq!(receive(&context), None);
-        // Closing USB cancels only this host's operation, without forgetting peers.
-        disconnect(&context);
-        submit(&context, request).unwrap();
-        let fresh = host.poll(&mut local, 1, network, 10).unwrap();
-        assert_ne!(
-            fresh.content, outgoing.content,
-            "air token must not reset on USB reconnect"
-        );
-        host.complete(&mut local, delivered(reply, 1), 11);
-        assert_eq!(receive(&context), None);
-        let reply = remote.receive_links(delivered(fresh, 2), 12).unwrap();
-        host.complete(&mut local, delivered(reply, 1), 13);
-        assert!(matches!(
-            receive(&context),
-            Some(Packet::Link {
-                token: 77,
-                owner: 2,
-                peer: 1,
-                ..
-            })
-        ));
-        host.complete(&mut local, delivered(reply, 1), 14);
-        assert_eq!(receive(&context), None);
-        submit(&context, request).unwrap();
-        assert!(host.poll(&mut local, 1, network, 15).is_some());
-        assert!(host
-            .poll(&mut local, 1, network, 15 + READ_TIMEOUT_MS)
-            .is_none());
-        assert_eq!(
-            receive(&context),
-            Some(Packet::Error {
-                token: 77,
-                failure: Failure::Timeout
-            })
-        );
-        // A reference advertised by the adjacent peer remains traversable
-        // through that peer, with the completion returning to this local host.
-        let mut third = Forwarder::new(3, network);
-        remote.record_presence(3, 8_020);
-        let offer = remote.maintain_links(8_021).unwrap();
-        let accept = third.receive_link(offer, 8_022).unwrap();
-        let confirm = remote.receive_link(accept, 8_023).unwrap();
-        third.receive_link(confirm, 8_024);
-        submit(
-            &context,
-            Packet::ReadLinks {
-                token: 78,
-                owner: 3,
-                after: 0,
-                via: 2,
-            },
-        )
-        .unwrap();
-        let first = host.poll(&mut local, 1, network, 8_025).unwrap();
-        assert_eq!(first.destination, Some(2));
-        let onward = remote.receive_links(delivered(first, 2), 8_026).unwrap();
-        assert_eq!(onward.destination, Some(3));
-        let reply = third.receive_links(delivered(onward, 3), 8_027).unwrap();
-        let reply = remote.receive_links(delivered(reply, 2), 8_028).unwrap();
-        host.complete(&mut local, delivered(reply, 1), 8_029);
-        assert!(matches!(
-            receive(&context),
-            Some(Packet::Link {
-                token: 78,
-                owner: 3,
-                via: 2,
-                peer: 2,
-                ..
-            })
-        ));
-        for via in [1, 3, u64::MAX] {
-            submit(
-                &context,
-                Packet::ReadLinks {
-                    token: 79,
-                    owner: 3,
-                    after: 0,
-                    via,
-                },
-            )
-            .unwrap();
-            assert!(host.poll(&mut local, 1, network, 8_030).is_none());
-            assert_eq!(
-                receive(&context),
-                Some(Packet::Error {
-                    token: 79,
-                    failure: Failure::InvalidRequest
-                })
-            );
-        }
-        disconnect(&context);
-    }
-}
+mod tests;

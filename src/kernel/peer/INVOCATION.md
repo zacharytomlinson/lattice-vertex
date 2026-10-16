@@ -4,8 +4,9 @@ This is the basic installation path: an ordinary tablet daemon peer addresses an
 appliance's exposed native transformer; the kernel invokes it and communicates
 subsequent established state changes. No nucleus, solver, IR interpreter, learned
 surface, or compiled-fragment runtime is required. Any peer can also read one
-exposed attribute to establish its initial value. Tablet transport/consumer code
-is not implemented in this repository yet.
+exposed attribute to establish its initial value. The optional [attached host endpoint](host/README.md) and the Linux client in
+`lattice-tablet` now originate these calls and reads. Host delta streaming remains
+unimplemented; radio delta propagation is independent of that next step.
 
 ## Appliance ownership
 

@@ -81,7 +81,14 @@ pub(crate) fn run(
         let milliseconds = ((now as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
         forwarder.expire(milliseconds);
         #[cfg(feature = "host-link")]
-        if let Some(outgoing) = host.poll(&mut forwarder, local, network, milliseconds) {
+        if let Some(outgoing) = host.poll(
+            &mut forwarder,
+            &description,
+            native,
+            &mut invocations,
+            &context,
+            milliseconds,
+        ) {
             if !send(radio, outgoing, &mut sequence, &mut outgoing_buffer) {
                 forwarder.transmit_failed(&outgoing);
                 host.transmit_failed(&mut forwarder);
@@ -114,6 +121,18 @@ pub(crate) fn run(
             timeout.min(crate::milliseconds_to_ticks_checked(ms as u64).unwrap())
         });
         if let Some(message) = receive(radio, local, network.channel, &mut buffer, timeout) {
+            #[cfg(feature = "host-link")]
+            if matches!(message.content,
+                Content::LinkEntry { read, .. } if read.reader == local)
+                || matches!(message.content, Content::SurfacePart { read, .. } if read.reader == local)
+                || matches!(message.content, Content::StateValue { read, .. } if read.reader == local)
+                || matches!(message.content, Content::InvocationResult { call, .. } if call.caller == local)
+            {
+                let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
+                    / crate::configTICK_RATE_HZ as u64) as u32;
+                host.complete(&mut forwarder, message, now);
+                continue;
+            }
             if let Content::LinkExchange { network: n, .. } = message.content {
                 if n == network {
                     let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
@@ -126,12 +145,6 @@ pub(crate) fn run(
             {
                 let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
                     / crate::configTICK_RATE_HZ as u64) as u32;
-                #[cfg(feature = "host-link")]
-                if matches!(message.content, Content::LinkEntry { read, .. } if read.reader == local)
-                {
-                    host.complete(&mut forwarder, message, now);
-                    continue;
-                }
                 if let Some(reply) = forwarder.receive_links(message, now) {
                     if !send(radio, reply, &mut sequence, &mut outgoing_buffer) {
                         forwarder.transmit_failed(&reply);
@@ -253,7 +266,9 @@ pub(crate) fn run(
                 }
                 let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
                     / crate::configTICK_RATE_HZ as u64) as u32;
-                if let Some(reply) = forwarder.receive(message, &description, &mut piece, now) {
+                if let Some(reply) =
+                    forwarder.receive_surface(message, &description, &mut piece, now)
+                {
                     if !send(radio, reply, &mut sequence, &mut outgoing_buffer) {
                         forwarder.transmit_failed(&reply);
                     }
