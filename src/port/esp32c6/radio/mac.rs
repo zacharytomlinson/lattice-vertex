@@ -24,9 +24,8 @@ use esp_wifi_sys_esp32c6::include::{
 
 const PHY_ENABLE_VERSION_PRINT: u8 = 0;
 
-/// ACK receive timeout in microseconds (200ms), matching the C driver's
-/// `receive_ack_timeout_timer_start(200000)`.
-const ACK_TIMEOUT_US: u32 = 200_000;
+/// IEEE 802.15.4 immediate-ACK wait, 54 symbols.
+const ACK_TIMEOUT_US: u32 = crate::kernel::radio::mac::ACK_WAIT_US;
 
 #[repr(C, align(4))]
 struct DmaBuffer([u8; FRAME_SIZE]);
@@ -265,6 +264,18 @@ pub fn prepare_reconfigure() {
         stop_current_operation_inner(state);
         state.state = Ieee802154State::Idle;
         state.rx_queue.clear();
+    });
+}
+
+pub fn waiting_for_ack() -> bool {
+    STATE.with(|state| state.state == Ieee802154State::RxAck)
+}
+
+pub fn cancel_transmit() {
+    STATE.with(|state| {
+        state.pending_tx = None;
+        stop_current_operation_inner(state);
+        state.state = Ieee802154State::Idle;
     });
 }
 
@@ -604,7 +615,7 @@ fn isr_handle_tx_done(needs_next_op: &mut bool) {
                 unsafe { core::slice::from_raw_parts(tx_frame.add(1), *tx_frame as usize) };
 
             if frame_is_ack_required(frame_data) && rx_auto_ack() {
-                // Wait for ACK - start 200ms timeout timer matching C driver
+                // Hardware changes to RX immediately; bound the ACK wait.
                 state.state = Ieee802154State::RxAck;
                 receive_ack_timeout_timer_start(ACK_TIMEOUT_US);
                 *needs_next_op = false;
@@ -756,7 +767,7 @@ fn isr_handle_timer0_done(needs_next_op: &mut bool) {
     // Timer0 fired while waiting for ACK - TX failed with no ACK
     timer0_stop();
     disable_events(Event::Timer0Overflow as u16);
-    super::tx_failed();
+    super::tx_no_ack();
     *needs_next_op = true;
 }
 
@@ -779,14 +790,14 @@ fn isr_handle_tx_abort(tx_abort_reason: u32, needs_next_op: &mut bool) {
             || r == TxAbortReason::RxAckTypeNotAck as u32
             || r == TxAbortReason::RxAckRestart as u32 =>
         {
-            super::tx_failed();
+            super::tx_no_ack();
             *needs_next_op = true;
         }
         // RX ACK timeout - no ACK received
         r if r == TxAbortReason::RxAckTimeout as u32 => {
             timer0_stop();
             disable_events(Event::Timer0Overflow as u16);
-            super::tx_failed();
+            super::tx_no_ack();
             *needs_next_op = true;
         }
         // TX coex break - notify coex manager
@@ -802,12 +813,12 @@ fn isr_handle_tx_abort(tx_abort_reason: u32, needs_next_op: &mut bool) {
         }
         // CCA failed
         r if r == TxAbortReason::CcaFailed as u32 => {
-            super::tx_failed();
+            super::tx_busy();
             *needs_next_op = true;
         }
         // CCA busy
         r if r == TxAbortReason::CcaBusy as u32 => {
-            super::tx_failed();
+            super::tx_busy();
             *needs_next_op = true;
         }
         _ => {}
@@ -827,7 +838,7 @@ fn should_send_enhanced_ack(frame: &[u8]) -> bool {
 }
 
 /// Start the ACK receive timeout timer.
-/// Duration is in microseconds. The C driver uses 200000 (200ms).
+/// Duration is in microseconds.
 fn receive_ack_timeout_timer_start(duration: u32) {
     enable_events(Event::Timer0Overflow as u16);
     timer0_set_threshold(duration);

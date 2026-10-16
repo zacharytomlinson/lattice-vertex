@@ -135,8 +135,17 @@ frame through the ordinary receive path. The maximum wait accounts for a full
 250-kbit/s frame, turnaround, and tick quantization; at 1 kHz it is six ticks.
 An in-progress PHY frame gets a bounded completion interval before cancellation
 for a deadline or new local work. Four owned frame records preserve captures across consecutive send calls, with
-oldest eviction under pressure. Neither packet transmission nor native execution
-is retried. Raw probe workloads and bootstrap retain their own receive windows.
+oldest eviction under pressure. Addressed peer frames request MAC ACKs and have
+at most four identical transmission attempts with bounded randomized backoff.
+Broadcasts remain single attempts. Native execution is not separately retried.
+Raw probe workloads and bootstrap retain their own receive windows.
+
+Portable checks beside `mac.rs` cover ACK target/sequence validation, duplicate
+suppression after lost ACKs, distinct senders, DSN/timer wrap, bounded history
+expiry/eviction, and retry timing bounds. The frame codec checks ACK requests are
+limited to unicast. Nordic immediate ACK turnaround belongs to its radio IRQ;
+C6 uses its hardware MAC. Hardware captures and deliberate loss experiments stay
+in the external lab.
 
 Portable checks beside `receive.rs` cover owned-byte retention, FIFO/eviction,
 channel reset, tick rounding, in-progress frame completion across tick wrap, and

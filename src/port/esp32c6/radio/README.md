@@ -15,7 +15,11 @@ APIs; use an aligned static DMA receive buffer and four fixed receive entries;
 evict the oldest frame on overflow and report it to test instrumentation when
 enabled; replace arbitrary callbacks
 with kernel task wakers. The hardware-test workload sends frames without MAC ACK requests.
-One transmission is one attempt, with no application retry.
+Each port transmission is one attempt. Ordinary addressed peer frames enable
+hardware immediate ACK TX/RX, validate the returned ACK sequence, and bound the
+hardware ACK wait to 864 us. CCA-busy and missing-ACK outcomes reach the common
+kernel, which owns the four-attempt limit and backoff. Broadcasts and the raw
+probe workload do not request ACKs. No application invocation is regenerated.
 
 The linked `esp-wifi-sys-esp32c6` 0.2.0 `libbtbb.a` initializes baseband TX-on
 delay to 29, then initializes MAC TX-on/RX-on/TX-RX-switch values to 35/50/127.

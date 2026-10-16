@@ -2,6 +2,7 @@
 //! no executor thread, allocation, or graph scheduling is introduced.
 
 use super::{
+    mac,
     receive::{finish_frame_ticks, receive_turn_ticks, ReceiveBuffer},
     Error, MAX_FRAME_SIZE,
 };
@@ -94,6 +95,7 @@ fn local_pending() -> bool {
 #[derive(Clone, Copy)]
 enum WaitMode {
     Hardware,
+    Transmit,
     Receive { local_work: bool },
 }
 
@@ -105,6 +107,7 @@ fn wait<F: Future>(
 ) -> Option<F::Output> {
     let start = tasks::xTaskGetTickCount();
     let mut finish_started = None;
+    let mut ack_started = None;
     let mut future = pin!(future);
     let mut cx = Context::from_waker(waker);
     loop {
@@ -118,9 +121,16 @@ fn wait<F: Future>(
         } else {
             timeout.saturating_sub(now.wrapping_sub(start))
         };
+        if matches!(mode, WaitMode::Transmit) && port::Radio::waiting_for_ack() {
+            let since = *ack_started.get_or_insert(now);
+            let ticks = (u64::from(mac::ACK_WAIT_US) * crate::configTICK_RATE_HZ as u64)
+                .div_ceil(1_000_000) as TickType_t
+                + 1;
+            remaining = remaining.min(ticks.saturating_sub(now.wrapping_sub(since)));
+        }
         if interrupted || remaining == 0 {
-            let receiving =
-                matches!(mode, WaitMode::Receive { .. }) && port::Radio::receiving_frame();
+            let receiving = matches!(mode, WaitMode::Receive { .. } | WaitMode::Transmit)
+                && port::Radio::receiving_frame();
             remaining = finish_frame_ticks(
                 &mut finish_started,
                 now as u32,
@@ -144,6 +154,9 @@ pub struct Transport {
     radio: port::Radio,
     peer_runtime: bool,
     received: ReceiveBuffer,
+    duplicates: mac::Duplicates,
+    backoff: mac::Backoff,
+    pan: u16,
     waker: Waker,
     _task_context: PhantomData<*mut ()>,
 }
@@ -170,6 +183,8 @@ impl Transport {
 
     pub fn configure(&mut self, channel: u8, pan_id: u16) -> Result<(), Error> {
         self.received.clear();
+        self.duplicates = mac::Duplicates::new();
+        self.pan = pan_id;
         self.radio.configure(channel, pan_id)
     }
 
@@ -193,40 +208,97 @@ impl Transport {
         frame: &mut [u8; MAX_FRAME_SIZE],
         timeout: TickType_t,
     ) -> Option<Result<usize, Error>> {
-        if let Some(length) = self.received.pop(frame) {
-            return Some(Ok(length));
-        }
-        wait(
-            self.radio.receive(frame),
-            &self.waker,
-            timeout,
-            if self.peer_runtime {
-                WaitMode::Receive { local_work: true }
+        let start = tasks::xTaskGetTickCount();
+        loop {
+            let result = if let Some(length) = self.received.pop(frame) {
+                Some(Ok(length))
             } else {
-                WaitMode::Hardware
-            },
-        )
+                let remaining =
+                    timeout.saturating_sub(tasks::xTaskGetTickCount().wrapping_sub(start));
+                if remaining == 0 {
+                    return None;
+                }
+                wait(
+                    self.radio.receive(frame),
+                    &self.waker,
+                    remaining,
+                    if self.peer_runtime {
+                        WaitMode::Receive { local_work: true }
+                    } else {
+                        WaitMode::Hardware
+                    },
+                )
+            };
+            match result {
+                Some(Ok(length)) if !self.accept_received(&frame[..length]) => continue,
+                _ => return result,
+            }
+        }
+    }
+
+    fn accept_received(&mut self, frame: &[u8]) -> bool {
+        if mac::is_ack(frame) {
+            return false;
+        }
+        if mac::ack_for(frame, self.pan, self.address()).is_none() {
+            return true;
+        }
+        let ms =
+            ((tasks::xTaskGetTickCount() as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
+        self.duplicates.accept(frame, ms)
     }
 
     pub fn transmit(&mut self, frame: &[u8]) -> Result<(), Error> {
-        // No timeout drops active DMA. The driver retains its buffer until the
-        // hardware completes or aborts this single attempt.
-        let result = wait(
-            self.radio.transmit(frame),
-            &self.waker,
-            portMAX_DELAY,
-            WaitMode::Hardware,
-        )
-        .unwrap();
+        let acknowledged = mac::requests_ack(frame);
+        let attempts = if acknowledged { mac::ATTEMPTS } else { 1 };
+        let mut result = Err(Error::Aborted);
+        let mut unconfirmed = false;
+        for attempt in 0..attempts {
+            if attempt != 0 {
+                let delay = self
+                    .backoff
+                    .ticks(attempt - 1, crate::configTICK_RATE_HZ as u32);
+                self.capture_for(delay as TickType_t, false);
+            }
+            // The port performs one TX/ACK exchange. Its cancellation guard
+            // stops DMA before a bounded deadline can return its storage.
+            result = wait(
+                self.radio.transmit(frame, &mut self.received),
+                &self.waker,
+                if acknowledged {
+                    mac::attempt_ticks(crate::configTICK_RATE_HZ as u32) as TickType_t
+                } else {
+                    portMAX_DELAY
+                },
+                WaitMode::Transmit,
+            )
+            .unwrap_or(Err(Error::NoAcknowledgement));
+            unconfirmed |= result == Err(Error::NoAcknowledgement);
+            if result.is_ok()
+                || !matches!(result, Err(Error::NoAcknowledgement | Error::ChannelBusy))
+            {
+                break;
+            }
+        }
         if result.is_ok() && self.peer_runtime {
             self.receive_turn();
         }
-        result
+        if result.is_err() && unconfirmed {
+            Err(Error::NoAcknowledgement)
+        } else {
+            result
+        }
     }
 
     fn receive_turn(&mut self) {
+        self.capture_for(
+            receive_turn_ticks(crate::configTICK_RATE_HZ as u32) as TickType_t,
+            true,
+        );
+    }
+
+    fn capture_for(&mut self, window: TickType_t, first_only: bool) {
         let start = tasks::xTaskGetTickCount();
-        let window = receive_turn_ticks(crate::configTICK_RATE_HZ as u32) as TickType_t;
         let mut frame = [0; MAX_FRAME_SIZE];
         loop {
             let remaining = window.saturating_sub(tasks::xTaskGetTickCount().wrapping_sub(start));
@@ -234,7 +306,8 @@ impl Transport {
                 return;
             }
             // Pending local changes must not cancel this receive opportunity.
-            // Retain the first valid frame for ordinary dispatch after send returns.
+            // Retain frames for ordinary dispatch; receive turns end at the first,
+            // while retry backoff listens through the entire chosen interval.
             match wait(
                 self.radio.receive(&mut frame),
                 &self.waker,
@@ -242,13 +315,18 @@ impl Transport {
                 WaitMode::Receive { local_work: false },
             ) {
                 Some(Ok(length)) => {
+                    if mac::is_ack(&frame[..length]) {
+                        continue;
+                    }
                     let evicted = self.received.push(&frame[..length]);
                     #[cfg(feature = "test-support")]
                     if evicted {
                         super::testing::event(super::testing::Event::ReceiveEvicted);
                     }
                     let _ = evicted;
-                    return;
+                    if first_only {
+                        return;
+                    }
                 }
                 Some(Err(_)) => {
                     #[cfg(feature = "test-support")]
@@ -270,10 +348,14 @@ extern "C" fn run(_: *mut c_void) {
             &WAKER_VTABLE,
         ))
     };
+    let address = radio.address();
     let mut transport = Transport {
         radio,
         peer_runtime: false,
         received: ReceiveBuffer::new(),
+        duplicates: mac::Duplicates::new(),
+        backoff: mac::Backoff::new(address),
+        pan: 0,
         waker,
         _task_context: PhantomData,
     };

@@ -4,7 +4,7 @@ use super::MAX_FRAME_SIZE;
 
 const CAPACITY: usize = 4;
 
-pub(super) struct ReceiveBuffer {
+pub(crate) struct ReceiveBuffer {
     frames: [[u8; MAX_FRAME_SIZE]; CAPACITY],
     lengths: [u8; CAPACITY],
     first: usize,
@@ -20,7 +20,7 @@ impl ReceiveBuffer {
         }
     }
     /// Keep the latest frames under pressure. Return whether the oldest was evicted.
-    pub(super) fn push(&mut self, frame: &[u8]) -> bool {
+    pub(crate) fn push(&mut self, frame: &[u8]) -> bool {
         assert!(frame.len() <= MAX_FRAME_SIZE);
         let evicted = self.count == CAPACITY;
         if evicted {

@@ -112,7 +112,16 @@ exact arguments, and returned status. An identical duplicate returns that status
 Reusing caller/request for different content returns `ConflictingRequest`.
 These records are replaced in insertion order, and do not survive reboot.
 
-There are **no automatic command retries**. A caller must not use a fresh token to
+The MAC transport can retransmit an identical addressed frame up to three times
+when its ACK is missing or CCA is busy. The receiver ACKs a duplicate but suppresses
+its delivery while recent MAC history is resident. All copies retain the original
+call token and arguments; the owner call-history rules still apply after routing.
+An ACK proves one-hop frame reception, not native execution or physical completion.
+Exhausting MAC attempts after a transmission is uncertain delivery. The original
+call remains pending for its result/normal timeout, including a result received
+while waiting for the missing ACK. It is not immediately failed as unsent.
+
+There are **no automatic command retries with a new invocation identity**. A caller must not use a fresh token to
 retry an uncertain mutation as though it were an immutable surface read. Result
 replay is bounded by retained history; after eviction or reboot a repeated request
 can execute again. This is not an exactly-once guarantee or durable execution

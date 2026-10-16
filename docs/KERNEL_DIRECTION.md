@@ -160,8 +160,30 @@ buffer pressure. Formation keeps its existing rendezvous windows.
 This addresses the reproduced collision between a producer's next delta and a
 neighbor's rebroadcast of the preceding one. It also preserves immediate replies
 received before the transmitting peer returns to normal dispatch. The bounded
-receive opportunity is not an acknowledgement or a guarantee of delivery. No frame or native
-invocation is automatically retried; forwarding remains enabled.
+receive opportunity remains separate from link acknowledgement. Addressed frames
+request a 2006 immediate ACK. The resident task makes at most four attempts,
+retaining identical bytes and MAC sequence, with randomized bounded backoff.
+Broadcasts remain single transmissions. A missing ACK reports uncertain link
+delivery; an already-issued read/call remains pending for its normal reply deadline.
+It never originates a new native invocation or changes its request token. A CCA
+failure after an earlier unacknowledged transmission remains uncertain. A frame
+already arriving at the ACK deadline gets the same bounded completion grace as
+ordinary receive, preserving responses that overlap a lost ACK.
+
+`radio::mac` owns that bounded policy and eight recent sender/sequence records.
+Duplicate addressed frames are acknowledged again by the port but delivered only
+once while the sender record remains resident and younger than 200 ms. Records
+expire, evict oldest, and clear on channel configuration. The existing bounded
+native-call history still protects reconverging routes; neither mechanism is a
+persistent exactly-once guarantee across eviction or reboot.
+
+C6 uses hardware ACK TX/RX with an 864-us ACK timeout. Nordic receives through
+its port IRQ and uses hardware TIFS (192 us) for immediate ACK transmission;
+Embassy retains chip initialization and CCA/data TX. The common task rounds the
+Nordic ACK receive deadline to kernel ticks (up to two ticks at 1 kHz), bounded
+separately from an entire transmit attempt. Unrelated frames heard during an ACK
+wait or retry backoff enter the existing four-frame receive ring. Cancellation
+stops DMA before reusing its storage. All of this stays below appliance firmware.
 
 `kernel::Appliance::new(&SURFACE)` reserves the native instance's static storage
 and RTOS mutex. Firmware initializes it once before scheduler startup, then passes
@@ -253,8 +275,10 @@ in the `esp-rtos` scheduler. The generic CLINT port remains a separate target;
 both now use a compatible `riscv-rt` 0.16 dependency generation.
 
 The [Nordic radio port](../src/port/nrf52840/radio.rs) consumes
-`embassy-nrf`'s 802.15.4 packet driver and adds register-level energy detection
-on the same interrupt, because the HAL does not expose that operation. It also
+`embassy-nrf`'s initialization and CCA/transmit driver. Its
+[`radio/receive.rs`](../src/port/nrf52840/radio/receive.rs) owns aligned RX storage
+and immediate ACK turnaround in the RADIO IRQ. Register-level energy detection
+shares that IRQ because the HAL does not expose it. The port also
 restores the nRF52840 CCA correlation threshold/count after the HAL's whole-register
 mode write clears them; this is port initialization, not appliance policy.
 The [C6 radio port](../src/port/esp32c6/radio/mod.rs)
@@ -346,8 +370,8 @@ adopts the first established network it hears. Choosing between independently
 owned deployments and authorizing operations are not decided by that tag or PAN.
 The `LVT` version-6 envelope carries discovery, proposals, surface reads, native
 calls/results, and deltas; it rejects earlier wire versions. Ordinary discovery still
-repeats every 2–3 seconds after selection. Presence never causes an echo. MAC ACKs
-are not requested for these frames. No peer table, appliance formation/join knob,
+repeats every 2–3 seconds after selection. Presence never causes an echo. Broadcast discovery/proposals do not request ACKs;
+directed presence/proposal responses use the common MAC ACK path. No peer table, appliance formation/join knob,
 graph work queue, or repeated transformer invocation is introduced.
 
 The board fixture's `peer-observer` feature observes this normal path. It supplies
@@ -589,7 +613,7 @@ Use static task/control storage and bounded communication buffers. Fixed rings
 with explicit eviction are transport storage, not a graph-job queue. Choose packing,
 layout, and hardware offload against the target's actual memory and latency needs.
 The radio task has a fixed 8 KiB stack and a static task control block. Nordic
-uses the HAL's caller-owned DMA packet. C6 has an aligned static DMA buffer and
+uses the HAL's caller-owned TX packet, a 128-byte RX buffer, and a four-byte ACK buffer. C6 has an aligned static DMA buffer and
 four fixed receive entries, evicting the oldest frame on overflow. The common
 transport separately owns four raw-frame records for captures made while a send
 call gives the neighbors their receive turn; those bytes have left the port's DMA
@@ -629,8 +653,9 @@ flowchart TB
     exposure["peer::exposure: borrowed local IR and bounded range encoding"]
     links["peer::links: maintained adjacent peers, confirmation, refresh and cursor enumeration"]
     forwarding["peer::forwarding: bounded dissemination, return paths, cost-ranked directions, one invocation split"]
-    radio["Nordic/C6 radio ports: fixed buffers, energy/CCA, RX progress, hardware IRQs"]
+    radio["Nordic/C6 radio ports: fixed buffers, energy/CCA, immediate ACK, RX progress, hardware IRQs"]
     transport["kernel::radio: resident driver, notification waits and receive turns"]
+    mac["radio::mac: ACK matching, four attempts, backoff, eight recent senders"]
     rxbuffer["radio::receive: four owned frames captured before peer dispatch"]
     probe["src/kernel/radio/tests: transport probe, discovery counters and surface-range observer"]
     testentry["test-support only: scoped transport access and event hooks"]
@@ -694,6 +719,8 @@ flowchart TB
     startup -->|checks and borrows local description| exposure
     transport -->|retains frames captured after TX| rxbuffer
     rxbuffer -->|FIFO delivery through normal receive| transport
+    transport -->|bounded link delivery and duplicate filtering| mac
+    radio -->|ACK frame recognition| mac
     transport -->|owns selected driver| radio
     transport -->|ordinary resident task runs| discovery
     discovery -->|local exchanges, maintenance, and validated peer messages| forwarding
@@ -733,7 +760,7 @@ logging/upload entry; those are fixture facilities, not kernel requirements.
 
 Prior board bring-up exercised discovery and formation on C6, and Nordic/C6 peer
 exchange through the kernel. RF quality remains unresolved and the investigation
-is paused. Historical captures used older wire revisions and live in the external
+is active. Historical captures used older wire revisions and live in the external
 lab; they do not establish current protocol delivery or general loss-free operation.
 
 The current LVT v6 path has host tests and both MCU builds: borrowed surface range
@@ -744,9 +771,11 @@ deltas. Tests cover argument/reference rejection, retained command replay, actua
 and grouped-delta ordering. Kernel task/protocol behavior remains in common source;
 portable codecs, fixture counters, and hardware logging live in separate test crates.
 
-Authentication, tablet consumer integration, installed compiled fragments, and
-their distributed activation remain open. Local dependents are immediate native callbacks, not an installed distributed DAG. The current
-manual-control message path has not yet had an end-to-end hardware run.
+Authentication, tablet UI integration, installed compiled fragments, and
+their distributed activation remain open. Local dependents are immediate native
+callbacks, not an installed distributed DAG. The Linux/tablet USB companion path
+has exercised native calls, state reads and pushed deltas on Nordic hardware;
+this does not establish physical appliance behavior or loss-free RF.
 
 ## Next implementation sequence
 

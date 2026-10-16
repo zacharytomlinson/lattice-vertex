@@ -6,7 +6,7 @@ mod mac;
 mod registers;
 mod settings;
 
-use crate::kernel::radio::{Error, MAX_FRAME_SIZE};
+use crate::kernel::radio::{mac as link, receive::ReceiveBuffer, Error, MAX_FRAME_SIZE};
 use core::{
     future::poll_fn,
     sync::atomic::{AtomicI16, AtomicU8, Ordering},
@@ -49,6 +49,14 @@ fn tx_done() {
     TX_STATUS.store(1, Ordering::Release);
     TX_WAKER.wake();
 }
+fn tx_no_ack() {
+    TX_STATUS.store(4, Ordering::Release);
+    TX_WAKER.wake();
+}
+fn tx_busy() {
+    TX_STATUS.store(3, Ordering::Release);
+    TX_WAKER.wake();
+}
 fn tx_failed() {
     TX_STATUS.store(2, Ordering::Release);
     TX_WAKER.wake();
@@ -84,8 +92,8 @@ impl Radio {
         mac::set_short_address(0, 0xfffe);
         mac::set_extended_address(0, self.address().to_le_bytes());
         mac::set_promiscuous(false);
-        mac::set_auto_ack_tx(false);
-        mac::set_auto_ack_rx(false);
+        mac::set_auto_ack_tx(true);
+        mac::set_auto_ack_rx(true);
         mac::set_enhance_ack_tx(false);
         mac::set_rx_when_idle(true);
         Ok(())
@@ -148,22 +156,50 @@ impl Radio {
         Ok(length)
     }
 
-    pub async fn transmit(&mut self, frame: &[u8]) -> Result<(), Error> {
+    pub(crate) fn waiting_for_ack() -> bool {
+        mac::waiting_for_ack()
+    }
+
+    pub async fn transmit(
+        &mut self,
+        frame: &[u8],
+        _received: &mut ReceiveBuffer,
+    ) -> Result<(), Error> {
         if !(3..=MAX_FRAME_SIZE).contains(&frame.len()) {
             return Err(Error::InvalidFrame);
         }
         self.transmit.0[0] = (frame.len() + 2) as u8;
         self.transmit.0[1..1 + frame.len()].copy_from_slice(frame);
+        struct Cancel(bool);
+        impl Drop for Cancel {
+            fn drop(&mut self) {
+                if self.0 {
+                    mac::cancel_transmit();
+                }
+            }
+        }
+        let mut cancel = Cancel(true);
         TX_STATUS.store(0, Ordering::Release);
         mac::ieee802154_transmit(self.transmit.0.as_ptr(), true);
-        poll_fn(|cx| {
+        let result = poll_fn(|cx| {
             TX_WAKER.register(cx.waker());
             match TX_STATUS.load(Ordering::Acquire) {
                 0 => Poll::Pending,
                 1 => Poll::Ready(Ok(())),
+                3 => Poll::Ready(Err(Error::ChannelBusy)),
+                4 => Poll::Ready(Err(Error::NoAcknowledgement)),
                 _ => Poll::Ready(Err(Error::Aborted)),
             }
         })
-        .await
+        .await;
+        cancel.0 = false;
+        result?;
+        if link::requests_ack(frame)
+            && !mac::get_ack_frame()
+                .is_some_and(|ack| ack.data[0] == 5 && link::matches_ack(&ack.data[1..4], frame[2]))
+        {
+            return Err(Error::NoAcknowledgement);
+        }
+        Ok(())
     }
 }

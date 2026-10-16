@@ -105,7 +105,12 @@ reads (4–5, 11–12), native invocation/result and deltas (8–10), and link o
 [INVOCATION.md](INVOCATION.md#one-frame-per-call-read-result-or-delta). Older wire
 versions are rejected. MAC framing still uses numeric 2006 data frames,
 compressed PAN `0x4c56`, extended source, and broadcast or extended destination.
-No MAC ACK is requested. Integers are little-endian.
+Extended unicast destinations request a MAC ACK; broadcasts do not. The common
+radio transport makes at most four attempts of the identical addressed frame,
+then reports uncertain delivery. This does not retry the application read with a
+new token. Integers are little-endian. Receivers also accept addressed data without
+an ACK request; older firmware that rejects the ACK bit needs updating before it
+can consume the new addressed transmissions.
 
 Read and range-reply messages begin after their opcode with the network founder (`u64`) and
 channel (`u8`), followed by a `SurfaceRead`: reader (`u64`), owner (`u64`), request

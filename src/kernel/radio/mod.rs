@@ -17,7 +17,10 @@ pub(crate) use task::start;
 pub mod testing;
 
 #[cfg(any(test, feature = "port-nrf52840", feature = "port-esp32c6"))]
-mod receive;
+pub(crate) mod receive;
+
+#[cfg(any(test, feature = "port-nrf52840", feature = "port-esp32c6"))]
+pub(crate) mod mac;
 
 /// Maximum MAC frame size, excluding the hardware checksum.
 pub const MAX_FRAME_SIZE: usize = 125;
@@ -28,5 +31,7 @@ pub enum Error {
     InvalidConfiguration,
     InvalidFrame,
     ChannelBusy,
+    /// No matching link acknowledgement; peer execution remains unknown.
+    NoAcknowledgement,
     Aborted,
 }

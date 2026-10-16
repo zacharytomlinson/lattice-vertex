@@ -430,7 +430,7 @@ impl<'a> Message<'a> {
             header: Header {
                 frame_type: FrameType::Data,
                 frame_pending: false,
-                ack_request: false,
+                ack_request: self.destination.is_some(),
                 pan_id_compress: true,
                 seq_no_suppress: false,
                 ie_present: false,
@@ -459,8 +459,8 @@ impl<'a> Message<'a> {
             return Err(InvalidFrame);
         }
         // Exact profile: 2006 data, compressed PAN, extended source, short
-        // broadcast/extended destination, no ACK/security/IEs/reserved bits.
-        if bytes[0] != 0x41 || !matches!(bytes[1], 0xd8 | 0xdc) {
+        // broadcast/extended destination, optional unicast ACK, no security/IEs.
+        if !matches!((bytes[0], bytes[1]), (0x41, 0xd8 | 0xdc) | (0x61, 0xdc)) {
             return Err(InvalidFrame);
         }
         let frame: Frame = bytes
@@ -1862,7 +1862,7 @@ mod tests {
                     content: Content::Present(network),
                 },
                 &[
-                    0x41, 0xdc, 42, 0x56, 0x4c, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 8,
+                    0x61, 0xdc, 42, 0x56, 0x4c, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 8,
                     7, 6, 5, 4, 3, 2, 1, b'L', b'V', b'T', 6, 1, 0x28, 0x27, 0x26, 0x25, 0x24,
                     0x23, 0x22, 0x21, 23,
                 ],
@@ -1902,7 +1902,6 @@ mod tests {
                 (3, 0xff),
                 (4, 0xff),
                 (0, 0x49),
-                (0, 0x61),
                 (0, 0xc1),
                 (1, 0xe8),
                 (1, 0xd9),
@@ -1917,6 +1916,16 @@ mod tests {
                     Message::decode(&bad[..n], B, 23).is_err(),
                     "mutation {offset}:{value}"
                 );
+            }
+            let mut ack = out;
+            ack[0] = 0x61;
+            assert_eq!(
+                Message::decode(&ack[..n], B, 23).is_ok(),
+                message.destination.is_some()
+            );
+            if message.destination.is_some() {
+                ack[0] = 0x41;
+                assert_eq!(&Message::decode(&ack[..n], B, 23).unwrap(), message);
             }
             for source in [0u64, u64::MAX] {
                 let mut bad = out;

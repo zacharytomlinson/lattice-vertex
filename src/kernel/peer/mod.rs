@@ -353,7 +353,9 @@ fn send(
             }
         });
     }
-    result.is_ok()
+    // Missing ACK is uncertain delivery. Keep the existing read/call pending
+    // for its reply; do not invent another request or discard an early result.
+    super::radio::mac::delivery_possible(result)
 }
 
 #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]

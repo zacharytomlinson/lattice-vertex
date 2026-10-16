@@ -42,7 +42,7 @@ The on-air discovery profile is:
 
 | Field | Encoding |
 | --- | --- |
-| MAC | 2006 data frame, compressed PAN, extended source, sequence byte, no requested ACK |
+| MAC | 2006 data frame, compressed PAN, extended source, sequence byte; ACK requested only for extended unicast |
 | Discovery destination | PAN `0x4c56`, short broadcast `0xffff` |
 | Presence destination | PAN `0x4c56`, requesting peer's extended address |
 | Proposal destination | Broadcast solicits an answer; directed reply carries the candidate's preferred record |
