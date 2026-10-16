@@ -3,8 +3,7 @@
 
 use super::{Network, PAN_ID};
 #[cfg(test)]
-use crate::ir::Integer;
-use crate::ir::Value;
+use crate::ir::{Integer, Value};
 use crate::kernel::radio::MAX_FRAME_SIZE;
 use byte::BytesExt;
 use ieee802154::mac::{
@@ -37,13 +36,7 @@ pub(super) struct Invocation {
     pub transformer: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct StateDelta {
-    pub owner: u64,
-    pub attribute: u64,
-    pub sequence: u32,
-    pub value: Option<Value>,
-}
+pub(super) use lattice_peer_wire::StateChange;
 
 /// Presence metadata only; no mathematical definition or live value is copied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,7 +142,7 @@ pub(super) enum Content<'a> {
     },
     StateChanged {
         network: Network,
-        delta: StateDelta,
+        delta: StateChange,
         hops: u8,
     },
     ReadState {
@@ -713,7 +706,7 @@ impl<'a> Message<'a> {
                 };
                 Content::StateChanged {
                     network,
-                    delta: StateDelta {
+                    delta: StateChange {
                         owner,
                         attribute,
                         sequence,
@@ -1524,7 +1517,7 @@ mod tests {
                 destination: None,
                 content: Content::StateChanged {
                     network,
-                    delta: StateDelta {
+                    delta: StateChange {
                         owner: A,
                         attribute: 42,
                         sequence: 17,
@@ -1538,7 +1531,7 @@ mod tests {
                 destination: None,
                 content: Content::StateChanged {
                     network,
-                    delta: StateDelta {
+                    delta: StateChange {
                         owner: A,
                         attribute: 42,
                         sequence: 18,
@@ -1552,7 +1545,7 @@ mod tests {
                 destination: None,
                 content: Content::StateChanged {
                     network,
-                    delta: StateDelta {
+                    delta: StateChange {
                         owner: A,
                         attribute: 42,
                         sequence: 19,

@@ -527,12 +527,18 @@ byte and rejects older wire versions.
 ## Attached tablet host
 
 The tablet and its attached nRF use one resident network identity. The new optional
-`host-link` feature adds one fixed local request/response exchange, without USB
-code in the common kernel or a new radio configuration API. The Linux client and
+`host-link` feature adds one fixed local request/response exchange and eight
+pending change records, without USB code in the common kernel or a new radio
+configuration API. The Linux client and
 maintained XIAO attachment firmware live in `lattice-tablet`. Ordinary appliance
 builds do not include this feature. Its operations now include status, link/surface/state reads, and native calls.
 The Linux client can inspect a complete LSF description and consume its exposed
-references. Host delta streaming and Slint presentation remain subsequent work.
+references. Registered local changes and accepted, deduplicated remote deltas
+stream to an attached host without state polling. Ready replies have priority over
+loss notices and pending changes; overflow evicts the oldest event and reports the
+count. Disconnect clears this event buffer. It is not a retained state mirror or
+a graph work queue. Slint presentation and continuous daemon operation remain
+subsequent work.
 
 Local read and call origins share the existing return-path budgets and route
 learning. Local native requests use the same appliance binding and result replay
@@ -611,7 +617,7 @@ flowchart TB
     hal["esp-hal startup, timers, and interrupt routing: C6 only"]
     smoke["Nordic and C6 test firmware beside their ports"]
     usbconsole["Nordic fixture only: USB diagnostics and XIAO serial-DFU entry"]
-    hostlink["Optional kernel::host: fixed local exchange, read/call origins"]
+    hostlink["Optional kernel::host: fixed exchange, read/call origins, bounded change delivery"]
     hostwire["peer/wire: shared scalar codec and optional host records"]
     tabletradio["lattice-tablet firmware: XIAO USB and host task"]
     tabletpeer["lattice-tablet peer: Linux serial client"]
@@ -632,16 +638,16 @@ flowchart TB
     smoke -->|optional USB console feature| usbconsole
     usbconsole -->|low-priority reporter uses existing task API| tasks
     usbconsole -->|USB peripheral driver| nordic
-    tabletradio -->|binary requests and completions| hostlink
+    tabletradio <-->|requests, completions and pushed changes| hostlink
     tabletradio -->|USB peripheral driver| nordic
-    tabletpeer -->|USB stream| tabletradio
+    tabletpeer <-->|USB stream| tabletradio
     tabletpeer -->|codec| hostwire
     hostlink -->|codec and records| hostwire
     discovery -->|shared scalar/status encoding| hostwire
     exposure -->|shared typed literals| hostwire
     hostlink -->|wake resident task| transport
-    discovery -->|service local host| hostlink
-    hostlink -->|originate and complete reads| forwarding
+    discovery -->|service requests and publish registered or accepted changes| hostlink
+    hostlink -->|originate and complete reads and calls| forwarding
     probe -->|installs transport workload or observes peers and surface ranges| testentry
     testentry -->|uses normal task and scheduler startup| startup
     testentry -->|passes resident transport to workload| transport
@@ -723,7 +729,8 @@ implemented using the existing read return paths and resident task. Cost-ranked
 alternate directions and a bounded invocation split now preserve message identity
 through independent and reconverging paths. A Linux host client and XIAO USB
 attachment now originate local/remote link,
-surface, and state reads plus native calls through that runtime. The shared local codec and optional kernel host endpoint are
+surface, and state reads plus native calls through that runtime; registered changes
+now stream through USB without host polling. The shared local codec and optional kernel host endpoint are
 [documented beside their owner](../src/kernel/peer/host/README.md). Tablet UI/service
 integration, broader hardware validation, and adaptive delivery/coverage policy
 remain open. Native duplicate
@@ -764,8 +771,9 @@ history is bounded and volatile; this is not an exactly-once ledger.
    reduced to appliance definitions and physical I/O.
    Native binding, owner-directed calls/results, registered observation capture,
    scoped delta forwarding, and on-demand current-state reads are implemented and
-   checked on the host. Both MCU images build. The tablet daemon, hardware exercise
-   of this path, and installed conditional activation remain open.
+   checked on the host. The attached-host path now delivers accepted deltas with
+   bounded buffering and explicit local-loss notices. Both MCU images build. The
+   tablet daemon and installed conditional activation remain open.
 
 Extend that working path into compiled-fragment installation, conditional
 activation, and their forwarding semantics. Native transformer invocation is now

@@ -4,8 +4,10 @@
 
 pub const MAX_PACKET: usize = 128;
 use crate::scalar::{decode_value, encode_arguments, encode_value, valid_arguments};
-use crate::{InvokeStatus, StateReadResult, Value, CALL_ARGUMENT_BYTES, SURFACE_BYTES};
-const VERSION: u8 = 2;
+use crate::{
+    InvokeStatus, StateChange, StateReadResult, Value, CALL_ARGUMENT_BYTES, SURFACE_BYTES,
+};
+const VERSION: u8 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -116,6 +118,14 @@ pub enum Packet {
         transformer: u64,
         status: InvokeStatus,
     },
+    /// Unsolicited registered state, never inferred from invocation success.
+    Changed {
+        change: StateChange,
+    },
+    /// Oldest events evicted while the local host was attached but not draining.
+    ChangesLost {
+        dropped: u32,
+    },
     Error {
         token: u32,
         failure: Failure,
@@ -124,6 +134,7 @@ pub enum Packet {
 impl Packet {
     pub fn token(self) -> u32 {
         match self {
+            Self::Changed { .. } | Self::ChangesLost { .. } => 0,
             Self::Status { token }
             | Self::ReadLinks { token, .. }
             | Self::Ready { token, .. }
@@ -279,6 +290,23 @@ impl Packet {
                 body[14..22].copy_from_slice(&transformer.to_le_bytes());
                 body[22] = status as u8;
                 23
+            }
+            Self::Changed { change } => {
+                body[1] = 0x90;
+                body[6..14].copy_from_slice(&change.owner.to_le_bytes());
+                body[14..22].copy_from_slice(&change.attribute.to_le_bytes());
+                body[22..26].copy_from_slice(&change.sequence.to_le_bytes());
+                if let Some(value) = change.value {
+                    26 + encode_value(value, &mut body[26..])
+                } else {
+                    body[26] = 255;
+                    27
+                }
+            }
+            Self::ChangesLost { dropped } => {
+                body[1] = 0x91;
+                body[6..10].copy_from_slice(&dropped.to_le_bytes());
+                10
             }
             Self::Error { failure, .. } => {
                 body[1] = 0xff;
@@ -467,6 +495,31 @@ fn decode_body(b: &[u8]) -> Option<Packet> {
                 _ => return None,
             },
         },
+        (0x90, 27..=35) if token == 0 => {
+            let state = if b[26] == 255 {
+                if b.len() != 27 {
+                    return None;
+                }
+                None
+            } else {
+                let (v, n) = decode_value(&b[26..])?;
+                if b.len() != 26 + n {
+                    return None;
+                }
+                Some(v)
+            };
+            Packet::Changed {
+                change: StateChange {
+                    owner: value(6),
+                    attribute: value(14),
+                    sequence: u32::from_le_bytes(b[22..26].try_into().ok()?),
+                    value: state,
+                },
+            }
+        }
+        (0x91, 10) if token == 0 => Packet::ChangesLost {
+            dropped: u32::from_le_bytes(b[6..10].try_into().ok()?),
+        },
         (0xff, 7) => Packet::Error {
             token,
             failure: match b[6] {
@@ -488,6 +541,23 @@ mod tests {
     fn stream_boundaries_and_invalid_records_do_not_change_messages() {
         let records = [
             Packet::Status { token: 0 },
+            Packet::Changed {
+                change: StateChange {
+                    owner: 19,
+                    attribute: 123,
+                    sequence: u32::MAX,
+                    value: Some(Value::integer(crate::Integer::I64, i64::MIN as i128).unwrap()),
+                },
+            },
+            Packet::Changed {
+                change: StateChange {
+                    owner: 19,
+                    attribute: 123,
+                    sequence: 0,
+                    value: None,
+                },
+            },
+            Packet::ChangesLost { dropped: u32::MAX },
             Packet::ReadLinks {
                 token: u32::MAX,
                 owner: 0x0100020003000400,
@@ -586,6 +656,23 @@ mod tests {
             );
         }
         assert_eq!(decode_body(&[1, 0, 0, 0, 0, 0]), None);
+        assert_eq!(decode_body(&[2, 0, 0, 0, 0, 0]), None);
+        let mut change = [0; 28];
+        change[0] = VERSION;
+        change[1] = 0x90;
+        change[26] = 255;
+        assert!(decode_body(&change[..27]).is_some());
+        assert_eq!(
+            decode_body(&change),
+            None,
+            "unavailable cannot carry trailing bytes"
+        );
+        change[2] = 1;
+        assert_eq!(
+            decode_body(&change[..27]),
+            None,
+            "events require reserved token zero"
+        );
         assert_eq!(decode_body(&[1, 0, 0, 0, 0, 0, 0]), None);
     }
 }

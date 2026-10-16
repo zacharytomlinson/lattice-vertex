@@ -5,7 +5,7 @@
 use super::{
     exposure::Description,
     frame::{
-        Content, Invocation, InvokeStatus, LinkPhase, LinkRead, Message, StateDelta, StateRead,
+        Content, Invocation, InvokeStatus, LinkPhase, LinkRead, Message, StateChange, StateRead,
         StateReadResult, SurfaceOwner, SurfaceRead, CALL_ARGUMENT_BYTES, MAX_HOPS, SURFACE_BYTES,
     },
     links::Links,
@@ -806,7 +806,7 @@ impl Forwarder {
             destination: None,
             content: Content::StateChanged {
                 network: self.network,
-                delta: StateDelta {
+                delta: StateChange {
                     owner: self.local,
                     attribute,
                     sequence,
@@ -822,7 +822,7 @@ impl Forwarder {
         incoming: Message<'_>,
         now: u32,
         mut send: impl FnMut(Message<'static>),
-    ) -> Option<StateDelta> {
+    ) -> Option<StateChange> {
         self.expire(now);
         let Content::StateChanged {
             network,
@@ -2319,7 +2319,7 @@ mod tests {
             destination: None,
             content: Content::StateChanged {
                 network,
-                delta: StateDelta {
+                delta: StateChange {
                     owner: 4,
                     attribute: 42,
                     sequence: 1,
@@ -2340,7 +2340,7 @@ mod tests {
             source: 3,
             content: Content::StateChanged {
                 network,
-                delta: StateDelta {
+                delta: StateChange {
                     owner: 4,
                     attribute: 42,
                     sequence: 2,

@@ -1,5 +1,5 @@
-//! One bounded local host exchange with the resident peer. USB belongs to the
-//! board firmware; this module owns request admission and the local read origin.
+//! Bounded host requests and registered-change delivery from the resident peer.
+//! USB belongs to the board firmware; this module owns admission and buffering.
 //! No allocation, configuration override, retry, or foreign-surface registry.
 
 use super::{
@@ -11,7 +11,9 @@ use super::{
 use crate::kernel::appliance::Native;
 use crate::{port, sync::TaskContext, types::UBaseType_t};
 pub use lattice_peer_wire::host::{Arguments, Bytes, Decoder, Failure, Packet, MAX_PACKET};
+pub use lattice_peer_wire::StateChange;
 use lattice_peer_wire::{CALL_ARGUMENT_BYTES, SURFACE_BYTES};
+const CHANGE_CAPACITY: usize = 8;
 const READ_TIMEOUT_MS: u32 = 8_000;
 
 struct Mailbox {
@@ -19,6 +21,11 @@ struct Mailbox {
     busy: bool,
     request: Option<Packet>,
     response: Option<Packet>,
+    attached: bool,
+    changes: [Option<StateChange>; CHANGE_CAPACITY],
+    first: usize,
+    count: usize,
+    dropped: u32,
 }
 impl Mailbox {
     const fn new() -> Self {
@@ -27,6 +34,11 @@ impl Mailbox {
             busy: false,
             request: None,
             response: None,
+            attached: false,
+            changes: [None; CHANGE_CAPACITY],
+            first: 0,
+            count: 0,
+            dropped: 0,
         }
     }
 }
@@ -61,20 +73,53 @@ pub fn submit(_context: &TaskContext, request: Packet) -> Result<(), Failure> {
     crate::kernel::radio::task::notify_work();
     Ok(())
 }
+/// Start delivery of subsequent changes. No snapshot or pre-attachment replay.
+pub fn connect(_context: &TaskContext) {
+    access(|m| m.attached = true);
+}
+/// Drain a reply first, then any loss notice, then registered changes in order.
 pub fn receive(_context: &TaskContext) -> Option<Packet> {
     access(|m| {
-        let result = m.response.take()?;
-        m.busy = false;
-        Some(result)
+        if let Some(response) = m.response.take() {
+            m.busy = false;
+            return Some(response);
+        }
+        if m.dropped != 0 {
+            return Some(Packet::ChangesLost {
+                dropped: core::mem::take(&mut m.dropped),
+            });
+        }
+        if m.count == 0 {
+            return None;
+        }
+        let change = m.changes[m.first].take().unwrap();
+        m.first = (m.first + 1) % CHANGE_CAPACITY;
+        m.count -= 1;
+        Some(Packet::Changed { change })
     })
+}
+/// Called only for a locally registered or accepted, deduplicated remote delta.
+pub(super) fn publish(change: StateChange) {
+    access(|m| {
+        if !m.attached {
+            return;
+        }
+        if m.count == CHANGE_CAPACITY {
+            m.changes[m.first] = None;
+            m.first = (m.first + 1) % CHANGE_CAPACITY;
+            m.count -= 1;
+            m.dropped = m.dropped.saturating_add(1);
+        }
+        m.changes[(m.first + m.count) % CHANGE_CAPACITY] = Some(change);
+        m.count += 1;
+    });
 }
 /// Abandon the USB session. Old radio completions cannot satisfy a new session.
 pub fn disconnect(_context: &TaskContext) {
     access(|m| {
-        m.generation = m.generation.wrapping_add(1);
-        m.busy = false;
-        m.request = None;
-        m.response = None;
+        let generation = m.generation.wrapping_add(1);
+        *m = Mailbox::new();
+        m.generation = generation;
     });
     #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
     crate::kernel::radio::task::notify_work();

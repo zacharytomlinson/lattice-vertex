@@ -101,6 +101,10 @@ pub(crate) fn run(
                 change.value,
                 milliseconds,
             );
+            #[cfg(feature = "host-link")]
+            if let Content::StateChanged { delta, .. } = message.content {
+                host::publish(delta);
+            }
             send(radio, message, &mut sequence, &mut outgoing_buffer);
         }
         if now.wrapping_sub(last_discovery) >= period {
@@ -189,6 +193,10 @@ pub(crate) fn run(
                 let received = forwarder.receive_change(message, now, |out| {
                     send(radio, out, &mut sequence, &mut outgoing_buffer);
                 });
+                #[cfg(feature = "host-link")]
+                if let Some(delta) = received {
+                    host::publish(delta);
+                }
                 #[cfg(feature = "test-support")]
                 if let Some(delta) = received {
                     super::radio::testing::event(

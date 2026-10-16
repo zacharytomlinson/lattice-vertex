@@ -560,3 +560,100 @@ fn rebooted_reader_does_not_deliberately_restart_at_token_one() {
     }
     disconnect(&context);
 }
+
+#[test]
+fn attached_changes_are_bounded_independent_of_replies_and_end_with_the_session() {
+    crate::port::test_port_reset();
+    access(|m| *m = Mailbox::new());
+    let context = unsafe { TaskContext::assume() };
+    let change = |sequence| StateChange {
+        owner: 2,
+        attribute: 11,
+        sequence,
+        value: Some(Value::boolean(true)),
+    };
+    publish(change(0));
+    connect(&context);
+    assert_eq!(receive(&context), None, "no pre-attachment history");
+    submit(&context, Packet::Status { token: 1 }).unwrap();
+    publish(change(1));
+    assert_eq!(
+        receive(&context),
+        Some(Packet::Changed { change: change(1) })
+    );
+    assert_eq!(
+        submit(&context, Packet::Status { token: 2 }),
+        Err(Failure::Busy),
+        "draining an event must not release an outstanding request"
+    );
+    let network = Network {
+        founder: 1,
+        channel: 15,
+    };
+    let mut local = Forwarder::new(1, network);
+    let mut host = Host::new();
+    poll(&mut host, &mut local, 0);
+    for sequence in 2..12 {
+        publish(change(sequence));
+    }
+    assert!(
+        matches!(receive(&context), Some(Packet::Ready { token: 1, .. })),
+        "event overflow must not overwrite or delay the command reply"
+    );
+    assert_eq!(receive(&context), Some(Packet::ChangesLost { dropped: 2 }));
+    for sequence in 4..12 {
+        assert_eq!(
+            receive(&context),
+            Some(Packet::Changed {
+                change: change(sequence)
+            })
+        );
+    }
+    assert_eq!(receive(&context), None);
+
+    // The resident path exposes only changes accepted by ordinary network and
+    // duplicate validation. Re-forwarded copies cannot become new host events.
+    let mut remote = Forwarder::new(2, network);
+    let message = remote.announce_change(11, 12, None, 1);
+    for _ in 0..2 {
+        if let Some(delta) = local.receive_change(message, 2, |_| {}) {
+            publish(delta);
+        }
+    }
+    assert_eq!(
+        receive(&context),
+        Some(Packet::Changed {
+            change: StateChange {
+                value: None,
+                ..change(12)
+            }
+        })
+    );
+    assert_eq!(receive(&context), None);
+    let mut foreign = Forwarder::new(
+        3,
+        Network {
+            founder: 3,
+            channel: 15,
+        },
+    );
+    assert!(local
+        .receive_change(foreign.announce_change(11, 1, None, 3), 4, |_| {})
+        .is_none());
+
+    publish(change(13));
+    disconnect(&context);
+    publish(change(14));
+    connect(&context);
+    assert_eq!(
+        receive(&context),
+        None,
+        "old events must not leak into a new attachment"
+    );
+    publish(change(15));
+    assert_eq!(
+        receive(&context),
+        Some(Packet::Changed { change: change(15) })
+    );
+    disconnect(&context);
+}

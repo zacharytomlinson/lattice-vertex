@@ -27,3 +27,12 @@ pub enum StateReadResult {
     UnknownAttribute,
     Busy,
 }
+
+/// One registered change, identified by its owner and owner-local sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateChange {
+    pub owner: u64,
+    pub attribute: u64,
+    pub sequence: u32,
+    pub value: Option<Value>,
+}

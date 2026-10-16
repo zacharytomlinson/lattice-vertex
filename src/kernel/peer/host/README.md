@@ -5,7 +5,7 @@ Host and MCU share the MCU's radio identity. The kernel owns formation, maintain
 links, routing, deadlines, and radio operations. The attachment cannot select a
 PAN, channel, source identity, or network founder.
 
-`kernel::host::submit`, `receive`, and `disconnect` operate from the owning transport
+`kernel::host::connect`, `submit`, `receive`, and `disconnect` operate from the owning transport
 task. One fixed mailbox accepts one request at a time, including its unread reply.
 Busy requests are rejected. Disconnect invalidates host completions and cancels
 local return paths without withdrawing the resident peer. It cannot undo a native
@@ -42,13 +42,16 @@ module containing the local records/stream decoder; ordinary appliance builds do
 not include it. Neither module contains a radio driver, RTOS, allocator, or IR
 interpreter. The radio remains **LVT v6**, and surfaces remain **LSF v1**.
 
-Host version **2** uses little-endian records, COBS, and a zero delimiter. Version 1
-is rejected. The largest current encoded record is 87 bytes, in a fixed 128-byte
+Host version **3** uses little-endian records, COBS, and a zero delimiter. Older versions
+are rejected. The largest current encoded record is 87 bytes, in a fixed 128-byte
 buffer. USB CDC may split/coalesce records and needs a terminating short packet
 (or ZLP at an exact endpoint boundary). This does not fragment radio messages:
 each surface range, state read, invocation, and result remains one RF frame.
 
 All records begin with version (`u8`), kind (`u8`), and token (`u32`).
+Unsolicited kinds 144/145 require token zero; kind distinguishes events from
+replies, including a reply to request token zero. A change is at most 37 encoded
+bytes and a loss notice is 12 bytes.
 
 | Kind | Remaining fields |
 | --- | --- |
@@ -62,6 +65,8 @@ All records begin with version (`u8`), kind (`u8`), and token (`u32`).
 | 130 Surface | owner `u64`, offset/total `u16`, up to 67 bytes |
 | 131 State | owner/attribute `u64`, result tag; values add sequence `u32` and typed scalar or 255 unavailable |
 | 132 Invoked | owner/transformer `u64`, native status `u8` |
+| 144 Changed | owner/attribute `u64`, sequence `u32`, typed scalar or 255 unavailable |
+| 145 ChangesLost | evicted event count `u32` |
 | 255 Error | reason `u8`: busy, invalid request, transmit failure, timeout |
 
 The argument section has the same 61-byte/30-value radio limit. It starts with a
@@ -70,9 +75,28 @@ count byte and declared-width scalars. State tags are 0 value, 1 unknown attribu
 
 The XIAO USB application and Linux consumer live in `lattice-tablet`. The consumer
 assembles only explicitly requested surfaces and checks completeness before
-inspection/saving. The MCU retains no foreign surface or global registry. Delta
-streaming to the host, continuous daemon operation, and UI integration are later
-work; read-after-call validation is not a substitute for that event path.
+inspection/saving. The MCU retains no foreign surface or global registry.
+
+## Registered changes
+
+Connecting the transport attaches the host to subsequent locally registered and
+accepted remote state changes. Remote changes pass ordinary network validation
+and duplicate suppression before delivery. This adds no radio subscription,
+periodic state request, or initial snapshot. The same `StateChange` record is used
+by the RF and host codecs. Native success never manufactures a change.
+
+Eight pending changes occupy fixed storage separate from the request/reply slot.
+On overflow the oldest change is evicted and a saturating loss count is retained.
+`receive` returns a ready reply first, then the loss notice, then changes in order.
+An event never releases the outstanding-request slot. Disconnect discards events
+and loss counts; a new attachment starts fresh. This is a transport buffer, not a
+graph execution queue or a retained state mirror. Loss notices count this buffer's
+evictions, not missed RF frames or pre-attachment history.
+
+The USB owner drains records even when no request is pending. Linux waits for
+readable USB data; no polling message is sent. Continuous daemon operation and UI
+integration remain subsequent work. Explicit state reads remain available when a
+consumer chooses to obtain an initial value or recover after a reported gap.
 
 Checks:
 
@@ -83,5 +107,6 @@ cargo +stable test --lib kernel::peer --no-default-features --features port-test
 
 Maintained tests cover local/remote reads, guided traversal, exact response
 correlation, reconnect cancellation, typed arguments, native error distinctions,
-duplicate result replay, and a lost call result without re-execution. Hardware
+duplicate result replay, a lost call result without re-execution, attached-event
+lifecycle, bounded overflow, and reply/event independence. Hardware
 validation uses the Nordic `test-appliance` fixture; its dimmer is software-backed.

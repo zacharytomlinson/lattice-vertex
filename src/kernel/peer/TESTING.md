@@ -144,7 +144,16 @@ while another node retains that identity. A regression check covers that case.
 The radio stack reserves 8 KiB for the measured ~5 KiB entry frame plus callers,
 callees, and exception context. Neither that allocation nor the diagnostic USB
 polling cleanup established the cause of every earlier timeout.
- Native calls, relayed
+
+The host v3 stream has also delivered registered power changes and a subsequent
+single-state level change to Linux after native calls, without `ReadState` requests.
+An idle `watch` blocks on USB input and makes no serial writes. The same check had
+surface-read timeouts and incomplete two-change bursts; no overflow marker was
+reported. This proves the event path, not complete delivery or the cause of a
+missing delta. Ring overflow, reply priority, reconnect isolation, and coalesced
+reply/event decoding have deterministic checks.
+
+Native calls, relayed
 surface/current-state reads, reciprocal link maintenance, guided traversal, owner
 discovery, scored alternate directions, bounded invocation replication, and deltas
 have deterministic host checks; their

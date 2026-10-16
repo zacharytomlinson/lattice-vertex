@@ -5,8 +5,10 @@ appliance's exposed native transformer; the kernel invokes it and communicates
 subsequent established state changes. No nucleus, solver, IR interpreter, learned
 surface, or compiled-fragment runtime is required. Any peer can also read one
 exposed attribute to establish its initial value. The optional [attached host endpoint](host/README.md) and the Linux client in
-`lattice-tablet` now originate these calls and reads. Host delta streaming remains
-unimplemented; radio delta propagation is independent of that next step.
+`lattice-tablet` originate these calls and reads. Registered local changes and
+accepted remote deltas also stream to an attached host without state polling.
+The host event buffer is bounded and reports oldest-event eviction separately
+from command results; it does not guarantee RF delivery or retain state history.
 
 ## Appliance ownership
 
