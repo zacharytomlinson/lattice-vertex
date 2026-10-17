@@ -1,12 +1,13 @@
 //! Numeric transport definitions; no radio driver, RTOS, interpreter, or allocator.
 #![no_std]
 pub use lattice_ir::{Integer, Type, Value};
+pub mod cost;
 #[cfg(feature = "host")]
 pub mod host;
 pub mod scalar;
 pub const CALL_ARGUMENT_BYTES: usize = 61;
 pub const MAX_CALL_ARGUMENTS: usize = 30;
-pub const SURFACE_BYTES: usize = 67;
+pub const SURFACE_BYTES: usize = 63;
 
 /// Result of dispatch, never a claim that physical state has converged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -86,6 +86,7 @@ impl Invocations {
 
 #[cfg(all(test, feature = "port-test"))]
 mod tests {
+    use crate::kernel::radio::cost::TimePerByte;
     extern crate std;
     use self::std::{boxed::Box, vec::Vec};
     use super::super::{
@@ -220,6 +221,7 @@ mod tests {
     }
     fn request(call: Invocation, arguments: &[u8]) -> Message<'_> {
         Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 1,
             destination: Some(2),
             content: Content::Invoke {
@@ -284,6 +286,7 @@ mod tests {
                     via,
                 };
                 let q = Message {
+                    path_cost: TimePerByte::UNKNOWN,
                     source: if i == 0 { 1 } else { 2 },
                     destination: Some(ids[i]),
                     content: Content::ReadLinks {
@@ -295,6 +298,7 @@ mod tests {
                 let started = u32::from(token) * 10;
                 nodes[i].receive_links(q, started).unwrap();
                 let reply = Message {
+                    path_cost: TimePerByte::UNKNOWN,
                     source: next,
                     destination: Some(ids[i]),
                     content: Content::LinkEntry {
@@ -312,6 +316,7 @@ mod tests {
                 ..call(91)
             };
             let initial = Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: 1,
                 destination: Some(2),
                 content: Content::Invoke {
@@ -395,6 +400,7 @@ mod tests {
             if drop_first {
                 nodes[0].expire(10_101);
                 let q = Message {
+                    path_cost: TimePerByte::UNKNOWN,
                     source: 1,
                     destination: Some(2),
                     content: Content::ReadState {
@@ -514,6 +520,7 @@ mod tests {
             attribute: core::ptr::from_ref(POWER.definition()) as usize as u64,
         };
         let mut message = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 1,
             destination: None,
             content: Content::ReadState {
@@ -561,6 +568,7 @@ mod tests {
         );
         assert_eq!(f.calls(), 0);
         let next = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 1,
             destination: None,
             content: Content::ReadState {

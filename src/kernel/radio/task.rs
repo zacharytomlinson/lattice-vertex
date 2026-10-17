@@ -2,6 +2,7 @@
 //! no executor thread, allocation, or graph scheduling is introduced.
 
 use super::{
+    cost::{Samples, Transmission},
     mac,
     receive::{finish_frame_ticks, receive_turn_ticks, ReceiveBuffer},
     Error, MAX_FRAME_SIZE,
@@ -157,6 +158,7 @@ pub struct Transport {
     duplicates: mac::Duplicates,
     backoff: mac::Backoff,
     pan: u16,
+    costs: Samples,
     waker: Waker,
     _task_context: PhantomData<*mut ()>,
 }
@@ -183,6 +185,7 @@ impl Transport {
 
     pub fn configure(&mut self, channel: u8, pan_id: u16) -> Result<(), Error> {
         self.received.clear();
+        self.costs.clear();
         self.duplicates = mac::Duplicates::new();
         self.pan = pan_id;
         self.radio.configure(channel, pan_id)
@@ -248,7 +251,12 @@ impl Transport {
         self.duplicates.accept(frame, ms)
     }
 
+    pub(crate) fn take_cost_sample(&mut self) -> Option<Transmission> {
+        self.costs.take()
+    }
+
     pub fn transmit(&mut self, frame: &[u8]) -> Result<(), Error> {
+        let started = tasks::xTaskGetTickCount();
         let acknowledged = mac::requests_ack(frame);
         let attempts = if acknowledged { mac::ATTEMPTS } else { 1 };
         let mut result = Err(Error::Aborted);
@@ -282,6 +290,20 @@ impl Transport {
         }
         if result.is_ok() && self.peer_runtime {
             self.receive_turn();
+        }
+        if acknowledged && self.peer_runtime {
+            let ticks = tasks::xTaskGetTickCount().wrapping_sub(started).max(1);
+            let us = (u64::from(ticks) * 1_000_000 / crate::configTICK_RATE_HZ as u64)
+                .min(u64::from(u32::MAX)) as u32;
+            self.costs.push(Transmission {
+                peer: u64::from_le_bytes(frame[5..13].try_into().unwrap()),
+                elapsed_us: us,
+                acknowledged_bytes: if result.is_ok() {
+                    (frame.len() - 21) as u16
+                } else {
+                    0
+                },
+            });
         }
         if result.is_err() && unconfirmed {
             Err(Error::NoAcknowledgement)
@@ -356,6 +378,7 @@ extern "C" fn run(_: *mut c_void) {
         duplicates: mac::Duplicates::new(),
         backoff: mac::Backoff::new(address),
         pan: 0,
+        costs: Samples::new(),
         waker,
         _task_context: PhantomData,
     };

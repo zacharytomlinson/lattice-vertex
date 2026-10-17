@@ -3,6 +3,7 @@
 //! healthy relationship to admit a new candidate; pending/expired entries clear.
 
 use super::frame::{LinkPhase, PeerLink};
+use crate::kernel::radio::cost::{Measurement, TimePerByte, Transmission};
 
 const CAPACITY: usize = 8;
 const EXCHANGE_MS: u32 = 6_000;
@@ -18,6 +19,8 @@ struct Neighbor {
     accepted_token: u32,
     accepted_at: u32,
     round_trip_ms: u16,
+    measurement: Measurement,
+    measured_at: u32,
     established: bool,
     waiting_accept: bool,
 }
@@ -30,6 +33,8 @@ impl Neighbor {
         accepted_token: 0,
         accepted_at: 0,
         round_trip_ms: 0,
+        measurement: Measurement::EMPTY,
+        measured_at: 0,
         established: false,
         waiting_accept: false,
     };
@@ -40,7 +45,7 @@ pub(super) struct Links {
     token: u32,
     revision: u32,
 }
-const _: () = assert!(core::mem::size_of::<Links>() <= 320);
+const _: () = assert!(core::mem::size_of::<Links>() <= 448);
 
 impl Links {
     pub(super) const fn new() -> Self {
@@ -74,6 +79,19 @@ impl Links {
         self.reserve(peer, now);
     }
 
+    pub(super) fn record_transmission(&mut self, sample: Transmission, now: u32) {
+        if let Some(i) = self.reserve(sample.peer, now) {
+            self.neighbors[i].measurement.observe(sample);
+            self.neighbors[i].measured_at = now;
+        }
+    }
+    pub(super) fn cost(&self, peer: u64) -> TimePerByte {
+        self.neighbors
+            .iter()
+            .find(|n| n.peer == peer && peer != 0)
+            .map_or(TimePerByte::UNKNOWN, |n| n.measurement.cost())
+    }
+
     pub(super) fn contains(&self, peer: u64) -> bool {
         self.neighbors
             .iter()
@@ -91,6 +109,7 @@ impl Links {
             .map(|n| PeerLink {
                 peer: n.peer,
                 round_trip_ms: n.round_trip_ms,
+                cost: n.measurement.cost(),
             });
         (self.revision, link)
     }
@@ -107,6 +126,9 @@ impl Links {
                 }
                 *neighbor = Neighbor::EMPTY;
             } else {
+                if now.wrapping_sub(neighbor.measured_at) >= EXPIRE_MS {
+                    neighbor.measurement = Measurement::EMPTY;
+                }
                 if now.wrapping_sub(neighbor.offered_at) >= EXCHANGE_MS {
                     neighbor.offer_token = 0;
                     neighbor.waiting_accept = false;
@@ -218,6 +240,32 @@ impl Links {
 mod tests {
     use super::*;
 
+    #[test]
+    fn outgoing_cost_is_directional_and_expires_without_removing_a_refreshed_link() {
+        let mut a = Links::new();
+        let mut b = Links::new();
+        a.record_transmission(
+            Transmission {
+                peer: 2,
+                elapsed_us: 2000,
+                acknowledged_bytes: 100,
+            },
+            0,
+        );
+        assert_eq!(a.read(0).1, None, "a TX sample is not reciprocal admission");
+        connected(&mut a, &mut b, 1);
+        assert_eq!(a.read(0).1.unwrap().cost.estimate_us(10), Some(200));
+        assert_eq!(
+            b.read(0).1.unwrap().cost,
+            TimePerByte::UNKNOWN,
+            "reverse direction needs its own evidence"
+        );
+        connected(&mut a, &mut b, 30_000);
+        a.expire(60_000, |_| panic!("refreshed adjacency expired"));
+        assert!(a.contains(2));
+        assert_eq!(a.read(0).1.unwrap().cost, TimePerByte::UNKNOWN);
+    }
+
     fn connected(a: &mut Links, b: &mut Links, now: u32) {
         a.record_presence(2, now);
         let (peer, token) = a.maintain(now).unwrap();
@@ -272,6 +320,7 @@ mod tests {
             (
                 1,
                 Some(PeerLink {
+                    cost: TimePerByte::UNKNOWN,
                     peer: 2,
                     round_trip_ms: 2
                 })
@@ -282,6 +331,7 @@ mod tests {
             (
                 1,
                 Some(PeerLink {
+                    cost: TimePerByte::UNKNOWN,
                     peer: 1,
                     round_trip_ms: 4
                 })
@@ -414,6 +464,7 @@ mod tests {
                 (
                     CAPACITY as u32,
                     Some(PeerLink {
+                        cost: TimePerByte::UNKNOWN,
                         peer: cursor + 1,
                         round_trip_ms: 1
                     })

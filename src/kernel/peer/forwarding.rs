@@ -2,6 +2,8 @@
 //! Return paths and duplicate records are communication state, never semantic
 //! edges or queued graph activations.
 
+use crate::kernel::radio::cost::{TimePerByte, Transmission};
+
 use super::{
     exposure::Description,
     frame::{
@@ -25,18 +27,18 @@ const ROUTE_MS: u32 = 60_000;
 struct Direction {
     next: u64,
     confirmed: u32,
-    round_trip_ms: u16,
+    tail_cost: TimePerByte,
     hops: u8,
 }
 impl Direction {
     const EMPTY: Self = Self {
         next: 0,
         confirmed: 0,
-        round_trip_ms: 0,
+        tail_cost: TimePerByte::UNKNOWN,
         hops: 0,
     };
-    fn cost(self) -> (u8, u16, u64) {
-        (self.hops, self.round_trip_ms, self.next)
+    fn rank_key(self, outgoing: TimePerByte) -> (TimePerByte, u8, u64) {
+        (outgoing.then(self.tail_cost), self.hops, self.next)
     }
 }
 
@@ -185,7 +187,7 @@ struct CallPath {
     arguments: [u8; CALL_ARGUMENT_BYTES],
     length: u8,
     remaining: u8,
-    result: Option<(InvokeStatus, u8)>,
+    result: Option<(InvokeStatus, u8, TimePerByte)>,
 }
 impl CallPath {
     const EMPTY: Self = Self {
@@ -234,7 +236,9 @@ pub(super) struct Forwarder {
     changes: [ChangeNotice; CHANGE_NOTICES],
 }
 
-const _: () = assert!(core::mem::size_of::<Forwarder>() <= 2048);
+// Prior 2 KiB budget plus 256 bytes for neighbor samples and path/replay costs.
+// Peer, route, and return-path capacities are unchanged.
+const _: () = assert!(core::mem::size_of::<Forwarder>() <= 2304);
 
 impl Forwarder {
     pub(super) const fn new(local: u64, network: Network) -> Self {
@@ -311,6 +315,50 @@ impl Forwarder {
         }
     }
 
+    pub(super) fn record_transmission(&mut self, sample: Transmission, now: u32) {
+        if sample.peer != self.local {
+            self.links.record_transmission(sample, now);
+        }
+    }
+
+    /// The same per-byte path cost supports ranking and later quantity estimates.
+    pub(super) fn cost_to(&self, owner: u64) -> TimePerByte {
+        if owner == self.local {
+            return TimePerByte::ZERO;
+        }
+        let next = self.next_hops(owner, self.local, MAX_HOPS)[0];
+        if next == 0 {
+            return TimePerByte::UNKNOWN;
+        }
+        let tail = self
+            .routes
+            .iter()
+            .find(|r| r.owner == owner)
+            .and_then(|r| r.directions.iter().find(|d| d.next == next))
+            .map_or(TimePerByte::UNKNOWN, |d| d.tail_cost);
+        self.links.cost(next).then(if next == owner {
+            TimePerByte::ZERO
+        } else {
+            tail
+        })
+    }
+
+    fn response_cost(&self, message: Message<'_>) -> TimePerByte {
+        let direct = match message.content {
+            Content::OwnerFound { hops, .. }
+            | Content::SurfacePart { hops, .. }
+            | Content::InvocationResult { hops, .. }
+            | Content::StateValue { hops, .. }
+            | Content::LinkEntry { hops, .. } => hops == 1,
+            _ => false,
+        };
+        self.links.cost(message.source).then(if direct {
+            TimePerByte::ZERO
+        } else {
+            message.path_cost
+        })
+    }
+
     /// Only directed presence for this selected network introduces a candidate.
     pub(super) fn record_presence(&mut self, peer: u64, now: u32) {
         self.expire(now);
@@ -327,6 +375,7 @@ impl Forwarder {
 
     fn link_message(&self, peer: u64, phase: LinkPhase, token: u32) -> Message<'static> {
         Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: self.local,
             destination: Some(peer),
             content: Content::LinkExchange {
@@ -398,6 +447,7 @@ impl Forwarder {
             .unwrap_or(0);
         self.remember_read(request, self.local, onward, false, now);
         Some(Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: self.local,
             destination: (onward != 0).then_some(onward),
             content: match request {
@@ -454,7 +504,7 @@ impl Forwarder {
         {
             return None;
         }
-        let previous = self.return_read(request, incoming.source, hops, now)?;
+        let previous = self.return_read(request, incoming.source, hops, now, incoming.path_cost)?;
         (previous == self.local).then_some(incoming)
     }
 
@@ -492,6 +542,7 @@ impl Forwarder {
         let next = self.next_hop(call.owner, self.local, MAX_HOPS).unwrap_or(0);
         self.remember_call(call, arguments, self.local, [next, 0], MAX_HOPS, now);
         Some(Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: self.local,
             destination: (next != 0).then_some(next),
             content: Content::Invoke {
@@ -557,6 +608,7 @@ impl Forwarder {
                 if read.owner == self.local {
                     let (revision, link) = self.links.read(read.after);
                     return Some(Message {
+                        path_cost: TimePerByte::ZERO,
                         source: self.local,
                         destination: Some(incoming.source),
                         content: Content::LinkEntry {
@@ -569,6 +621,7 @@ impl Forwarder {
                     });
                 }
                 Some(Message {
+                    path_cost: TimePerByte::UNKNOWN,
                     source: self.local,
                     destination: (onward != 0).then_some(onward),
                     content: Content::ReadLinks {
@@ -588,9 +641,15 @@ impl Forwarder {
                 if network != self.network {
                     return None;
                 }
-                let previous =
-                    self.return_read(ReadRequest::Links(read), incoming.source, hops, now)?;
+                let previous = self.return_read(
+                    ReadRequest::Links(read),
+                    incoming.source,
+                    hops,
+                    now,
+                    incoming.path_cost,
+                )?;
                 Some(Message {
+                    path_cost: self.response_cost(incoming),
                     source: self.local,
                     destination: Some(previous),
                     content: Content::LinkEntry {
@@ -630,6 +689,7 @@ impl Forwarder {
                     let status = invoke(call, arguments);
                     return [
                         Some(Message {
+                            path_cost: TimePerByte::ZERO,
                             source: self.local,
                             destination: Some(incoming.source),
                             content: Content::InvocationResult {
@@ -667,7 +727,8 @@ impl Forwarder {
                     // A second incoming branch joins the retained return paths.
                     // Cached results answer just that copy; pending work is not forwarded again.
                     return [
-                        path.result.map(|(status, hops)| Message {
+                        path.result.map(|(status, hops, cost)| Message {
+                            path_cost: cost,
                             source: self.local,
                             destination: Some(incoming.source),
                             content: Content::InvocationResult {
@@ -693,6 +754,7 @@ impl Forwarder {
                 let copies = if split || next[0] == 0 { 1 } else { copies };
                 self.remember_call(call, arguments, incoming.source, next, remaining, now);
                 let first = Message {
+                    path_cost: TimePerByte::UNKNOWN,
                     source: self.local,
                     destination: (next[0] != 0).then_some(next[0]),
                     content: Content::Invoke {
@@ -720,13 +782,14 @@ impl Forwarder {
                 if network != self.network || hops >= MAX_HOPS {
                     return [None; 2];
                 }
+                let response_cost = self.response_cost(incoming);
                 let Some(path) = self.calls.iter_mut().find(|p| p.call == call) else {
                     return [None; 2];
                 };
                 if path.previous.contains(&incoming.source)
                     || path.returned.contains(&incoming.source)
                     || (path.onward[0] != 0 && !path.onward.contains(&incoming.source))
-                    || path.result.is_some_and(|(old, _)| old != status)
+                    || path.result.is_some_and(|(old, _, _)| old != status)
                 {
                     return [None; 2];
                 }
@@ -734,12 +797,13 @@ impl Forwarder {
                     return [None; 2];
                 };
                 *returned = incoming.source;
-                let distance = path.result.map_or(hops, |(_, old)| old.min(hops));
-                path.result = Some((status, distance));
+                if path.result.is_none_or(|(_, old, _)| hops <= old) {
+                    path.result = Some((status, hops, response_cost));
+                }
                 let previous = path.previous;
-                let elapsed = now.wrapping_sub(path.started);
-                self.learn(call.owner, incoming.source, hops, now, elapsed);
+                self.learn(call.owner, incoming.source, hops, now, incoming.path_cost);
                 let first = Message {
+                    path_cost: self.response_cost(incoming),
                     source: self.local,
                     destination: Some(previous[0]),
                     content: Content::InvocationResult {
@@ -802,6 +866,7 @@ impl Forwarder {
         self.expire(now);
         self.change_seen(self.local, sequence, now);
         Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: self.local,
             destination: None,
             content: Content::StateChanged {
@@ -840,6 +905,7 @@ impl Forwarder {
         }
         if hops < MAX_HOPS {
             send(Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: self.local,
                 destination: None,
                 content: Content::StateChanged {
@@ -886,6 +952,7 @@ impl Forwarder {
         self.expire(now);
         self.notice(self.local, 0, sequence, now);
         Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: self.local,
             destination: None,
             content: Content::Arrive {
@@ -904,6 +971,7 @@ impl Forwarder {
         self.expire(now);
         self.remember_discovery(self.local, request, 0, now);
         Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: self.local,
             destination: None,
             content: Content::FindOwners {
@@ -941,6 +1009,7 @@ impl Forwarder {
                 }
                 if hops < MAX_HOPS {
                     send(Message {
+                        path_cost: TimePerByte::UNKNOWN,
                         source: self.local,
                         destination: None,
                         content: Content::Arrive {
@@ -973,6 +1042,7 @@ impl Forwarder {
                 self.remember_discovery(seeker, request, incoming.source, now);
                 self.notice(self.local, seeker, request, now);
                 send(Message {
+                    path_cost: TimePerByte::ZERO,
                     source: self.local,
                     destination: Some(incoming.source),
                     content: Content::OwnerFound {
@@ -988,6 +1058,7 @@ impl Forwarder {
                 });
                 if remaining > 1 {
                     send(Message {
+                        path_cost: TimePerByte::UNKNOWN,
                         source: self.local,
                         destination: None,
                         content: Content::FindOwners {
@@ -1029,7 +1100,7 @@ impl Forwarder {
                         incoming.source,
                         hops,
                         now,
-                        now.wrapping_sub(path.started),
+                        incoming.path_cost,
                     );
                 }
                 if !first {
@@ -1037,6 +1108,7 @@ impl Forwarder {
                 }
                 if seeker != self.local {
                     send(Message {
+                        path_cost: self.response_cost(incoming),
                         source: self.local,
                         destination: Some(path.previous),
                         content: Content::OwnerFound {
@@ -1130,6 +1202,7 @@ impl Forwarder {
                 if owner {
                     let n = description.encode_part(read.offset, reply);
                     return Some(Message {
+                        path_cost: TimePerByte::ZERO,
                         source: self.local,
                         destination: Some(incoming.source),
                         content: Content::SurfacePart {
@@ -1142,6 +1215,7 @@ impl Forwarder {
                     });
                 }
                 return Some(Message {
+                    path_cost: TimePerByte::UNKNOWN,
                     source: self.local,
                     destination: next,
                     content: Content::ReadSurface {
@@ -1161,9 +1235,15 @@ impl Forwarder {
                 if network != self.network {
                     return None;
                 }
-                let previous =
-                    self.return_read(ReadRequest::Surface(read), incoming.source, hops, now)?;
+                let previous = self.return_read(
+                    ReadRequest::Surface(read),
+                    incoming.source,
+                    hops,
+                    now,
+                    incoming.path_cost,
+                )?;
                 return Some(Message {
+                    path_cost: self.response_cost(incoming),
                     source: self.local,
                     destination: Some(previous),
                     content: Content::SurfacePart {
@@ -1202,6 +1282,7 @@ impl Forwarder {
                 let next = (onward != 0).then_some(onward);
                 if read.owner == self.local {
                     return Some(Message {
+                        path_cost: TimePerByte::ZERO,
                         source: self.local,
                         destination: Some(incoming.source),
                         content: Content::StateValue {
@@ -1213,6 +1294,7 @@ impl Forwarder {
                     });
                 }
                 Some(Message {
+                    path_cost: TimePerByte::UNKNOWN,
                     source: self.local,
                     destination: next,
                     content: Content::ReadState {
@@ -1231,9 +1313,15 @@ impl Forwarder {
                 if network != self.network {
                     return None;
                 }
-                let previous =
-                    self.return_read(ReadRequest::State(read), incoming.source, hops, now)?;
+                let previous = self.return_read(
+                    ReadRequest::State(read),
+                    incoming.source,
+                    hops,
+                    now,
+                    incoming.path_cost,
+                )?;
                 Some(Message {
+                    path_cost: self.response_cost(incoming),
                     source: self.local,
                     destination: Some(previous),
                     content: Content::StateValue {
@@ -1304,7 +1392,14 @@ impl Forwarder {
         &self.reads[slot]
     }
 
-    fn return_read(&mut self, read: ReadRequest, source: u64, hops: u8, now: u32) -> Option<u64> {
+    fn return_read(
+        &mut self,
+        read: ReadRequest,
+        source: u64,
+        hops: u8,
+        now: u32,
+        tail_cost: TimePerByte,
+    ) -> Option<u64> {
         if hops >= MAX_HOPS {
             return None;
         }
@@ -1315,28 +1410,26 @@ impl Forwarder {
         path.answered = true;
         let previous = path.previous;
         // A correlated response confirms reachability, including Busy/UnknownAttribute.
-        let elapsed = now.wrapping_sub(path.started);
-        self.learn(read.owner(), source, hops, now, elapsed);
+        self.learn(read.owner(), source, hops, now, tail_cost);
         Some(previous)
     }
 
     fn next_hops(&self, owner: u64, previous: u64, remaining: u8) -> [u64; 2] {
-        let direct = remaining > 1 && owner != previous && self.links.contains(owner);
-        let mut candidates = [Direction::EMPTY; 2];
+        let mut candidates = [Direction::EMPTY; 3];
         if let Some(route) = self.routes.iter().find(|r| r.owner == owner) {
-            candidates = route.directions;
+            candidates[..2].copy_from_slice(&route.directions);
         }
-        if candidates[1].next != 0
-            && (candidates[0].next == 0 || candidates[1].cost() < candidates[0].cost())
-        {
-            candidates.swap(0, 1);
+        if remaining > 1 && owner != previous && self.links.contains(owner) {
+            candidates[2] = Direction {
+                next: owner,
+                hops: 1,
+                tail_cost: TimePerByte::ZERO,
+                confirmed: 0,
+            };
         }
+        candidates.sort_unstable_by_key(|d| d.rank_key(self.links.cost(d.next)));
         let mut selected = [0; 2];
         let mut count = 0;
-        if direct {
-            selected[0] = owner;
-            count = 1;
-        }
         for d in candidates {
             if count == 2 {
                 break;
@@ -1358,7 +1451,7 @@ impl Forwarder {
         (next != 0).then_some(next)
     }
 
-    fn learn(&mut self, owner: u64, next: u64, hops: u8, now: u32, elapsed: u32) {
+    fn learn(&mut self, owner: u64, next: u64, hops: u8, now: u32, tail_cost: TimePerByte) {
         let slot = self
             .routes
             .iter()
@@ -1380,7 +1473,11 @@ impl Forwarder {
             next,
             hops,
             confirmed: now,
-            round_trip_ms: elapsed.clamp(1, u16::MAX as u32) as u16,
+            tail_cost: if hops == 1 {
+                TimePerByte::ZERO
+            } else {
+                tail_cost
+            },
         };
         let index = route
             .directions
@@ -1390,12 +1487,16 @@ impl Forwarder {
         if let Some(index) = index {
             route.directions[index] = measured;
         } else {
-            let worst = if route.directions[0].cost() > route.directions[1].cost() {
+            let worst = if route.directions[0].rank_key(self.links.cost(route.directions[0].next))
+                > route.directions[1].rank_key(self.links.cost(route.directions[1].next))
+            {
                 0
             } else {
                 1
             };
-            if measured.cost() < route.directions[worst].cost() {
+            if measured.rank_key(self.links.cost(next))
+                < route.directions[worst].rank_key(self.links.cost(route.directions[worst].next))
+            {
                 route.directions[worst] = measured;
             }
         }
@@ -1452,6 +1553,7 @@ mod tests {
 
     fn query(request: u16, offset: u16) -> Message<'static> {
         Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 1,
             destination: None,
             content: Content::ReadSurface {
@@ -1469,6 +1571,7 @@ mod tests {
 
     fn reply(request: u16, offset: u16) -> Message<'static> {
         Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 3,
             destination: Some(2),
             content: Content::SurfacePart {
@@ -1601,22 +1704,33 @@ mod tests {
     }
 
     #[test]
-    fn alternate_directions_rank_observed_cost_and_fail_independently() {
+    fn alternate_directions_rank_marginal_cost_and_fail_independently() {
         let mut node = Forwarder::new(2, NET);
-        for (next, hops, latency, expected) in [
-            (3, 3, 1, [3, 0]),
+        for peer in 3..=6 {
+            node.record_transmission(
+                Transmission {
+                    peer,
+                    elapsed_us: 1000,
+                    acknowledged_bytes: 1000,
+                },
+                0,
+            );
+        }
+        for (next, hops, unit_us, expected) in [
+            (3, 3, 41, [3, 0]),
             (4, 2, 40, [4, 3]),
-            (5, 2, 10, [5, 4]),
-            (6, 4, 1, [5, 4]),
+            (5, 4, 10, [5, 4]),
+            (6, 2, 99, [5, 4]),
             (4, 2, 5, [4, 5]),
             (4, 2, 80, [5, 4]),
         ] {
-            node.learn(9, next, hops, 0, latency);
+            node.learn(9, next, hops, 0, TimePerByte::measured(unit_us, 1));
             assert_eq!(node.next_hops(9, 1, 8), expected);
         }
         assert_eq!(node.next_hops(9, 5, 8), [4, 0]);
         assert_eq!(node.next_hops(9, 1, 2), [0, 0]);
         let failed = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 2,
             destination: Some(5),
             content: Content::ReadState {
@@ -1632,7 +1746,7 @@ mod tests {
         };
         node.transmit_failed(&failed);
         assert_eq!(node.next_hops(9, 1, 8), [4, 0]);
-        node.learn(9, 5, 2, 100, 10);
+        node.learn(9, 5, 2, 100, TimePerByte::measured(10, 1));
         node.expire(ROUTE_MS);
         assert_eq!(
             node.next_hops(9, 1, 8),
@@ -1640,18 +1754,137 @@ mod tests {
             "expiry erased a newer alternate"
         );
         // Owner capacity stays bounded independently of candidates per owner.
-        node.learn(10, 3, 2, ROUTE_MS + 1, 3);
-        node.learn(11, 3, 2, ROUTE_MS + 2, 3);
-        node.learn(12, 3, 2, ROUTE_MS + 3, 3);
+        node.learn(10, 3, 2, ROUTE_MS + 1, TimePerByte::measured(3, 1));
+        node.learn(11, 3, 2, ROUTE_MS + 2, TimePerByte::measured(3, 1));
+        node.learn(12, 3, 2, ROUTE_MS + 3, TimePerByte::measured(3, 1));
         assert_eq!(node.next_hops(9, 1, 8), [0, 0]);
         assert_eq!(node.next_hops(12, 1, 8), [3, 0]);
     }
 
     #[test]
+    #[cfg(feature = "host-link")]
+    fn directional_cost_crosses_encoded_replies_and_drives_quantity_estimates() {
+        let mut a = Forwarder::new(1, NET);
+        let mut b = Forwarder::new(2, NET);
+        let mut c = Forwarder::new(3, NET);
+        a.record_transmission(
+            Transmission {
+                peer: 2,
+                elapsed_us: 1000,
+                acknowledged_bytes: 100,
+            },
+            0,
+        );
+        b.record_transmission(
+            Transmission {
+                peer: 3,
+                elapsed_us: 2000,
+                acknowledged_bytes: 100,
+            },
+            0,
+        );
+        // The expensive reverse direction must not become the forward path price.
+        b.record_transmission(
+            Transmission {
+                peer: 1,
+                elapsed_us: 90000,
+                acknowledged_bytes: 100,
+            },
+            0,
+        );
+        c.record_transmission(
+            Transmission {
+                peer: 2,
+                elapsed_us: 80000,
+                acknowledged_bytes: 100,
+            },
+            0,
+        );
+        let read = ReadRequest::State(StateRead {
+            reader: 1,
+            owner: 3,
+            request: 7,
+            attribute: 42,
+        });
+        let request = a.originate_read(read, 1).unwrap();
+        let onward = b.receive_state(request, 2, |_| panic!()).unwrap();
+        let reply = c
+            .receive_state(onward, 3, |_| StateReadResult::Busy)
+            .unwrap();
+        assert_eq!(reply.path_cost, TimePerByte::ZERO);
+        let mut wire = [0; MAX_FRAME_SIZE];
+        let size = reply.encode(1, &mut wire);
+        let reply = b
+            .receive_state(
+                Message::decode(&wire[..size], 2, 15).unwrap(),
+                4,
+                |_| panic!(),
+            )
+            .unwrap();
+        assert_eq!(reply.path_cost, TimePerByte::measured(2000, 100));
+        let size = reply.encode(2, &mut wire);
+        assert!(a
+            .complete_read(Message::decode(&wire[..size], 1, 15).unwrap(), 5)
+            .is_some());
+        let cost = a.cost_to(3);
+        assert_eq!(cost.estimate_us(10), Some(300));
+        assert_eq!(cost.estimate_us(10_000), Some(300_000));
+        assert_eq!(a.cost_to(1), TimePerByte::ZERO);
+        assert_eq!(a.cost_to(99), TimePerByte::UNKNOWN);
+        // Update only the first-hop measurement; retained downstream cost stays 20.
+        a.record_transmission(
+            Transmission {
+                peer: 2,
+                elapsed_us: 3000,
+                acknowledged_bytes: 100,
+            },
+            6,
+        );
+        assert_eq!(a.cost_to(3).estimate_us(100), Some(4000));
+        a.expire(ROUTE_MS + 10);
+        assert_eq!(a.cost_to(3), TimePerByte::UNKNOWN);
+    }
+
+    #[test]
+    fn measured_indirect_path_can_beat_a_maintained_direct_neighbor() {
+        let mut nodes = [Forwarder::new(1, NET), Forwarder::new(9, NET)];
+        connect(&mut nodes, 0, 1, 0);
+        let node = &mut nodes[0];
+        node.record_transmission(
+            Transmission {
+                peer: 9,
+                elapsed_us: 9000,
+                acknowledged_bytes: 100,
+            },
+            4,
+        );
+        node.record_transmission(
+            Transmission {
+                peer: 2,
+                elapsed_us: 1000,
+                acknowledged_bytes: 100,
+            },
+            4,
+        );
+        node.learn(9, 2, 3, 5, TimePerByte::measured(2000, 100));
+        assert_eq!(node.next_hops(9, 1, 8), [2, 9]);
+        assert_eq!(node.cost_to(9).estimate_us(100), Some(3000));
+        // A known direct link still wins against an unmeasured suffix.
+        node.learn(9, 2, 3, 6, TimePerByte::UNKNOWN);
+        assert_eq!(node.next_hops(9, 1, 8), [9, 2]);
+        // Same route ranking at either quantity: no special transfer class.
+        let direct = node.cost_to(9);
+        assert_eq!(
+            direct.estimate_us(10_000).unwrap(),
+            direct.estimate_us(10).unwrap() * 1000
+        );
+    }
+
+    #[test]
     fn invocation_split_budget_and_partial_success_keep_the_surviving_direction() {
         let mut node = Forwarder::new(2, NET);
-        node.learn(9, 3, 2, 0, 4);
-        node.learn(9, 4, 2, 0, 6);
+        node.learn(9, 3, 2, 0, TimePerByte::measured(4, 1));
+        node.learn(9, 4, 2, 0, TimePerByte::measured(6, 1));
         let call = Invocation {
             caller: 1,
             owner: 9,
@@ -1659,6 +1892,7 @@ mod tests {
             transformer: 42,
         };
         let request = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 1,
             destination: Some(2),
             content: Content::Invoke {
@@ -1680,6 +1914,7 @@ mod tests {
             );
         }
         let result = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 4,
             destination: Some(2),
             content: Content::InvocationResult {
@@ -1701,8 +1936,8 @@ mod tests {
             "one successful copy masked the unanswered direction"
         );
         let mut downstream = Forwarder::new(4, NET);
-        downstream.learn(9, 6, 2, 0, 1);
-        downstream.learn(9, 7, 2, 0, 2);
+        downstream.learn(9, 6, 2, 0, TimePerByte::measured(1, 1));
+        downstream.learn(9, 7, 2, 0, TimePerByte::measured(2, 1));
         let one = downstream.receive_control(sent[1].unwrap(), 2, |_, _| panic!());
         assert!(
             one[0].is_some() && one[1].is_none(),
@@ -1720,7 +1955,7 @@ mod tests {
             }
         ));
         // No split is consumed while there is only one known direction.
-        empty.learn(9, 3, 2, 0, 4);
+        empty.learn(9, 3, 2, 0, TimePerByte::measured(4, 1));
         let next = Message {
             content: Content::Invoke {
                 network: NET,
@@ -1766,6 +2001,7 @@ mod tests {
             };
             token += 1;
             let query = Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: 1,
                 destination: Some(2),
                 content: Content::ReadLinks {
@@ -1795,6 +2031,7 @@ mod tests {
             offset: 0,
         };
         let query = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 1,
             destination: Some(2),
             content: Content::ReadSurface {
@@ -1824,7 +2061,7 @@ mod tests {
         assert!(matches!(answer.content,Content::SurfacePart {read:r,hops:4,..} if r==read));
         // A local route-cache replacement cannot erase the maintained neighbor.
         for owner in 90..95 {
-            nodes[0].learn(owner, 3, 2, 102, 1);
+            nodes[0].learn(owner, 3, 2, 102, TimePerByte::measured(1, 1));
         }
         let read = LinkRead {
             reader: 1,
@@ -1836,6 +2073,7 @@ mod tests {
         let reply = walk(
             &mut nodes,
             Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: 1,
                 destination: Some(2),
                 content: Content::ReadLinks {
@@ -1861,6 +2099,7 @@ mod tests {
             via: 2,
         };
         let query = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 1,
             destination: Some(2),
             content: Content::ReadLinks {
@@ -1879,6 +2118,7 @@ mod tests {
             LinkRead { owner: 4, ..read },
         ] {
             let bad = Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: 3,
                 destination: Some(2),
                 content: Content::LinkEntry {
@@ -1947,7 +2187,7 @@ mod tests {
         // Failed routing toward a via removes that direction, not a target route
         // which this request had not yet established.
         let mut relay = Forwarder::new(2, NET);
-        relay.learn(4, 3, 2, 0, 1);
+        relay.learn(4, 3, 2, 0, TimePerByte::measured(1, 1));
         let q = Message {
             content: Content::ReadLinks {
                 network: NET,
@@ -1968,6 +2208,7 @@ mod tests {
         // Discovery content from another network or a relayed/broadcast exchange
         // cannot establish a maintained link.
         let offer = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 3,
             destination: None,
             content: Content::LinkExchange {
@@ -1989,6 +2230,7 @@ mod tests {
             attribute: 42,
         };
         let query = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 1,
             destination: None,
             content: Content::ReadState {
@@ -1998,6 +2240,7 @@ mod tests {
             },
         };
         let reply = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 3,
             destination: Some(2),
             content: Content::StateValue {
@@ -2199,6 +2442,7 @@ mod tests {
             transformer: 42,
         };
         let request = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 1,
             destination: Some(2),
             content: Content::Invoke {
@@ -2210,6 +2454,7 @@ mod tests {
             },
         };
         let response = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 3,
             destination: Some(2),
             content: Content::InvocationResult {
@@ -2315,6 +2560,7 @@ mod tests {
         )[0]
         .is_none());
         let change = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 4,
             destination: None,
             content: Content::StateChanged {
@@ -2504,6 +2750,7 @@ mod tests {
             surface_bytes: 195,
         };
         let found = |request| Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 2,
             destination: Some(1),
             content: Content::OwnerFound {
@@ -2557,6 +2804,7 @@ mod tests {
         let mut node = Forwarder::new(2, NET);
         let mut sent = Vec::new();
         let find = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 1,
             destination: None,
             content: Content::FindOwners {
@@ -2594,6 +2842,7 @@ mod tests {
             surface_bytes: 13,
         };
         let arrival = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 3,
             destination: None,
             content: Content::Arrive {
@@ -2609,6 +2858,7 @@ mod tests {
         );
         // An owner notice can end at the hop boundary, but cannot be relayed beyond it.
         let found = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 3,
             destination: Some(2),
             content: Content::OwnerFound {
@@ -2674,7 +2924,7 @@ mod tests {
 
     #[test]
     fn hop_limits_owner_bounds_and_read_path_eviction_are_local() {
-        assert!(core::mem::size_of::<Forwarder>() <= 2048);
+        assert!(core::mem::size_of::<Forwarder>() <= 2304);
         let description = Description::new(&SURFACE).unwrap();
         let mut relay = Forwarder::new(2, NET);
         let mut owner = Forwarder::new(4, NET);
@@ -2723,7 +2973,7 @@ mod tests {
         let description = Description::new(&SURFACE).unwrap();
         let mut node = Forwarder::new(2, NET);
         let mut piece = [0; SURFACE_BYTES];
-        node.learn(4, 3, 2, 0, 1);
+        node.learn(4, 3, 2, 0, TimePerByte::measured(1, 1));
         let out = node
             .receive_surface(query(1, 0), &description, &mut piece, 1)
             .unwrap();
@@ -2762,7 +3012,7 @@ mod tests {
             Some(3)
         );
         let mut wrap = Forwarder::new(2, NET);
-        wrap.learn(4, 3, 2, u32::MAX - 100, 1);
+        wrap.learn(4, 3, 2, u32::MAX - 100, TimePerByte::measured(1, 1));
         wrap.receive_surface(query(1, 0), &description, &mut piece, u32::MAX - 99)
             .unwrap();
         wrap.expire(READ_MS);
@@ -2773,7 +3023,7 @@ mod tests {
             None
         );
         for (i, owner) in (4..8).enumerate() {
-            node.learn(owner, 3, 2, 100 + i as u32, 1);
+            node.learn(owner, 3, 2, 100 + i as u32, TimePerByte::measured(1, 1));
         }
         assert!(node.routes.iter().all(|r| r.owner != 4));
         node.expire(ROUTE_MS + 104);

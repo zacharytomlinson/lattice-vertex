@@ -13,8 +13,9 @@ Nordic nRF52840 and ESP32-C6 are both hardware targets. C6 support is needed for
 the Shelly devices as well as the existing prototypes. Keep each platform's
 dependencies isolated and the common kernel's interfaces and protocol portable.
 
-RF delivery investigation has resumed after the tablet coprocessor proof. Keep
-captures, diagnostic images, and vendor comparisons in the external local lab.
+RF range/PHY investigation is parked after the tablet coprocessor proof and
+bounded MAC ACK/retry implementation. Keep captures, diagnostic images, and
+vendor comparisons in the external local lab.
 Reproduce a concrete failure before changing radio behavior; successful delivery
 checks do not establish RF range or explain earlier absolute RSSI measurements.
 
@@ -101,13 +102,15 @@ execution; the kernel must not invent repeated transformer invocations.
 information nucleus needs for reasoning. Firmware can retain those definitions
 as static data and expose them through the common kernel.
 
-Nucleus solves and compiles programs, then delegates their fragments. Vertices
-install and execute their assigned native fragments. Neither the shared IR crate
-nor the vertex kernel needs an IR interpreter, compiler, or solver. The initial
-program model is a finite DAG of compiled conditional steps and native function
-calls. Preserve the current one-invocation-per-requirement synthesis limit;
-expanding that model belongs to nucleus/IR work and does not imply adding a
-general-purpose program runtime to each vertex.
+Nucleus solves and compiles programs, then delegates their fragments. For the
+basic installation, the tablet can compile the user's graph directly without an
+FSPS. The initial program is a finite DAG of state references, predicates/basic
+arithmetic, native transformer handles and arguments, and continuation references.
+Compilation binds those steps to participating vertices; it need not emit new
+machine code for each architecture. The vertex supplies the small execution
+primitives. Neither the shared IR crate nor the vertex kernel needs an IR
+interpreter, compiler, or solver. Preserve the current one-invocation-per-requirement
+synthesis limit; expanding it does not imply a general-purpose program runtime.
 
 State dependencies and transformer invocation have different roles. Upstream
 activation belongs to states used by conditions. A transformer is an invocation
@@ -368,7 +371,7 @@ PAN `0x4c56` remains a common discovery filter, not an allocated PAN or membersh
 credential. The network tag distinguishes advertised networks; startup currently
 adopts the first established network it hears. Choosing between independently
 owned deployments and authorizing operations are not decided by that tag or PAN.
-The `LVT` version-6 envelope carries discovery, proposals, surface reads, native
+The `LVT` version-7 envelope carries discovery, proposals, surface reads, native
 calls/results, and deltas; it rejects earlier wire versions. Ordinary discovery still
 repeats every 2–3 seconds after selection. Presence never causes an echo. Broadcast discovery/proposals do not request ACKs;
 directed presence/proposal responses use the common MAC ACK path. No peer table, appliance formation/join knob,
@@ -443,7 +446,7 @@ traversal through an advertising vertex now run in the common peer task. The
 [link protocol](../src/kernel/peer/LINKS.md) defines admission/refresh, enumeration,
 and the route hint. Host tests exercise a chained walk followed by a surface read;
 both MCU ports build. Destination records now retain two next-hop candidates,
-ranked by hops and observed exchange latency. Addressed invocations can split
+ranked by normalized directional delivery cost. Addressed invocations can split
 once into two copies; adaptive probability/coverage scoring remains subsequent work.
 
 ## Forwarding learned from communication
@@ -491,7 +494,7 @@ eight recent paths
 shared by surface, current-state, and link reads, four owner-query return paths,
 eight recent owner notices, four call paths, and eight delta duplicate keys. Eight
 adjacent-peer records are maintained separately from destination paths, inside a
-combined compile-time 2,048-byte ceiling. All return
+combined compile-time 2,304-byte ceiling. All return
 paths and duplicate keys expire after 10 seconds;
 confirmed routes after 60 seconds without another matching response. Path/history
 storage evicts its oldest record; the adjacent-peer records reject new admissions
@@ -505,9 +508,11 @@ membership, and a missing response does not prove absence. Startup tokens use
 local ticks, not durable boot identities; rapid restart or token reuse can collide
 with retained history until it expires. Fresh-query attempts recover independently.
 
-The current selector ranks hop count then measured request/reply latency and
-retains an alternate direction. Probability/airtime/energy scoring, adaptive
-broadcast coverage, and coordinated protection of unique bridges remain open. Arrival, owner discovery,
+The current selector ranks normalized directional time per delivered payload byte,
+then hop count/address for ties, and retains an alternate direction. Unknown
+costs remain explicit and rank after measured paths. Adaptive broadcast coverage,
+energy/probability objectives, and coordinated protection of unique bridges remain
+open. Arrival, owner discovery,
 reads, calls/results, and deltas are bounded to eight links. Channel survey/formation remains local and
 requires an existing radio neighbor; forwarding requires the same selected network
 and channel. Partition merging and coordinated channel migration remain separate.
@@ -536,12 +541,60 @@ token namespace; there is no periodic poller or foreign-state mirror. A consumer
 can compare that attribute's read watermark against later deltas within a boot;
 this is not an atomic multi-attribute snapshot or a reboot ordering mechanism.
 
+### Marginal communication cost
+
+Communication cost is normalized per unit of delivered information. The shared
+`lattice-peer-wire::cost::TimePerByte` represents microseconds per acknowledged
+MAC payload byte, in unsigned Q24.8 fixed point. Both MCU ports use the same
+meaning, independent of CPU clock. `ratio` compares two known costs;
+`estimate_us(quantity)` applies any byte quantity to the same value. Ten bytes
+and ten thousand bytes do not select different models. Energy is not silently
+mixed into the time unit.
+
+The resident transport measures each addressed send from its first attempt
+through its successful receive turn or exhausted attempts. This includes MAC
+header/FCS airtime, ACK waits, retry backoff, and the mandatory receive opportunity;
+the denominator counts the acknowledged payload once, excluding MAC header/FCS.
+Failed sends add service time and zero acknowledged bytes. Remote application
+execution and idle time between sends are not measured. The first implementation
+uses the kernel tick clock (1 ms on the supported ports), so these are quantized
+service estimates, not fine-resolution PHY timestamps or hard deadlines.
+
+Eight existing neighbor records own the measurements. Samples are aged by halving
+the accumulated evidence after roughly 4 KiB of acknowledged payload; 60 seconds
+without new samples makes the cost unknown. Four transient samples hand timing
+results from the radio task's sends to those records. No sample history array,
+allocator, network-wide cost table, or separate task is introduced. Frame overhead
+is amortized over the observed packet-size mix; changes in that mix or contention
+change the estimate as new observations arrive. A consumer counts the actual MAC
+payload bytes its operation will transmit, including its protocol envelopes.
+
+An owner's reply starts with zero remaining path cost. Each relay adds its own
+outgoing-link cost toward the replying neighbor and advertises that sum on the
+reverse reply. The recipient adds its own outgoing link to that suffix. Reverse
+link cost and request/reply processing latency are not substituted for forward
+cost. Route records retain the suffix separately, allowing fresh first-hop
+measurements to change ranking without copying or rediscovering the entire path.
+This is an additive serialized service estimate; overlapping transmissions or
+future traffic cannot be inferred as a guaranteed wall-clock completion time.
+
+Unknown is encoded as `0xffffffff`, not zero. Zero denotes an empty/local path.
+Unknown components or arithmetic overflow leave the estimate unknown. Known
+paths rank by their normalized cost, including when a longer route is cheaper
+than a direct link. Hop limits still bound traversal. Link enumeration exposes
+both the normalized outgoing cost and the existing round-trip diagnostic; RTT
+is no longer the routing objective.
+
+These quantities are available for updater planning, but no OTA service or updater
+scheduler is implemented by this change. Firmware-local flash/verification/boot
+costs remain distinct from communication time.
+
 ### Alternate directions and bounded redundant invocation
 
 Each cached owner retains up to two learned next-hop candidates. Selection
-uses hop count as a transmission-count proxy, then observed request/reply latency
-as a tie-breaker. These are local measurements, not a global optimum, calibrated
-energy estimate, or independent delivery probability. Failures withdraw the
+uses composed directional time per payload byte, then hop count and address
+for equal costs. Unknown estimates follow known estimates. These are local
+observations, not a global optimum or an independent delivery probability. Failures withdraw the
 specific direction; they must not erase a successful alternate for the same owner.
 Candidates come from correlated exchanges and guided traversal. Until an alternate
 is learned, the owner has only one known direction; no background path-probing
@@ -565,7 +618,7 @@ Reconverging copies join return paths only when their remaining scope is at leas
 that of the first copy; this prevents downstream echoes becoming upstream paths.
 Later longer branches are not retained at the convergence point. Delta/arrival
 dissemination remains the existing bounded broadcast behavior; adaptive coverage
-is separate. LVT v6 packs the invocation copy budget into its existing control
+is separate. LVT v7 packs the invocation copy budget into its existing control
 byte and rejects older wire versions.
 
 ## Attached tablet host
@@ -630,6 +683,21 @@ merging those records; receive waits become interruptible after formation. Owner
 invocation history has a 768-byte compile-time ceiling. No allocator is enabled
 by either MCU port. Loss, eviction, and reboot do not imply automatic recovery.
 
+## Firmware updates
+
+The [updater plan](FIRMWARE_UPDATES.md) applies the same normalized communication
+cost to image transfer and uses package-supplied dry-run measurements for flash
+work and activation downtime. The receiver stages and verifies an inactive image,
+then chooses a local activation opportunity. The port and bootloader own trial,
+confirmation, and recovery. Any capable peer can supply the package; neither the
+tablet nor nucleus is a required update coordinator.
+
+This is planned behavior. The first slice is local staging and boot recovery on
+Nordic and C6, followed by the common transfer path and autonomous activation.
+Current surface-handle compatibility and flash execution stalls are explicit
+implementation constraints. Firmware replacement remains separate from installing
+an automation's references, conditions, and native calls.
+
 ## Implementation map
 
 This is the working responsibility map used by the
@@ -652,9 +720,13 @@ flowchart TB
     discovery["kernel::peer: channel survey, computed rendezvous, arrival and message dispatch"]
     exposure["peer::exposure: borrowed local IR and bounded range encoding"]
     links["peer::links: maintained adjacent peers, confirmation, refresh and cursor enumeration"]
-    forwarding["peer::forwarding: bounded dissemination, return paths, cost-ranked directions, one invocation split"]
+    forwarding["peer::forwarding: bounded dissemination, return paths, normalized-cost directions, one invocation split"]
     radio["Nordic/C6 radio ports: fixed buffers, energy/CCA, immediate ACK, RX progress, hardware IRQs"]
     transport["kernel::radio: resident driver, notification waits and receive turns"]
+    cost["wire::cost: time per byte; radio::cost: bounded measurement handoff"]
+    update["kernel::update: image staging, verification and local activation: to build"]
+    flash["Port flash and trial/confirm operations: to build"]
+    boot["Bootloader image selection and recovery integration: to build"]
     mac["radio::mac: ACK matching, four attempts, backoff, eight recent senders"]
     rxbuffer["radio::receive: four owned frames captured before peer dispatch"]
     probe["src/kernel/radio/tests: transport probe, discovery counters and surface-range observer"]
@@ -719,6 +791,16 @@ flowchart TB
     startup -->|checks and borrows local description| exposure
     transport -->|retains frames captured after TX| rxbuffer
     rxbuffer -->|FIFO delivery through normal receive| transport
+    transport -->|measures send service and acknowledged bytes| cost
+    cost -->|samples retained with adjacent peers| links
+    links -->|directional unit cost| forwarding
+    forwarding -->|suffix cost in correlated replies| cost
+    discovery -.->|update records through existing forwarding| update
+    update -.->|same path cost times transfer quantity| cost
+    update -.->|bounded background work in existing execution contexts| tasks
+    update -.->|bounded storage operations and boot selection| flash
+    flash -.->|persistent trial and confirmation state| boot
+    boot -.->|selected image starts normal kernel| startup
     transport -->|bounded link delivery and duplicate filtering| mac
     radio -->|ACK frame recognition| mac
     transport -->|owns selected driver| radio
@@ -738,7 +820,7 @@ flowchart TB
     radio -->|IRQ waker notifies resident task| tasks
 
     classDef planned stroke-dasharray: 5 5;
-    class peers planned;
+    class peers,update,flash,boot planned;
 ```
 
 ## Current baseline
@@ -759,11 +841,11 @@ The separate XIAO fixture can preserve its stock bootloader and provide USB
 logging/upload entry; those are fixture facilities, not kernel requirements.
 
 Prior board bring-up exercised discovery and formation on C6, and Nordic/C6 peer
-exchange through the kernel. RF quality remains unresolved and the investigation
-is active. Historical captures used older wire revisions and live in the external
-lab; they do not establish current protocol delivery or general loss-free operation.
+exchange through the kernel. RF quality remains unresolved and the range/PHY
+investigation is parked. Historical captures used older wire revisions and live
+in the external lab; they do not establish current protocol delivery or general loss-free operation.
 
-The current LVT v6 path has host tests and both MCU builds: borrowed surface range
+The current LVT v7 path has host tests and both MCU builds: borrowed surface range
 reads, maintained adjacent links and guided traversal, bounded relay directions,
 native appliance binding,
 owner-directed invocation/results, current-state reads, and registered observation
@@ -772,10 +854,14 @@ and grouped-delta ordering. Kernel task/protocol behavior remains in common sour
 portable codecs, fixture counters, and hardware logging live in separate test crates.
 
 Authentication, tablet UI integration, installed compiled fragments, and
-their distributed activation remain open. Local dependents are immediate native
-callbacks, not an installed distributed DAG. The Linux/tablet USB companion path
+their distributed activation remain open. Firmware updating and boot recovery
+integration are planned in [the updater design](FIRMWARE_UPDATES.md), not provided
+by the existing serial upload fixtures. Local dependents are immediate native
+callbacks, not an installed distributed DAG. The earlier LVT v6/host v3 Linux/tablet USB companion path
 has exercised native calls, state reads and pushed deltas on Nordic hardware;
-this does not establish physical appliance behavior or loss-free RF.
+this does not establish physical appliance behavior or loss-free RF. The v7/v4
+cost exchange has host and build checks; a coordinated firmware/client rollout
+and live cost measurements remain separate from those checks.
 
 ## Next implementation sequence
 
@@ -830,7 +916,11 @@ history is bounded and volatile; this is not an exactly-once ledger.
    bounded buffering and explicit local-loss notices. Both MCU images build. The
    tablet daemon and installed conditional activation remain open.
 
-Extend that working path into compiled-fragment installation, conditional
+The immediate next work is [firmware staging and trial-boot recovery](FIRMWARE_UPDATES.md#implementation-sequence),
+starting with a concrete boot layout and local two-image check. Transfer policy
+then reuses the kernel's measured unit costs and existing peer communication.
+
+Extend the working control path into compiled-fragment installation, conditional
 activation, and their forwarding semantics. Native transformer invocation is now
 available independently of fragment installation. Keep upstream state
 activation distinct from downstream execution. Nucleus supplies compiled work;

@@ -1,5 +1,6 @@
 use super::*;
 use crate::kernel::peer::{frame::Content, Network};
+use crate::kernel::radio::cost::TimePerByte;
 use crate::{
     ir::Value,
     kernel::peer::frame::{InvokeStatus, StateReadResult},
@@ -63,6 +64,7 @@ fn delivered(message: Message<'_>, recipient: u64) -> Message<'static> {
         _ => panic!("unexpected message"),
     };
     Message {
+        path_cost: TimePerByte::UNKNOWN,
         source: decoded.source,
         destination: decoded.destination,
         content,

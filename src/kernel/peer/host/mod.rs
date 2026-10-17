@@ -9,6 +9,7 @@ use super::{
     invocation::Invocations,
 };
 use crate::kernel::appliance::Native;
+use crate::kernel::radio::cost::TimePerByte;
 use crate::{port, sync::TaskContext, types::UBaseType_t};
 pub use lattice_peer_wire::host::{Arguments, Bytes, Decoder, Failure, Packet, MAX_PACKET};
 pub use lattice_peer_wire::StateChange;
@@ -294,6 +295,7 @@ impl Host {
                         revision,
                         peer: link.map_or(0, |l| l.peer),
                         round_trip_ms: link.map_or(0, |l| l.round_trip_ms),
+                        cost: link.map_or(TimePerByte::UNKNOWN, |l| l.cost),
                     }
                 }
                 Packet::ReadSurface { offset, .. } if offset <= description.len() => {
@@ -421,6 +423,7 @@ impl Host {
                         revision,
                         peer: link.map_or(0, |l| l.peer),
                         round_trip_ms: link.map_or(0, |l| l.round_trip_ms),
+                        cost: link.map_or(TimePerByte::UNKNOWN, |l| l.cost),
                     },
                 ),
                 Content::SurfacePart {

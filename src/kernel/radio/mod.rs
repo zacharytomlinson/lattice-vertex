@@ -35,3 +35,6 @@ pub enum Error {
     NoAcknowledgement,
     Aborted,
 }
+
+/// Shared normalized communication cost and internal measurement support.
+pub mod cost;

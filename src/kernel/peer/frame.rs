@@ -4,6 +4,7 @@
 use super::{Network, PAN_ID};
 #[cfg(test)]
 use crate::ir::{Integer, Value};
+use crate::kernel::radio::cost::TimePerByte;
 use crate::kernel::radio::MAX_FRAME_SIZE;
 use byte::BytesExt;
 use ieee802154::mac::{
@@ -19,12 +20,12 @@ pub(super) use lattice_peer_wire::scalar::{
 pub(crate) use lattice_peer_wire::{InvokeStatus, StateReadResult};
 
 const PAN: PanId = PanId(PAN_ID);
-const MAGIC: &[u8; 4] = b"LVT\x06";
+const MAGIC: &[u8; 4] = b"LVT\x07";
 pub(super) const MAX_HOPS: u8 = 8;
 const MAX_PAYLOAD: usize = MAX_FRAME_SIZE - 21;
 // Worst-case addressed MAC header plus the complete routed reply envelope.
 pub(super) use lattice_peer_wire::SURFACE_BYTES;
-const _: () = assert!(SURFACE_BYTES == MAX_PAYLOAD - 37);
+const _: () = assert!(SURFACE_BYTES == MAX_PAYLOAD - 41);
 pub(super) use lattice_peer_wire::{CALL_ARGUMENT_BYTES, MAX_CALL_ARGUMENTS};
 const _: () = assert!(CALL_ARGUMENT_BYTES == MAX_PAYLOAD - 43);
 
@@ -78,6 +79,7 @@ pub(super) enum LinkPhase {
 pub(super) struct PeerLink {
     pub peer: u64,
     pub round_trip_ms: u16,
+    pub cost: TimePerByte,
 }
 
 /// Enumerate an owner's resident links after a peer-address cursor. A nonzero
@@ -177,6 +179,8 @@ pub(super) enum Content<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Message<'a> {
+    /// Cost from this sender to the response owner, excluding the recipient link.
+    pub path_cost: TimePerByte,
     pub source: u64,
     pub destination: Option<u64>,
     pub content: Content<'a>,
@@ -185,11 +189,15 @@ pub(super) struct Message<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct InvalidFrame;
 
+fn carries_cost(opcode: u8) -> bool {
+    matches!(opcode, 5 | 7 | 9 | 12 | 15)
+}
+
 impl<'a> Message<'a> {
     pub fn encode(&self, sequence: u8, out: &mut [u8; MAX_FRAME_SIZE]) -> usize {
-        let mut payload = [0; 37 + SURFACE_BYTES];
+        let mut payload = [0; MAX_PAYLOAD];
         payload[..4].copy_from_slice(MAGIC);
-        let size = match self.content {
+        let mut size = match self.content {
             Content::Discover => 5,
             Content::Present(network) | Content::Propose(network) => {
                 payload[4] = match self.content {
@@ -352,7 +360,8 @@ impl<'a> Message<'a> {
                     payload[53] = 1;
                     payload[54..62].copy_from_slice(&link.peer.to_le_bytes());
                     payload[62..64].copy_from_slice(&link.round_trip_ms.to_le_bytes());
-                    64
+                    payload[64..68].copy_from_slice(&link.cost.raw().to_le_bytes());
+                    68
                 } else {
                     payload[53] = 0;
                     54
@@ -422,6 +431,10 @@ impl<'a> Message<'a> {
                 }
             }
         };
+        if carries_cost(payload[4]) {
+            payload[size..size + 4].copy_from_slice(&self.path_cost.raw().to_le_bytes());
+            size += 4;
+        }
         let destination = match self.destination {
             Some(a) => Address::Extended(PAN, ExtendedAddress(a)),
             None => Address::Short(PAN, ShortAddress(0xffff)),
@@ -479,10 +492,22 @@ impl<'a> Message<'a> {
             Some(Address::Short(PAN, ShortAddress(0xffff))) => None,
             _ => return Err(InvalidFrame),
         };
-        let p = frame.payload;
-        if p.len() < 5 || &p[..4] != MAGIC {
+        let payload = frame.payload;
+        if payload.len() < 5 || &payload[..4] != MAGIC {
             return Err(InvalidFrame);
         }
+        let (p, path_cost) = if carries_cost(payload[4]) {
+            if payload.len() < 9 {
+                return Err(InvalidFrame);
+            }
+            let at = payload.len() - 4;
+            (
+                &payload[..at],
+                TimePerByte::from_raw(u32::from_le_bytes(payload[at..].try_into().unwrap())),
+            )
+        } else {
+            (payload, TimePerByte::UNKNOWN)
+        };
         let content = match (p[4], p.len(), destination) {
             (0, 5, None) => Content::Discover,
             (1 | 2, 14, _) => {
@@ -796,7 +821,7 @@ impl<'a> Message<'a> {
                     token,
                 }
             }
-            (14, 49, _) | (15, 54 | 64, Some(_)) => {
+            (14, 49, _) | (15, 54 | 68, Some(_)) => {
                 let network = Network {
                     founder: u64::from_le_bytes(p[5..13].try_into().unwrap()),
                     channel: p[13],
@@ -832,19 +857,23 @@ impl<'a> Message<'a> {
                     let revision = u32::from_le_bytes(p[49..53].try_into().unwrap());
                     let link = match (p[53], p.len()) {
                         (0, 54) => None,
-                        (1, 64) => {
+                        (1, 68) => {
                             let peer = u64::from_le_bytes(p[54..62].try_into().unwrap());
                             let round_trip_ms = u16::from_le_bytes(p[62..64].try_into().unwrap());
                             if !valid_address(peer)
                                 || peer == read.owner
                                 || peer <= read.after
                                 || round_trip_ms == 0
+                                || p[64..68] == [0; 4]
                             {
                                 return Err(InvalidFrame);
                             }
                             Some(PeerLink {
                                 peer,
                                 round_trip_ms,
+                                cost: TimePerByte::from_raw(u32::from_le_bytes(
+                                    p[64..68].try_into().unwrap(),
+                                )),
                             })
                         }
                         _ => return Err(InvalidFrame),
@@ -860,7 +889,21 @@ impl<'a> Message<'a> {
             }
             _ => return Err(InvalidFrame),
         };
+        let response_hops = match content {
+            Content::OwnerFound { hops, .. }
+            | Content::SurfacePart { hops, .. }
+            | Content::InvocationResult { hops, .. }
+            | Content::StateValue { hops, .. }
+            | Content::LinkEntry { hops, .. } => Some(hops),
+            _ => None,
+        };
+        if let Some(hops) = response_hops {
+            if path_cost.is_known() && ((hops == 1) != (path_cost == TimePerByte::ZERO)) {
+                return Err(InvalidFrame);
+            }
+        }
         Ok(Self {
+            path_cost,
             source,
             destination,
             content,
@@ -965,6 +1008,7 @@ mod tests {
         let mut wire = [0; MAX_FRAME_SIZE];
         for copies in [1, 2] {
             let message = Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: A,
                 destination: Some(B),
                 content: Content::Invoke {
@@ -991,6 +1035,7 @@ mod tests {
             );
         }
         let message = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: A,
             destination: None,
             content: Content::Invoke {
@@ -1027,6 +1072,7 @@ mod tests {
             LinkPhase::Reject,
         ] {
             let message = Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: A,
                 destination: Some(B),
                 content: Content::LinkExchange {
@@ -1043,7 +1089,7 @@ mod tests {
                     b'L',
                     b'V',
                     b'T',
-                    6,
+                    7,
                     13,
                     99,
                     0,
@@ -1080,6 +1126,7 @@ mod tests {
             assert!(Message::decode(&wire[..n], B, 15).is_err());
         }
         let query = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: A,
             destination: Some(B),
             content: Content::ReadLinks {
@@ -1093,7 +1140,7 @@ mod tests {
         assert_eq!(
             &wire[21..n],
             &[
-                b'L', b'V', b'T', 6, 14, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
+                b'L', b'V', b'T', 7, 14, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
                 23, 22, 21, 20, 19, 18, 17, 0x34, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 9, 7, 6, 5, 4, 3,
                 2, 1, 8,
             ]
@@ -1101,11 +1148,13 @@ mod tests {
         for link in [
             None,
             Some(PeerLink {
+                cost: TimePerByte::from_raw(0x01020304),
                 peer: A,
                 round_trip_ms: 3,
             }),
         ] {
             let reply = Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: B,
                 destination: Some(A),
                 content: Content::LinkEntry {
@@ -1124,9 +1173,9 @@ mod tests {
                     if local == B {
                         70
                     } else if link.is_some() {
-                        85
+                        93
                     } else {
-                        75
+                        79
                     }
                 );
                 assert_eq!(Message::decode(&wire[..n], local, 15).unwrap(), message);
@@ -1152,6 +1201,10 @@ mod tests {
             bad[21 + 53] = 2;
             assert!(Message::decode(&bad[..n], A, 15).is_err());
             if link.is_some() {
+                assert_eq!(&wire[21 + 64..21 + 68], &[4, 3, 2, 1]);
+                let mut invalid_cost = wire;
+                invalid_cost[21 + 64..21 + 68].fill(0);
+                assert!(Message::decode(&invalid_cost[..n], A, 15).is_err());
                 for peer in [0, B, u64::MAX] {
                     let mut bad = wire;
                     bad[21 + 54..21 + 62].copy_from_slice(&peer.to_le_bytes());
@@ -1227,6 +1280,7 @@ mod tests {
             attribute: 42,
         };
         let request = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: A,
             destination: Some(B),
             content: Content::ReadState {
@@ -1241,7 +1295,7 @@ mod tests {
         assert_eq!(
             &wire[21..n],
             &[
-                b'L', b'V', b'T', 6, 11, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
+                b'L', b'V', b'T', 7, 11, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
                 23, 22, 21, 20, 19, 18, 17, 0x34, 0x12, 42, 0, 0, 0, 0, 0, 0, 0, 8,
             ]
         );
@@ -1274,6 +1328,7 @@ mod tests {
             ),
         ] {
             let reply = Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: B,
                 destination: Some(A),
                 content: Content::StateValue {
@@ -1284,7 +1339,7 @@ mod tests {
                 },
             };
             let n = reply.encode(8, &mut wire);
-            assert_eq!(n, length);
+            assert_eq!(n, length + 4);
             assert_eq!(wire[21 + 41], tag);
             if let StateReadResult::Value { sequence, .. } = result {
                 assert_eq!(&wire[21 + 42..21 + 46], &sequence.to_le_bytes());
@@ -1362,6 +1417,7 @@ mod tests {
         assert_eq!(n, 56);
         assert!(Message::decode(&wire[..n], B, 15).is_ok());
         let bad_value = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: B,
             destination: Some(A),
             content: Content::StateValue {
@@ -1441,6 +1497,7 @@ mod tests {
             transformer: 42,
         };
         let message = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: A,
             destination: Some(B),
             content: Content::Invoke {
@@ -1480,6 +1537,7 @@ mod tests {
             transformer: 0x0807060504030201,
         };
         let request = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: A,
             destination: Some(B),
             content: Content::Invoke {
@@ -1496,13 +1554,14 @@ mod tests {
         assert_eq!(
             &wire[21..n],
             &[
-                b'L', b'V', b'T', 6, 8, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
+                b'L', b'V', b'T', 7, 8, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
                 23, 22, 21, 20, 19, 18, 17, 1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8, 8, 1, 0, 1,
             ]
         );
         for message in [
             request,
             Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: B,
                 destination: Some(A),
                 content: Content::InvocationResult {
@@ -1513,6 +1572,7 @@ mod tests {
                 },
             },
             Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: A,
                 destination: None,
                 content: Content::StateChanged {
@@ -1527,6 +1587,7 @@ mod tests {
                 },
             },
             Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: A,
                 destination: None,
                 content: Content::StateChanged {
@@ -1541,6 +1602,7 @@ mod tests {
                 },
             },
             Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: A,
                 destination: None,
                 content: Content::StateChanged {
@@ -1589,6 +1651,7 @@ mod tests {
         }
         // Status and scalar tags are strict; neither failure is an application call.
         let reply = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: B,
             destination: Some(A),
             content: Content::InvocationResult {
@@ -1626,7 +1689,7 @@ mod tests {
                 },
                 None,
                 &[
-                    b'L', b'V', b'T', 6, 3, 99, 0, 0, 0, 0, 0, 0, 0, 23, 8, 7, 6, 5, 4, 3, 2, 1,
+                    b'L', b'V', b'T', 7, 3, 99, 0, 0, 0, 0, 0, 0, 0, 23, 8, 7, 6, 5, 4, 3, 2, 1,
                     0x34, 0x12, 195, 0, 1,
                 ],
             ),
@@ -1639,7 +1702,7 @@ mod tests {
                 },
                 None,
                 &[
-                    b'L', b'V', b'T', 6, 6, 99, 0, 0, 0, 0, 0, 0, 0, 23, 8, 7, 6, 5, 4, 3, 2, 1,
+                    b'L', b'V', b'T', 7, 6, 99, 0, 0, 0, 0, 0, 0, 0, 23, 8, 7, 6, 5, 4, 3, 2, 1,
                     0x34, 0x12, 8,
                 ],
             ),
@@ -1653,13 +1716,14 @@ mod tests {
                 },
                 Some(B),
                 &[
-                    b'L', b'V', b'T', 6, 7, 99, 0, 0, 0, 0, 0, 0, 0, 23, 0x18, 0x17, 0x16, 0x15,
+                    b'L', b'V', b'T', 7, 7, 99, 0, 0, 0, 0, 0, 0, 0, 23, 0x18, 0x17, 0x16, 0x15,
                     0x14, 0x13, 0x12, 0x11, 0x34, 0x12, 8, 7, 6, 5, 4, 3, 2, 1, 195, 0, 1,
                 ],
             ),
         ];
         for &(content, destination, expected) in cases {
             let message = Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: A,
                 destination,
                 content,
@@ -1667,7 +1731,15 @@ mod tests {
             let mut wire = [0; MAX_FRAME_SIZE];
             let n = message.encode(42, &mut wire);
             let header = if destination.is_some() { 21 } else { 15 };
-            assert_eq!(&wire[header..n], expected);
+            let suffix = if matches!(content, Content::OwnerFound { .. }) {
+                4
+            } else {
+                0
+            };
+            assert_eq!(&wire[header..n - suffix], expected);
+            if suffix != 0 {
+                assert_eq!(&wire[n - 4..n], &[255; 4]);
+            }
             assert_eq!(Message::decode(&wire[..n], B, 23).unwrap(), message);
             assert!(Message::decode(&wire[..n], B, 22).is_err());
             for end in 0..n {
@@ -1710,6 +1782,7 @@ mod tests {
             assert!(Message::decode(&wire[..n], B, 23).is_err());
             // A forwarded packet has a new link sender but retains its owner/seeker.
             let forwarded = Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: A + 1,
                 destination,
                 content: match content {
@@ -1771,6 +1844,7 @@ mod tests {
                 offset,
             };
             let message = Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: A,
                 destination: Some(B),
                 content: Content::SurfacePart {
@@ -1803,6 +1877,7 @@ mod tests {
         }
         for destination in [None, Some(A)] {
             let message = Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: B,
                 destination,
                 content: Content::ReadSurface {
@@ -1823,7 +1898,7 @@ mod tests {
             assert_eq!(
                 &out[p..n],
                 &[
-                    b'L', b'V', b'T', 6, 4, 99, 0, 0, 0, 0, 0, 0, 0, 23, 0x18, 0x17, 0x16, 0x15,
+                    b'L', b'V', b'T', 7, 4, 99, 0, 0, 0, 0, 0, 0, 0, 23, 0x18, 0x17, 0x16, 0x15,
                     0x14, 0x13, 0x12, 0x11, 8, 7, 6, 5, 4, 3, 2, 1, 0x34, 0x12, 0x78, 0x56, 8
                 ]
             );
@@ -1846,36 +1921,39 @@ mod tests {
         let cases: &[(Message, &[u8])] = &[
             (
                 Message {
+                    path_cost: TimePerByte::UNKNOWN,
                     source: A,
                     destination: None,
                     content: Content::Discover,
                 },
                 &[
                     0x41, 0xd8, 42, 0x56, 0x4c, 0xff, 0xff, 8, 7, 6, 5, 4, 3, 2, 1, b'L', b'V',
-                    b'T', 6, 0,
+                    b'T', 7, 0,
                 ],
             ),
             (
                 Message {
+                    path_cost: TimePerByte::UNKNOWN,
                     source: A,
                     destination: Some(B),
                     content: Content::Present(network),
                 },
                 &[
                     0x61, 0xdc, 42, 0x56, 0x4c, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 8,
-                    7, 6, 5, 4, 3, 2, 1, b'L', b'V', b'T', 6, 1, 0x28, 0x27, 0x26, 0x25, 0x24,
+                    7, 6, 5, 4, 3, 2, 1, b'L', b'V', b'T', 7, 1, 0x28, 0x27, 0x26, 0x25, 0x24,
                     0x23, 0x22, 0x21, 23,
                 ],
             ),
             (
                 Message {
+                    path_cost: TimePerByte::UNKNOWN,
                     source: A,
                     destination: None,
                     content: Content::Propose(network),
                 },
                 &[
                     0x41, 0xd8, 42, 0x56, 0x4c, 0xff, 0xff, 8, 7, 6, 5, 4, 3, 2, 1, b'L', b'V',
-                    b'T', 6, 2, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 23,
+                    b'T', 7, 2, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 23,
                 ],
             ),
         ];
@@ -1959,6 +2037,7 @@ mod tests {
         }
         for content in [Content::Discover, Content::Present(network)] {
             let invalid = Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: A,
                 destination: if content == Content::Discover {
                     Some(B)

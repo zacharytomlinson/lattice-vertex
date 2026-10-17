@@ -35,8 +35,8 @@ remain responsible for hardware limits; the kernel does not interpret IR precond
 
 ## One frame per call, read, result, or delta
 
-These use **LVT version 6** and the MAC/network profile in
-[EXPOSURE.md](EXPOSURE.md#read-envelope). Versions before 6 are incompatible.
+These use **LVT version 7** and the MAC/network profile in
+[EXPOSURE.md](EXPOSURE.md#read-envelope). Versions before 7 are incompatible.
 All numbers are little-endian; no strings or Rust layouts travel on the wire.
 The common payload prefix is magic/version (4), opcode (1), network founder (8),
 and channel (1).
@@ -44,10 +44,14 @@ and channel (1).
 | Opcode | Fields after the common prefix | MAC bytes including payload, before FCS |
 | --- | --- | --- |
 | 8: invoke | Caller `u64`, owner `u64`, request `u32`, transformer reference `u64`, packed scope/copy budget `u8`, argument count `u8`, typed scalar arguments | Addressed: 65–125; one Boolean argument: 67 |
-| 9: invocation result | Same caller/owner/request/transformer, status `u8`, distance `u8` | Addressed: 65 |
+| 9: invocation result | Same caller/owner/request/transformer, status `u8`, distance `u8`, path cost `u32` | Addressed: 69 |
 | 10: state changed | Owner `u64`, attribute reference `u64`, sequence `u32`, distance `u8`, typed scalar value or unavailable tag | Broadcast: 51–59; Boolean: 52 |
 | 11: read state | Reader `u64`, owner `u64`, request `u16`, attribute reference `u64`, remaining scope `u8` | Addressed: 62; broadcast exploration: 56 |
-| 12: state value | Same reader/owner/request/attribute, distance `u8`, result tag `u8`; successful read adds change sequence `u32` and typed scalar or unavailable tag | Addressed: 63 for a failure; 68–76 for a value; Boolean: 69 |
+| 12: state value | Same reader/owner/request/attribute, distance `u8`, result tag `u8`; successful read adds change sequence `u32` and typed scalar or unavailable tag; ends with path cost `u32` | Addressed: 67 for a failure; 72–80 for a value; Boolean: 73 |
+
+Replies (opcodes 9 and 12) append a Q24.8 microseconds-per-byte path cost;
+`0xffffffff` is unknown and an owner starts at zero. See the cost model in
+[the kernel direction](../../../docs/KERNEL_DIRECTION.md#marginal-communication-cost).
 
 The invocation control byte keeps remaining hops (1–8) in bits 0–3. Bit 4 is
 `copies - 1`: zero permits one copy, one permits a single split into two copies.
@@ -72,10 +76,11 @@ An error can follow a real partial change; that observation still emits its delt
 
 Invocations reuse owner directions learned from correlated discovery, read, or
 invocation replies. Each of three cached owners can retain up to two different next
-hops. Selection favors fewer hops, then lower observed request/reply latency,
-then the next-hop address to break ties. A maintained direct neighbor takes
-precedence. Latency includes remote processing and local scheduling; this is a
-local heuristic, not a calibrated airtime/energy or loss-probability model.
+hops. Selection favors lower composed time per acknowledged payload byte, then
+hop count/address for ties. A direct neighbor competes on the same cost; a cheaper
+measured indirect path can win. Unknown costs rank after known costs. Correlated
+replies carry the sender-to-owner suffix; the receiving node adds its outgoing
+link cost. Round-trip latency no longer sets route preference.
 Alternates must first be learned from actual correlated exchanges or guided
 traversal; this increment does not add a background route-probing workload.
 
@@ -197,7 +202,7 @@ ordering across reboot, compensate for packet loss, or prove physical convergenc
 
 ## Storage and validation
 
-The common forwarder retains its 2,048-byte compile-time ceiling, including three
+The common forwarder retains its 2,304-byte compile-time ceiling, including three
 owners with two candidate directions each, maintained adjacent links, read/discovery
 records, four call paths with two-way branch bookkeeping, and eight delta duplicate keys. Owner
 invocation history has a 768-byte ceiling. Appliance and transport storage are
@@ -209,7 +214,7 @@ after physical changes, grouped-report ordering, instance filtering, unavailable
 values, hard eviction, relayed results/deltas, scope/expiry, and numeric wire bounds.
 State-read checks also cover unavailable/busy/unknown results, delayed replies versus newer deltas, two-relay delivery, shared-path
 correlation/eviction, and preserving pending changes. Multipath checks cover
-cost ordering, independent failure/expiry, split-budget conservation, reconvergence,
+normalized-cost ordering, independent failure/expiry, split-budget conservation, reconvergence,
 a late second copy, and a lost branch using encoded frames and the native fixture.
 They prove single invocation while its result remains retained; they do not extend
 that guarantee across owner-history eviction or reboot.

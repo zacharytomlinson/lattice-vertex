@@ -46,7 +46,7 @@ The on-air discovery profile is:
 | Discovery destination | PAN `0x4c56`, short broadcast `0xffff` |
 | Presence destination | PAN `0x4c56`, requesting peer's extended address |
 | Proposal destination | Broadcast solicits an answer; directed reply carries the candidate's preferred record |
-| Discovery payload | `4c 56 54 06` (`LVT`, version 6), then kind 0 (discover), 1 (present), or 2 (propose) |
+| Discovery payload | `4c 56 54 07` (`LVT`, version 7), then kind 0 (discover), 1 (present), or 2 (propose) |
 | Present/propose fields | Founding address: 8 bytes little-endian; channel: 1 byte |
 | Size before hardware FCS | 20 bytes discovery; 35 bytes directed presence/proposal; 29 bytes broadcast proposal |
 
@@ -91,7 +91,8 @@ wrong resident channel, invalid network tags, and wrong addressing for a kind
 are rejected. Candidates advertise and answer broadcasts while visiting channels,
 with their proposed operating channel in the payload. That proposal
 may name another channel; established presence must match the receive channel.
-Versions 1–5 are intentionally incompatible with the current version 6.
+Versions 1–6 are intentionally incompatible with version 7; host v4 is paired
+with its 63-byte ranges and normalized link costs.
 Host checks cover wire vectors, rejection boundaries, channel selection, proposal
 ordering, inherited network replies, response termination, and rendezvous overlap:
 
@@ -125,7 +126,7 @@ the range/forwarding checks. Two passive observers do not initiate reads.
 
 ## Validation scope
 
-The current version-6 kernel has host/build validation, plus a two-Nordic
+The earlier version-6 kernel had host/build validation, plus a two-Nordic
 attached-host `ReadLinks` run. The Linux client obtained the attached resident's
 neighbor and read that neighbor's reciprocal link and end-of-list over radio.
 The test exposed a back-to-back discovery/link-offer conflict; maintenance now

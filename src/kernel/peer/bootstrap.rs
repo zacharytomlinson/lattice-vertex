@@ -2,6 +2,8 @@
 //! All search storage is fixed and local to the resident radio task's stack.
 
 use super::{frame::Content, Network};
+#[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
+use crate::kernel::radio::cost::TimePerByte;
 
 const CHANNELS: usize = 16;
 const SURVEYS: u8 = 2;
@@ -147,6 +149,7 @@ mod runtime {
             send(
                 radio,
                 Message {
+                    path_cost: TimePerByte::UNKNOWN,
                     source: local,
                     destination: None,
                     content: Content::Discover,
@@ -270,6 +273,7 @@ mod runtime {
                 send(
                     radio,
                     Message {
+                        path_cost: TimePerByte::UNKNOWN,
                         source: local,
                         destination: None,
                         content: Content::Propose(competing.unwrap()),

@@ -9,9 +9,10 @@ A link is distinct from a learned path toward a farther owner and from an
 installed program edge. The local link records provide a bounded piece of network
 memory and a direct forwarding direction. Destination paths can be learned through
 those links. The destination cache now retains two directions per owner, ranks
-hop count then observed exchange latency, and supports a bounded invocation split.
+normalized directional time per payload byte, and supports a bounded invocation split.
 See [invocation forwarding](INVOCATION.md#forwarding-and-duplicate-commands).
-These local cost observations do not establish independent end-to-end failure probabilities.
+Link measurements include ACK/retry service time. They do not establish independent
+end-to-end failure probabilities. Unknown cost is distinct from a zero-cost path.
 
 ## Establishment and maintenance
 
@@ -48,8 +49,10 @@ These control exchanges never invoke or retry appliance transformers.
 
 The retained round-trip sample measures the local maintenance exchange in
 milliseconds (minimum 1), including processing/scheduling delay. It is useful
-link evidence, not an airtime measurement, independent path-failure probability,
-or implemented routing score. Neither radio's power configuration changes.
+a diagnostic. The separate `cost` field is outgoing microseconds per acknowledged
+MAC payload byte (Q24.8); it comes from actual sends, not from dividing this RTT.
+Its records expire with the neighbor, or become unknown after 60 seconds without
+a transmission sample. Neither radio's power configuration changes.
 
 ## Reading and following references
 
@@ -83,12 +86,13 @@ namespace. Link-read correlation includes owner, cursor, and via. Duplicate requ
 are suppressed within retained history; a retry requires a fresh read token. The
 existing expiry, oldest eviction, and TX-failure rules apply. A failed request
 heading toward a via invalidates that direction, not an unrelated target route.
-Direct maintained neighbors take precedence over cached indirect directions.
+Direct maintained neighbors and cached indirect directions compete on the same
+normalized cost; hop count and address only break ties.
 
 ## Wire format
 
-These use **LVT v6**. The link-operation layouts are unchanged, but v6 introduces
-invocation copy budgets and rejects older wire versions.
+These use **LVT v7**. Link replies now include the advertised neighbor cost and
+the remaining return-sender-to-owner path cost. Older wire versions are rejected.
 The common payload prefix remains magic/version (4 bytes), opcode (1), network
 founder (8), and channel (1). Integers are little-endian.
 
@@ -96,7 +100,7 @@ founder (8), and channel (1). Integers are little-endian.
 | --- | --- | --- |
 | 13: link exchange | Phase `u8` (0 Offer, 1 Accept, 2 Confirm, 3 Reject), token `u32` | 40, addressed one-hop only |
 | 14: read links | Reader `u64`, owner `u64`, request `u16`, after `u64`, via `u64`, remaining scope `u8` | 70 addressed; 64 broadcast exploration |
-| 15: link entry | Same reader/owner/request/after/via, distance `u8`, membership revision `u32`, entry tag `u8`; tag 1 adds peer `u64` and round-trip milliseconds `u16`; tag 0 is end | 85 for an entry; 75 for end, addressed reverse path |
+| 15: link entry | Same reader/owner/request/after/via, distance `u8`, membership revision `u32`, entry tag `u8`; tag 1 adds peer `u64` and round-trip milliseconds `u16`, outgoing cost `u32`; tag 0 is end. Both append path cost `u32` | 93 for an entry; 79 for end, addressed reverse path |
 
 Link exchanges are never relayed. Zero tokens, unknown phases, foreign network
 records, and broadcast exchanges are rejected. Link entries reject self links,
@@ -113,8 +117,9 @@ return paths. The resident peer task owns both and performs periodic link work
 on its existing discovery wakeup. The old automatic startup `FindOwners` search
 is removed; explicit bounded owner searches and compact arrivals remain supported.
 
-Link storage has a 320-byte compile-time ceiling and is included in the
-forwarder's 2,048-byte ceiling. No allocator, per-peer task, foreign-surface store,
+Link storage has a 448-byte compile-time ceiling (eight existing neighbors,
+now including measurement totals and freshness) and is included in the
+forwarder's 2,304-byte ceiling. No allocator, per-peer task, foreign-surface store,
 new hardware experiment, or test-only receive path is added.
 
 Colocated host checks cover phase/token correlation, simultaneous opens, lost

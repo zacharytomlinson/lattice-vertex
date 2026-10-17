@@ -67,15 +67,14 @@ eight recent paths shared
 by surface and current-state reads,
 four owner-query return paths, eight recent owner notices, four invocation paths,
 eight delta duplicate keys, and eight maintained adjacent-peer records, within a
-2,048-byte compile-time ceiling. Link enumeration shares the same read paths.
+2,304-byte compile-time ceiling. Link enumeration shares the same read paths.
 Invocation paths retain exact argument bytes; no foreign definitions are retained.
 Read/query/notice records expire after 10 seconds, confirmed directions after 60 seconds without another
 matching reply; expiry uses wrapping millisecond arithmetic. Full storage evicts
 the oldest record. A failed addressed TX removes that direction. An expired
 unanswered read removes its unconfirmed direction unless a newer response has
 confirmed it. Subsequent requests then explore again. There is no automatic
-retry or guaranteed delivery for reads. Selection uses hop count then observed
-exchange latency; discovery can learn a second direction from a correlated later
+retry or guaranteed delivery for reads. Selection uses normalized directional time per payload byte; discovery can learn a second direction from a correlated later
 owner reply while suppressing duplicate owner notices upstream.
 
 A reader must use a fresh 16-bit request token for each attempt, including a retry
@@ -99,9 +98,9 @@ exactly-once delivery or complete membership protocol. Mutation calls have separ
 
 ## Read envelope
 
-`LVT` **version 6** retains discovery/arrival/search (0–3, 6–7), surface/state
+`LVT` **version 7** retains discovery/arrival/search (0–3, 6–7), surface/state
 reads (4–5, 11–12), native invocation/result and deltas (8–10), and link operations
-(13–15). The invocation control byte now encodes hop and copy budgets; see
+(13–15). The invocation control byte encodes hop and copy budgets; see
 [INVOCATION.md](INVOCATION.md#one-frame-per-call-read-result-or-delta). Older wire
 versions are rejected. MAC framing still uses numeric 2006 data frames,
 compressed PAN `0x4c56`, extended source, and broadcast or extended destination.
@@ -119,16 +118,20 @@ channel (`u8`), followed by a `SurfaceRead`: reader (`u64`), owner (`u64`), requ
 | Kind | Remaining fields | Delivery |
 | --- | --- | --- |
 | 4: read surface | Remaining hop budget (`u8`, 1–8) | Addressed along a learned direction, otherwise broadcast |
-| 5: surface part | Total encoded length (`u16`), distance from owner (`u8`, 1–8), bytes | Addressed along the recorded reverse path |
+| 5: surface part | Total encoded length (`u16`), distance from owner (`u8`, 1–8), bytes, path cost (`u32`) | Addressed along the recorded reverse path |
 
 A reader starts with hop budget 8 (or less); a relay decrements it. A node at
 budget 1 can answer for itself but cannot forward farther. The owner starts the
 reply distance at 1 and each relay increments it. A reply's largest addressed
-frame has a 21-byte MAC header, a 37-byte Lattice envelope, and **67 bytes of data**,
+frame has a 21-byte MAC header, a 37-byte Lattice envelope, a 4-byte path cost, and **63 bytes of data**,
 fitting the 125-byte MAC limit before hardware FCS.
 
+Response opcodes 5 and 7 append the sender-to-owner path cost as Q24.8
+microseconds per acknowledged payload byte. Each relay adds its outgoing link
+toward the owner. Zero is the owner's empty suffix; `0xffffffff` is unknown.
+
 Offsets need not be aligned. Each response contains exactly
-`min(67, total - offset)` bytes. Offset equal to total returns an empty terminal
+`min(63, total - offset)` bytes. Offset equal to total returns an empty terminal
 range; an owner ignores offsets beyond its description. The request fields,
 length, and frame checksum identify a complete individual range. Consumers still
 need all required ranges to reconstruct a complete definition and must handle
@@ -143,7 +146,7 @@ Arrival/query/reply payloads start with the same four-byte magic, opcode, founde
 | --- | --- | --- | --- |
 | 3: arrival | Owner (`u64`), sequence (`u16`), description length (`u16`), distance (`u8`) | Broadcast | 42 |
 | 6: find owners | Seeker (`u64`), request (`u16`), remaining scope (`u8`) | Broadcast | 40 |
-| 7: owner found | Seeker (`u64`), request (`u16`), owner (`u64`), description length (`u16`), distance (`u8`) | Directed reverse path | 56 |
+| 7: owner found | Seeker (`u64`), request (`u16`), owner (`u64`), description length (`u16`), distance (`u8`), path cost (`u32`) | Directed reverse path | 60 |
 
 The owner description length is at least 13 bytes. Arrival and owner replies start
 at distance 1 and relays increment it; an eight-link notice may be consumed but
@@ -234,4 +237,4 @@ surface over three requested ranges, including its axiom and invariant.
 RF/range investigation remains paused. The attached-host path has a two-Nordic
 hardware check; it validates surface/current-state reads and native calls against
 a software appliance, not physical device completion or RF delivery reliability. Older broadcast-capture results do
-not validate the current version-6 behavior; see [validation scope](TESTING.md#validation-scope).
+not validate the current version-7 behavior; see [validation scope](TESTING.md#validation-scope).

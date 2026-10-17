@@ -2,6 +2,7 @@
 //! Residents share the channel choice; the original founder has no special
 //! runtime role. This initial protocol has no authenticated admission mechanism.
 
+use crate::kernel::radio::cost::TimePerByte;
 mod bootstrap;
 pub(crate) mod exposure;
 mod forwarding;
@@ -39,6 +40,7 @@ fn discovery_response(
 ) -> Option<Message<'static>> {
     match (incoming.content, incoming.destination) {
         (Content::Discover | Content::Propose(_), None) => Some(Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: local,
             destination: Some(incoming.source),
             content: if resident {
@@ -80,6 +82,7 @@ pub(crate) fn run(
         let now = tasks::xTaskGetTickCount();
         let milliseconds = ((now as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
         forwarder.expire(milliseconds);
+        collect_costs(radio, &mut forwarder, milliseconds);
         #[cfg(feature = "host-link")]
         if let Some(outgoing) = host.poll(
             &mut forwarder,
@@ -112,6 +115,7 @@ pub(crate) fn run(
             // Discovery solicits an immediate response. Do not follow it with
             // a link offer while that neighbor is transmitting its presence.
             let message = forwarder.maintain_links(milliseconds).unwrap_or(Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: local,
                 destination: None,
                 content: Content::Discover,
@@ -125,6 +129,9 @@ pub(crate) fn run(
             timeout.min(crate::milliseconds_to_ticks_checked(ms as u64).unwrap())
         });
         if let Some(message) = receive(radio, local, network.channel, &mut buffer, timeout) {
+            let measured_at = ((tasks::xTaskGetTickCount() as u64 * 1000)
+                / crate::configTICK_RATE_HZ as u64) as u32;
+            collect_costs(radio, &mut forwarder, measured_at);
             #[cfg(feature = "host-link")]
             if matches!(message.content,
                 Content::LinkEntry { read, .. } if read.reader == local)
@@ -297,6 +304,17 @@ pub(crate) fn run(
 }
 
 #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
+fn collect_costs(
+    radio: &mut super::radio::task::Transport,
+    forwarder: &mut forwarding::Forwarder,
+    now: u32,
+) {
+    while let Some(sample) = radio.take_cost_sample() {
+        forwarder.record_transmission(sample, now);
+    }
+}
+
+#[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
 fn send(
     radio: &mut super::radio::task::Transport,
     message: Message<'_>,
@@ -407,6 +425,7 @@ mod tests {
             for resident in [false, true] {
                 let mut wire = [0; MAX_FRAME_SIZE];
                 let request = Message {
+                    path_cost: TimePerByte::UNKNOWN,
                     source: sender,
                     destination: None,
                     content: Content::Discover,
@@ -430,6 +449,7 @@ mod tests {
             }
         }
         let proposed = Message {
+            path_cost: TimePerByte::UNKNOWN,
             source: 1,
             destination: None,
             content: Content::Propose(Network {
@@ -484,6 +504,7 @@ mod tests {
             },
         ] {
             let message = Message {
+                path_cost: TimePerByte::UNKNOWN,
                 source: 1,
                 destination: None,
                 content,

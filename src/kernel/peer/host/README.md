@@ -40,13 +40,18 @@ still enforce their appliance's hardware limits.
 codec is shared by radio frames, surface literals, and USB. `host` is an optional
 module containing the local records/stream decoder; ordinary appliance builds do
 not include it. Neither module contains a radio driver, RTOS, allocator, or IR
-interpreter. The radio remains **LVT v6**, and surfaces remain **LSF v1**.
+interpreter. The radio remains **LVT v7**, and surfaces remain **LSF v1**.
 
-Host version **3** uses little-endian records, COBS, and a zero delimiter. Older versions
+Host version **4** uses little-endian records, COBS, and a zero delimiter. Older versions
 are rejected. The largest current encoded record is 87 bytes, in a fixed 128-byte
 buffer. USB CDC may split/coalesce records and needs a terminating short packet
 (or ZLP at an exact endpoint boundary). This does not fragment radio messages:
 each surface range, state read, invocation, and result remains one RF frame.
+
+Host v4 adds a Q24.8 microseconds-per-acknowledged-payload-byte cost to each
+link entry; `0xffffffff` means unknown. An end record carries unknown cost.
+Surface ranges are now at most 63 bytes, making room for RF path-cost propagation.
+The nRF companion and Linux client must consume the same wire revision.
 
 All records begin with version (`u8`), kind (`u8`), and token (`u32`).
 Unsolicited kinds 144/145 require token zero; kind distinguishes events from
@@ -61,8 +66,8 @@ bytes and a loss notice is 12 bytes.
 | 3 ReadState | owner `u64`, attribute `u64` |
 | 4 Invoke | owner `u64`, transformer `u64`, scalar argument list |
 | 128 Ready | address `u64`, founder `u64`, channel `u8` |
-| 129 Link | owner/after/via `u64`, revision `u32`, peer `u64`, round-trip milliseconds `u16` |
-| 130 Surface | owner `u64`, offset/total `u16`, up to 67 bytes |
+| 129 Link | owner/after/via `u64`, revision `u32`, peer `u64`, round-trip milliseconds `u16`, outgoing cost `u32` |
+| 130 Surface | owner `u64`, offset/total `u16`, up to 63 bytes |
 | 131 State | owner/attribute `u64`, result tag; values add sequence `u32` and typed scalar or 255 unavailable |
 | 132 Invoked | owner/transformer `u64`, native status `u8` |
 | 144 Changed | owner/attribute `u64`, sequence `u32`, typed scalar or 255 unavailable |

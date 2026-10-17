@@ -7,7 +7,7 @@ use crate::scalar::{decode_value, encode_arguments, encode_value, valid_argument
 use crate::{
     InvokeStatus, StateChange, StateReadResult, Value, CALL_ARGUMENT_BYTES, SURFACE_BYTES,
 };
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -82,6 +82,7 @@ pub enum Packet {
         revision: u32,
         peer: u64,
         round_trip_ms: u16,
+        cost: crate::cost::TimePerByte,
     },
     ReadSurface {
         token: u32,
@@ -196,6 +197,7 @@ impl Packet {
                 revision,
                 peer,
                 round_trip_ms,
+                cost,
                 ..
             } => {
                 body[1] = 0x81;
@@ -205,7 +207,8 @@ impl Packet {
                 body[30..34].copy_from_slice(&revision.to_le_bytes());
                 body[34..42].copy_from_slice(&peer.to_le_bytes());
                 body[42..44].copy_from_slice(&round_trip_ms.to_le_bytes());
-                44
+                body[44..48].copy_from_slice(&cost.raw().to_le_bytes());
+                48
             }
             Self::ReadSurface { owner, offset, .. } => {
                 body[1] = 2;
@@ -410,7 +413,7 @@ fn decode_body(b: &[u8]) -> Option<Packet> {
             founder: value(14),
             channel: b[22],
         },
-        (0x81, 44) => Packet::Link {
+        (0x81, 48) => Packet::Link {
             token,
             owner: value(6),
             after: value(14),
@@ -418,6 +421,9 @@ fn decode_body(b: &[u8]) -> Option<Packet> {
             revision: u32::from_le_bytes(b[30..34].try_into().ok()?),
             peer: value(34),
             round_trip_ms: u16::from_le_bytes(b[42..44].try_into().ok()?),
+            cost: crate::cost::TimePerByte::from_raw(u32::from_le_bytes(
+                b[44..48].try_into().ok()?,
+            )),
         },
         (2, 16) => Packet::ReadSurface {
             token,
@@ -578,6 +584,7 @@ mod tests {
                 revision: 18,
                 peer: u64::MAX,
                 round_trip_ms: u16::MAX,
+                cost: crate::cost::TimePerByte::measured(1000, 20),
             },
             Packet::ReadSurface {
                 token: 5,
@@ -657,6 +664,7 @@ mod tests {
         }
         assert_eq!(decode_body(&[1, 0, 0, 0, 0, 0]), None);
         assert_eq!(decode_body(&[2, 0, 0, 0, 0, 0]), None);
+        assert_eq!(decode_body(&[3, 0, 0, 0, 0, 0]), None);
         let mut change = [0; 28];
         change[0] = VERSION;
         change[1] = 0x90;
