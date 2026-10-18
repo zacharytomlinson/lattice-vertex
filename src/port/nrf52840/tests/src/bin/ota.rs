@@ -79,8 +79,13 @@ impl UsbSession {
         }
     }
 }
+#[cfg(feature = "ota-activation-check")]
+#[path = "../../../../tests/update_activation.rs"]
+mod update_activation;
 extern "C" fn usb_task(_: *mut c_void) {
     let context = unsafe { TaskContext::assume() };
+    #[cfg(feature = "ota-activation-check")]
+    let mut activation_check = update_activation::Check::new(&context);
     interrupt::USBD.set_priority(interrupt::Priority::P6);
     interrupt::CLOCK_POWER.set_priority(interrupt::Priority::P6);
     let driver = usb::Driver::new(
@@ -233,6 +238,8 @@ extern "C" fn usb_task(_: *mut c_void) {
     let mut work = pin!(join(device.run(), exchange));
     let mut cx = Context::from_waker(Waker::noop());
     loop {
+        #[cfg(feature = "ota-activation-check")]
+        activation_check.poll(&context);
         let _ = work.as_mut().poll(&mut cx);
         lattice_vertex::delay_ms(&context, 1);
     }

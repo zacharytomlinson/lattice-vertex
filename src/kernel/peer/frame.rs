@@ -104,6 +104,10 @@ pub(super) struct LinkRead {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Content<'a> {
+    UpdateAbsence {
+        network: Network,
+        notice: lattice_peer_wire::update::Absence,
+    },
     Update {
         network: Network,
         read: UpdateRead,
@@ -219,6 +223,13 @@ impl<'a> Message<'a> {
         let mut payload = [0; MAX_PAYLOAD];
         payload[..4].copy_from_slice(MAGIC);
         let mut size = match self.content {
+            Content::UpdateAbsence { network, notice } => {
+                payload[4] = 18;
+                payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
+                payload[13] = network.channel;
+                notice.encode((&mut payload[14..23]).try_into().unwrap());
+                23
+            }
             Content::Update {
                 network,
                 read,
@@ -565,6 +576,20 @@ impl<'a> Message<'a> {
             (payload, TimePerByte::UNKNOWN)
         };
         let content = match (p[4], p.len(), destination) {
+            (18, 23, None) => {
+                let network = Network {
+                    founder: u64::from_le_bytes(p[5..13].try_into().unwrap()),
+                    channel: p[13],
+                };
+                if !network.valid() || network.channel != channel {
+                    return Err(InvalidFrame);
+                }
+                Content::UpdateAbsence {
+                    network,
+                    notice: lattice_peer_wire::update::Absence::decode(&p[14..])
+                        .ok_or(InvalidFrame)?,
+                }
+            }
             (16, 50..=MAX_PAYLOAD, _) | (17, 61, Some(_)) => {
                 let network = Network {
                     founder: u64::from_le_bytes(p[5..13].try_into().unwrap()),
@@ -1098,6 +1123,64 @@ impl SurfaceRead {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_absence_is_a_bounded_one_hop_notice() {
+        use lattice_peer_wire::update::{Absence, AbsencePhase, MAX_ABSENCE_MS};
+        let network = Network {
+            founder: 1,
+            channel: 15,
+        };
+        let mut bytes = [0; MAX_FRAME_SIZE];
+        for phase in [
+            AbsencePhase::Proposed,
+            AbsencePhase::Leaving,
+            AbsencePhase::Cancel,
+        ] {
+            let notice = Absence {
+                attempt: 42,
+                phase,
+                duration_ms: if phase == AbsencePhase::Cancel {
+                    0
+                } else {
+                    MAX_ABSENCE_MS
+                },
+            };
+            let mut message = Message {
+                source: 1,
+                destination: None,
+                path_cost: TimePerByte::UNKNOWN,
+                content: Content::UpdateAbsence { network, notice },
+            };
+            let n = message.encode(1, &mut bytes);
+            assert!(n <= MAX_FRAME_SIZE);
+            assert_eq!(
+                Message::decode(&bytes[..n], 2, 15).unwrap().content,
+                message.content
+            );
+            message.destination = Some(2);
+            let n = message.encode(2, &mut bytes);
+            assert!(
+                Message::decode(&bytes[..n], 2, 15).is_err(),
+                "notice has no routed/addressed form"
+            );
+        }
+        for (attempt, duration_ms, phase) in [
+            (0, 1, AbsencePhase::Leaving),
+            (1, 0, AbsencePhase::Leaving),
+            (1, MAX_ABSENCE_MS + 1, AbsencePhase::Proposed),
+            (1, 1, AbsencePhase::Cancel),
+        ] {
+            let mut encoded = [0; 9];
+            Absence {
+                attempt,
+                duration_ms,
+                phase,
+            }
+            .encode(&mut encoded);
+            assert!(Absence::decode(&encoded).is_none());
+        }
+    }
     const A: u64 = 0x0102_0304_0506_0708;
     const B: u64 = 0x1112_1314_1516_1718;
 

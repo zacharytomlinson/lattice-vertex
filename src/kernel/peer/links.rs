@@ -4,6 +4,7 @@
 
 use super::frame::{LinkPhase, PeerLink};
 use crate::kernel::radio::cost::{Measurement, TimePerByte, Transmission};
+use lattice_peer_wire::update::{Absence, AbsencePhase, NOTICE_MS};
 
 const CAPACITY: usize = 8;
 const EXCHANGE_MS: u32 = 6_000;
@@ -23,6 +24,7 @@ struct Neighbor {
     measured_at: u32,
     established: bool,
     waiting_accept: bool,
+    absence: Option<(Absence, u32)>,
 }
 impl Neighbor {
     const EMPTY: Self = Self {
@@ -37,6 +39,7 @@ impl Neighbor {
         measured_at: 0,
         established: false,
         waiting_accept: false,
+        absence: None,
     };
 }
 
@@ -45,9 +48,46 @@ pub(super) struct Links {
     token: u32,
     revision: u32,
 }
-const _: () = assert!(core::mem::size_of::<Links>() <= 448);
+const _: () = assert!(core::mem::size_of::<Links>() <= 608);
 
 impl Links {
+    /// Only already-maintained neighbors can defer activation. These notices
+    /// never establish membership or propagate beyond this one radio hop.
+    pub(super) fn record_absence(&mut self, peer: u64, notice: Absence, now: u32) {
+        let Some(n) = self
+            .neighbors
+            .iter_mut()
+            .find(|n| n.peer == peer && n.established)
+        else {
+            return;
+        };
+        if notice.phase == AbsencePhase::Cancel {
+            if n.absence
+                .is_some_and(|(old, _)| old.attempt == notice.attempt)
+            {
+                n.absence = None;
+            }
+        } else {
+            if let Some((old, _)) = n.absence {
+                if old.attempt == notice.attempt
+                    && (old.phase == AbsencePhase::Leaving || old.phase == notice.phase)
+                {
+                    return;
+                }
+            }
+            n.absence = Some((notice, now));
+        }
+    }
+    pub(super) fn activation_conflict(&self, local: u64, contending: bool, now: u32) -> bool {
+        self.neighbors.iter().any(|n| {
+            n.established
+                && n.absence.is_some_and(|(a, at)| {
+                    let lifetime = a.duration_ms + NOTICE_MS + 5_000;
+                    now.wrapping_sub(at) < lifetime
+                        && (a.phase == AbsencePhase::Leaving || !contending || n.peer < local)
+                })
+        })
+    }
     pub(super) const fn new() -> Self {
         Self {
             neighbors: [Neighbor::EMPTY; CAPACITY],
@@ -119,7 +159,13 @@ impl Links {
             if neighbor.peer == 0 {
                 continue;
             }
-            if now.wrapping_sub(neighbor.retained_at) >= EXPIRE_MS {
+            if neighbor
+                .absence
+                .is_some_and(|(a, at)| now.wrapping_sub(at) >= a.duration_ms + NOTICE_MS + 5_000)
+            {
+                neighbor.absence = None;
+            }
+            if now.wrapping_sub(neighbor.retained_at) >= EXPIRE_MS && neighbor.absence.is_none() {
                 if neighbor.established {
                     lost(neighbor.peer);
                     self.revision = self.revision.wrapping_add(1);
@@ -239,6 +285,70 @@ impl Links {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_absences_are_local_bounded_and_break_simultaneous_ties() {
+        let mut a = Links::new();
+        let mut b = Links::new();
+        let proposed = Absence {
+            attempt: 42,
+            phase: AbsencePhase::Proposed,
+            duration_ms: 90_000,
+        };
+        a.record_absence(2, proposed, 0);
+        assert!(
+            !a.activation_conflict(1, false, 1),
+            "unknown senders cannot reserve absence"
+        );
+        connected(&mut a, &mut b, 0);
+        a.record_absence(2, proposed, 100);
+        assert!(a.activation_conflict(1, false, 101));
+        assert!(
+            !a.activation_conflict(1, true, 101),
+            "lower address wins simultaneous proposal"
+        );
+        b.record_absence(1, proposed, 100);
+        assert!(b.activation_conflict(2, true, 101));
+        a.record_absence(
+            2,
+            Absence {
+                phase: AbsencePhase::Leaving,
+                ..proposed
+            },
+            200,
+        );
+        assert!(
+            a.activation_conflict(1, true, 201),
+            "already leaving wins regardless of address"
+        );
+        a.record_absence(2, proposed, 300); // stale proposal cannot downgrade leaving
+        a.record_absence(
+            2,
+            Absence {
+                attempt: 41,
+                phase: AbsencePhase::Cancel,
+                duration_ms: 0,
+            },
+            301,
+        );
+        assert!(a.activation_conflict(1, true, 302));
+        a.expire(65_000, |_| {
+            panic!("announced absence should retain neighbor")
+        });
+        assert!(a.activation_conflict(1, false, 65_000));
+        a.expire(100_000, |_| {});
+        assert!(!a.activation_conflict(1, false, 100_000));
+        b.record_absence(
+            1,
+            Absence {
+                phase: AbsencePhase::Cancel,
+                duration_ms: 0,
+                ..proposed
+            },
+            400,
+        );
+        assert!(!b.activation_conflict(2, true, 401));
+    }
 
     #[test]
     fn outgoing_cost_is_directional_and_expires_without_removing_a_refreshed_link() {

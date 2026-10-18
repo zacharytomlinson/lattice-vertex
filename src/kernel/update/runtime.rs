@@ -1,6 +1,11 @@
-//! The resident peer task exclusively owns flash and the receiver. Local control
-//! requests use one atomic notification, not an appliance-owned networking loop.
-use super::{package::Policy, Receiver, Storage};
+//! The resident peer task owns flash, the receiver, and activation decisions.
+//! Physical-work holds share only atomic admission state. Local maintenance
+//! requests use one notification, not an appliance-owned networking loop.
+use super::{
+    activation::{self, Action, Activation},
+    package::Policy,
+    Receiver, Storage,
+};
 use crate::{kernel::tasks, port, sync::TaskContext};
 use core::sync::atomic::{AtomicU8, Ordering};
 use lattice_peer_wire::update::{Progress, Request, Status};
@@ -49,6 +54,16 @@ impl Storage for PlatformStorage {
     fn confirm(&mut self) -> Result<(), Self::Error> {
         PlatformStorage::confirm(self)
     }
+    fn activation_swap_bytes(&self) -> u32 {
+        #[cfg(feature = "port-nrf52840")]
+        {
+            self.image_capacity()
+        }
+        #[cfg(feature = "port-esp32c6")]
+        {
+            0
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +75,8 @@ pub struct Snapshot {
 }
 static mut RECEIVER: Option<Receiver<PlatformStorage>> = None;
 static CONTROL: AtomicU8 = AtomicU8::new(0);
+static mut ACTIVATION: Activation = Activation::new();
+static mut ACTIVITY_EPOCH: u32 = 0;
 static mut SNAPSHOT: Snapshot = Snapshot {
     progress: Progress {
         package: [0; 16],
@@ -139,6 +156,107 @@ pub(crate) fn pending() -> bool {
     CONTROL.load(Ordering::Acquire) != 0
 }
 
+pub(crate) fn contending() -> bool {
+    unsafe { (&*core::ptr::addr_of!(ACTIVATION)).contending() }
+}
+pub(crate) fn awaiting_activation() -> bool {
+    unsafe {
+        (&*core::ptr::addr_of!(RECEIVER)).as_ref().is_some_and(|r| {
+            r.phase == lattice_peer_wire::update::Phase::Ready
+                && r.header.is_some_and(|h| {
+                    h.costs
+                        .outage_ms(h.image_bytes, r.storage.activation_swap_bytes())
+                        .is_some()
+                })
+        })
+    }
+}
+/// Called only by the resident peer, after ordinary local/received work. Sending
+/// a notice gives neighbors a receive turn before final admission is closed.
+pub(crate) fn poll_activation(
+    now: u32,
+    local: u64,
+    neighbor_busy: bool,
+    work_pending: bool,
+    mut send: impl FnMut(lattice_peer_wire::update::Absence) -> bool,
+) {
+    use lattice_peer_wire::update::{AbsencePhase, Phase};
+    let state = unsafe { &mut *core::ptr::addr_of_mut!(ACTIVATION) };
+    let epoch = activation::epoch();
+    unsafe {
+        if epoch != ACTIVITY_EPOCH {
+            ACTIVITY_EPOCH = epoch;
+            state.activity(now);
+        }
+    }
+    let ready = unsafe {
+        (&*core::ptr::addr_of!(RECEIVER)).as_ref().and_then(|r| {
+            (r.phase == Phase::Ready)
+                .then(|| (r.header.unwrap(), r.storage.activation_swap_bytes()))
+        })
+    };
+    let busy = activation::held() || pending() || work_pending || crate::kernel::change::pending();
+    match state.poll(now, local, ready, busy, neighbor_busy) {
+        Action::Wait => {}
+        Action::Announce(notice) => {
+            let sent = send(notice);
+            state.announced(now, sent);
+        }
+        Action::Cancel(notice) => {
+            send(notice);
+        }
+        Action::Activate(notice) => {
+            if !send(notice) {
+                state.activity(now);
+                return;
+            }
+            let commit = activation::Commit::enter();
+            // An appliance task may have run during the radio send. Recheck
+            // its activity and unsent deltas after closing new physical work.
+            if commit.is_none()
+                || activation::epoch() != epoch
+                || crate::kernel::change::pending()
+                || pending()
+            {
+                drop(commit);
+                state.activity(now);
+                send(lattice_peer_wire::update::Absence {
+                    phase: AbsencePhase::Cancel,
+                    duration_ms: 0,
+                    ..notice
+                });
+                return;
+            }
+            let result = unsafe {
+                (&mut *core::ptr::addr_of_mut!(RECEIVER))
+                    .as_mut()
+                    .unwrap()
+                    .activate()
+            };
+            unsafe {
+                publish(result.err().unwrap_or(Status::Ok));
+            }
+            if result.is_ok() {
+                reset_chip();
+            }
+            drop(commit);
+            state.activity(now);
+            send(lattice_peer_wire::update::Absence {
+                phase: AbsencePhase::Cancel,
+                duration_ms: 0,
+                ..notice
+            });
+        }
+    }
+}
+
+fn reset_chip() -> ! {
+    #[cfg(feature = "port-nrf52840")]
+    cortex_m::peripheral::SCB::sys_reset();
+    #[cfg(feature = "port-esp32c6")]
+    esp_hal::system::software_reset();
+}
+
 pub(crate) fn poll_control() {
     let command = CONTROL.load(Ordering::Acquire);
     if !matches!(command, 1 | 2 | 3) {
@@ -154,10 +272,7 @@ pub(crate) fn poll_control() {
         // Give the local USB task a chance to transmit its accepted-reset reply.
         let context = unsafe { TaskContext::assume() };
         crate::delay_ms(&context, 100);
-        #[cfg(feature = "port-nrf52840")]
-        cortex_m::peripheral::SCB::sys_reset();
-        #[cfg(feature = "port-esp32c6")]
-        esp_hal::system::software_reset();
+        reset_chip();
     }
     let result = unsafe {
         match (&mut *core::ptr::addr_of_mut!(RECEIVER)).as_mut() {

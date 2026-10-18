@@ -291,6 +291,10 @@ impl Host {
             );
             return None;
         }
+        #[cfg(feature = "firmware-update")]
+        if !matches!(request, Packet::Update { .. }) {
+            crate::kernel::update::activation::activity();
+        }
         if let Packet::Invoke {
             transformer,
             arguments,

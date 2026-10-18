@@ -11,6 +11,9 @@ pub(crate) struct ReceiveBuffer {
     count: usize,
 }
 impl ReceiveBuffer {
+    pub(super) fn pending(&self) -> bool {
+        self.count != 0
+    }
     pub(super) const fn new() -> Self {
         Self {
             frames: [[0; MAX_FRAME_SIZE]; CAPACITY],

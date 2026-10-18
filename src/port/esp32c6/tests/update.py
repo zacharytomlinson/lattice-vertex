@@ -28,6 +28,8 @@ def check_image(data):
 
 
 def prepare(args):
+    if args.activation_check and not args.ota:
+        raise ValueError("--activation-check requires --ota")
     idf = Path(args.idf or os.environ['IDF_PATH']).resolve()
     version = subprocess.check_output(['git', '-C', str(idf), 'describe', '--tags', '--exact-match'], text=True).strip()
     if version != 'v5.5.4':
@@ -52,6 +54,7 @@ def prepare(args):
     (out/'otadata-empty.bin').write_bytes(b'\xff' * 0x2000)
     (out/'journal-empty.bin').write_bytes(b'\xff' * 0x2000)
     for image, features in ([('a','ota-test'),('b','ota-image-b')] if args.ota else [('a','update-test'),('b','update-image-b')]):
+        if args.activation_check and image == 'a': features += ',ota-activation-check'
         subprocess.run(['cargo', '+nightly', 'build', '-Z', 'build-std=core', '--release', '--locked',
                         '--bin', 'ota' if args.ota else 'update', '--features', features], cwd=HERE, check=True)
         elf = HERE/('target/riscv32imac-unknown-none-elf/release/ota' if args.ota else 'target/riscv32imac-unknown-none-elf/release/update')
@@ -95,6 +98,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
     build = sub.add_parser('prepare')
+    build.add_argument('--activation-check', action='store_true', help='hold automatic activation for ten seconds after verification in image A')
     build.add_argument('--ota', action='store_true', help='build the signed receiver and binary host interface')
     build.add_argument('--idf')
     build.add_argument('--idf-python', default=sys.executable)

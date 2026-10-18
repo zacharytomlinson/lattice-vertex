@@ -26,3 +26,7 @@ activation decisions stay in `kernel::update` and the platform ports. The option
 host codec adds kinds 5/6 and 133/134 without altering existing host-v4 records.
 See [the updater](../../../../docs/FIRMWARE_UPDATES.md#implemented-signed-transfer)
 for the signed package and byte layout.
+
+`update::Absence` is the fixed nine-byte one-hop planned-outage notice. It carries
+an attempt token, phase, and bounded relative duration; LVT v7 opcode 18 encodes
+it after the network tag. It has no routed or attached-host request equivalent.

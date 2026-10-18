@@ -1,7 +1,9 @@
 //! One signed candidate, bounded flash work, and page-level durable progress.
-//! Ordinary peer dispatch owns the receiver. Activation is a local explicit act;
-//! receiving a signed image does not give a transmitting peer a reboot command.
+//! Ordinary peer dispatch owns the receiver. Local activity and signed timing
+//! govern activation; a transmitting peer has no reboot command.
 
+pub(crate) mod activation;
+pub use activation::{hold_activation, ActivationHold};
 mod journal;
 pub mod package;
 #[cfg(any(
@@ -15,7 +17,8 @@ pub(crate) mod runtime;
 ))]
 pub use runtime::{confirm, select_trial, snapshot, PlatformStorage};
 
-use lattice_peer_wire::update::{PackageId, Phase, Progress, Request, Status};
+use lattice_peer_wire::update::{PackageId, Request};
+pub use lattice_peer_wire::update::{Phase, Progress, Status};
 use package::{Header, Policy, HEADER_BYTES};
 
 pub trait Storage {
@@ -31,6 +34,10 @@ pub trait Storage {
     fn verify(&mut self, digest: &[u8; 32]) -> Result<(), Self::Error>;
     fn select_trial(&mut self, digest: &[u8; 32]) -> Result<(), Self::Error>;
     fn confirm(&mut self) -> Result<(), Self::Error>;
+    /// Bytes copied by the bootloader during activation; zero for direct slot selection.
+    fn activation_swap_bytes(&self) -> u32 {
+        0
+    }
 }
 
 /// Both current ports use 4 KiB erase pages. Geometry remains a port-owned fact;
@@ -320,7 +327,7 @@ impl<S: Storage> Receiver<S> {
         Ok(())
     }
 
-    /// Called locally after an explicit activation decision. No radio operation
+    /// Called locally after an activation decision. No radio operation
     /// invokes this. A consumed journal cannot resurrect a reverted trial.
     pub fn activate(&mut self) -> Result<(), Status> {
         if self.phase != Phase::Ready {

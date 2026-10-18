@@ -217,7 +217,7 @@ def upload(peer, owner, path, stop_after=None):
             return p
     p = peer.update(owner, b"\x03" + package)
     print(
-        f"Verified in {time.monotonic() - started:.2f}s; activation remains local and explicit.",
+        f"Verified in {time.monotonic() - started:.2f}s; activation is decided by the receiver.",
         flush=True,
     )
     print(p, flush=True)

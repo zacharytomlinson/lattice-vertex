@@ -142,7 +142,7 @@ including a rerun with that console open; console state alone was not establishe
 as their cause. One concrete restart defect was fixed: host-originated reads now
 seed their counter from the host token instead of deliberately reusing read 1
 while another node retains that identity. A regression check covers that case.
-The radio stack reserves 8 KiB for the measured ~5 KiB entry frame plus callers,
+The radio stack now reserves 12 KiB (24 KiB for signed OTA) for the resident frame, callers,
 callees, and exception context. Neither that allocation nor the diagnostic USB
 polling cleanup established the cause of every earlier timeout.
 

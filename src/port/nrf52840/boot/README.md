@@ -12,7 +12,8 @@ Nordic's flash layout and swap/trial/confirmation state remain in this port.
 Current status: host checks, ARM builds, and the XIAO USB staging/trial/confirm/revert
 sequence pass. The common `kernel::update` service adds signed packages, a durable
 transfer journal, and OTA messages above this local backend. Watchdog-driven trial
-expiry and automatic activation remain planned. Calling `select_trial` checks SHA-256 and initial vectors; it
+expiry remains planned. Automatic quiet/hold/neighbor deferral now lives in the
+common update service. Calling `select_trial` checks SHA-256 and initial vectors; it
 does **not** authenticate a release signature.
 
 ## XIAO layout

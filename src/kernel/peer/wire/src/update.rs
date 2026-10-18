@@ -6,6 +6,54 @@ pub const REQUEST_BYTES: usize = 71;
 pub const PROGRESS_BYTES: usize = 28;
 pub type PackageId = [u8; 16];
 
+pub const NOTICE_MS: u32 = 2_000;
+pub const MAX_ABSENCE_MS: u32 = 600_000;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AbsencePhase {
+    Proposed = 0,
+    Leaving = 1,
+    Cancel = 2,
+}
+/// One-hop update absence, measured from receipt; no synchronized network clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Absence {
+    pub attempt: u32,
+    pub phase: AbsencePhase,
+    pub duration_ms: u32,
+}
+impl Absence {
+    pub fn encode(self, out: &mut [u8; 9]) {
+        out[..4].copy_from_slice(&self.attempt.to_le_bytes());
+        out[4] = self.phase as u8;
+        out[5..].copy_from_slice(&self.duration_ms.to_le_bytes());
+    }
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 9 {
+            return None;
+        }
+        let attempt = u32::from_le_bytes(bytes[..4].try_into().ok()?);
+        let phase = match bytes[4] {
+            0 => AbsencePhase::Proposed,
+            1 => AbsencePhase::Leaving,
+            2 => AbsencePhase::Cancel,
+            _ => return None,
+        };
+        let duration_ms = u32::from_le_bytes(bytes[5..].try_into().ok()?);
+        if attempt == 0
+            || (phase == AbsencePhase::Cancel && duration_ms != 0)
+            || (phase != AbsencePhase::Cancel && !(1..=MAX_ABSENCE_MS).contains(&duration_ms))
+        {
+            return None;
+        }
+        Some(Self {
+            attempt,
+            phase,
+            duration_ms,
+        })
+    }
+}
+
 /// Attached-host maintenance only. These operations have no radio encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]

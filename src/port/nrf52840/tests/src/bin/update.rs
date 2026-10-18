@@ -20,6 +20,8 @@ mod usb_console;
 
 #[path = "../../../../tests/update_commands.rs"]
 mod update_commands;
+#[path = "../../../../tests/update_measurement.rs"]
+mod update_measurement;
 const _: () = assert!(lattice_vertex::config::configTICK_RATE_HZ == 1000);
 
 static mut STACK: [StackType_t; 3072] = [0; 3072];
@@ -33,6 +35,7 @@ static mut PROGRESS: u32 = 0;
 static mut PENDING: bool = false;
 static mut RESET: u8 = 0;
 static mut REPORT_TICK: u32 = 0;
+static mut ELAPSED_US: u32 = 0;
 
 fn factory_ready() -> bool {
     // Read only. Factory settings are never rewritten by the test or Lattice loader.
@@ -57,6 +60,7 @@ fn command(bytes: &[u8]) {
         OPCODE = bytes[4];
         let payload = &bytes[5..];
         let storage = STORAGE.as_mut().unwrap();
+        let started = cortex_m::peripheral::DWT::cycle_count();
         RESULT = match (OPCODE, payload.len()) {
             (0, 0) => Ok(()),
             (1, 4) if factory_ready() => {
@@ -82,8 +86,12 @@ fn command(bytes: &[u8]) {
                 RESET = 2;
                 Ok(())
             }
+            (8, 32) if factory_ready() => storage.verify_image(payload.try_into().unwrap()),
             _ => Err(Error::Order),
         };
+        ELAPSED_US = cortex_m::peripheral::DWT::cycle_count()
+            .wrapping_sub(started)
+            .div_ceil(64);
         PENDING = true;
     }
 }
@@ -107,7 +115,7 @@ fn report_once(_: &TaskContext, out: &mut dyn core::fmt::Write) -> core::fmt::Re
     unsafe {
         writeln!(
             out,
-            "UPDATE image={} boot={:?} ready={} seq={} op={} result={:?} progress={} tick={}",
+            "UPDATE image={} boot={:?} ready={} seq={} op={} result={:?} progress={} tick={} elapsed_us={} radio_free={} peer_ready={}",
             if cfg!(feature = "update-image-b") {
                 "B"
             } else {
@@ -119,7 +127,7 @@ fn report_once(_: &TaskContext, out: &mut dyn core::fmt::Write) -> core::fmt::Re
             OPCODE,
             RESULT,
             PROGRESS,
-            kernel::tasks::xTaskGetTickCount()
+            kernel::tasks::xTaskGetTickCount(), ELAPSED_US, update_measurement::radio_free_bytes(), update_measurement::peer_ready() as u8
         )?;
         PENDING = false;
         REPORT_TICK = kernel::tasks::xTaskGetTickCount();
@@ -133,8 +141,15 @@ extern "C" fn console(_: *mut c_void) {
 
 #[cortex_m_rt::entry]
 fn main() -> ! {
+    extern "C" fn stack_overflow(_: lattice_vertex::types::TaskHandle_t, _: *const u8) {
+        panic!("local update task stack overflow");
+    }
+    kernel::tasks::vTaskSetStackOverflowHook(Some(stack_overflow));
+    update_measurement::start();
     rtt_target::rtt_init_print!();
-    let core = cortex_m::Peripherals::take().unwrap();
+    let mut core = cortex_m::Peripherals::take().unwrap();
+    core.DCB.enable_trace();
+    core.DWT.enable_cycle_counter();
     let p = port::nrf52840::initialize(core.SYST);
     let context = unsafe { TaskContext::assume() };
     usb_console::initialize(p.USBD);

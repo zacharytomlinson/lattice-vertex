@@ -21,13 +21,20 @@ extern "C" fn stack_overflow(_: lattice_vertex::types::TaskHandle_t, _: *const u
     panic!("OTA task stack overflow");
 }
 
+#[cfg(feature = "ota-activation-check")]
+#[path = "../../../../tests/update_activation.rs"]
+mod update_activation;
 extern "C" fn usb_task(_: *mut c_void) {
     let context = unsafe { TaskContext::assume() };
+    #[cfg(feature = "ota-activation-check")]
+    let mut activation_check = update_activation::Check::new(&context);
     let mut usb = unsafe { USB.take().unwrap() };
     let mut decoder = host::Decoder::new();
     let mut output = [0; host::MAX_PACKET + 1];
     host::connect(&context);
     loop {
+        #[cfg(feature = "ota-activation-check")]
+        activation_check.poll(&context);
         let mut rejected = None;
         while let Ok(byte) = usb.read_byte() {
             if let Some(request) = decoder.push(byte) {

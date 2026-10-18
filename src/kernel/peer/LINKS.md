@@ -117,9 +117,9 @@ return paths. The resident peer task owns both and performs periodic link work
 on its existing discovery wakeup. The old automatic startup `FindOwners` search
 is removed; explicit bounded owner searches and compact arrivals remain supported.
 
-Link storage has a 448-byte compile-time ceiling (eight existing neighbors,
-now including measurement totals and freshness) and is included in the
-forwarder's 2,304-byte ceiling. No allocator, per-peer task, foreign-surface store,
+Link storage has a 608-byte compile-time ceiling for eight neighbors, their
+measurement totals/freshness, and bounded update-absence records. It is included
+in the forwarder's 2,464-byte ceiling. No allocator, per-peer task, foreign-surface store,
 new hardware experiment, or test-only receive path is added.
 
 Colocated host checks cover phase/token correlation, simultaneous opens, lost
@@ -128,3 +128,14 @@ ordering, and wire bounds. A chained walk uses encoded frames, follows advertise
 links beyond the consumer's radio range, and then reads the encountered owner's
 surface through the learned direction. These are host/build checks; no new board
 run or RF investigation has been performed.
+
+
+## Update absence
+
+Each retained neighbor has one bounded update-absence record in the same link
+storage. Only confirmed neighbors can supply it. Proposed, leaving and cancel
+notices stay one hop; they neither reserve a route nor establish a new neighbor.
+An announced neighbor remains retained until its bounded absence expires, even
+if ordinary refresh expires meanwhile. Duplicate notices do not extend the timer.
+The local updater uses these records to defer competing departures, with an
+address tie-break for simultaneous proposals. See [the activation policy](../../../docs/FIRMWARE_UPDATES.md#local-activation-policy) for the exact timing and limits.

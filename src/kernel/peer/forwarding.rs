@@ -241,11 +241,31 @@ pub(super) struct Forwarder {
     changes: [ChangeNotice; CHANGE_NOTICES],
 }
 
-// Prior 2 KiB budget plus 256 bytes for neighbor samples and path/replay costs.
+// Existing path budgets plus bounded per-neighbor update absence records.
 // Peer, route, and return-path capacities are unchanged.
-const _: () = assert!(core::mem::size_of::<Forwarder>() <= 2304);
+const _: () = assert!(core::mem::size_of::<Forwarder>() <= 2464);
 
 impl Forwarder {
+    pub(super) fn work_pending(&self) -> bool {
+        self.reads
+            .iter()
+            .any(|r| r.read.reader() != 0 && !r.answered)
+            || self
+                .calls
+                .iter()
+                .any(|c| c.call.caller != 0 && c.result.is_none())
+    }
+    pub(super) fn record_update_absence(
+        &mut self,
+        peer: u64,
+        notice: lattice_peer_wire::update::Absence,
+        now: u32,
+    ) {
+        self.links.record_absence(peer, notice, now);
+    }
+    pub(super) fn activation_conflict(&self, contending: bool, now: u32) -> bool {
+        self.links.activation_conflict(self.local, contending, now)
+    }
     pub(super) const fn new(local: u64, network: Network) -> Self {
         Self {
             local,
@@ -3122,7 +3142,7 @@ mod tests {
 
     #[test]
     fn hop_limits_owner_bounds_and_read_path_eviction_are_local() {
-        assert!(core::mem::size_of::<Forwarder>() <= 2304);
+        assert!(core::mem::size_of::<Forwarder>() <= 2464);
         let description = Description::new(&SURFACE).unwrap();
         let mut relay = Forwarder::new(2, NET);
         let mut owner = Forwarder::new(4, NET);

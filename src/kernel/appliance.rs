@@ -89,6 +89,15 @@ impl<A: Send, E> Appliance<A, E> {
     /// automatic once the kernel binds this instance. The closure must not
     /// recursively acquire this same appliance.
     pub fn with<R>(&self, context: &TaskContext, update: impl FnOnce(&mut A) -> R) -> R {
+        #[cfg(feature = "firmware-update")]
+        let _activity = loop {
+            if let Ok(guard) = super::update::activation::try_hold() {
+                break guard;
+            }
+            // Activation has closed admission. A successful commit resets;
+            // a failed commit reopens it without starting hardware work here.
+            crate::delay_ms(context, 1);
+        };
         let mutex = self.native();
         let mut guard = if tasks::xTaskGetSchedulerState() == tasks::taskSCHEDULER_NOT_STARTED {
             mutex.try_lock(context)
@@ -143,6 +152,10 @@ impl<A: Send, E> Native for Appliance<A, E> {
     }
 
     fn invoke(&self, context: &TaskContext, transformer: u64, arguments: &[Value]) -> InvokeStatus {
+        #[cfg(feature = "firmware-update")]
+        let Ok(_activity) = super::update::activation::try_hold() else {
+            return InvokeStatus::Busy;
+        };
         let Some(handle) = self
             .surface
             .transformers

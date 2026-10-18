@@ -23,14 +23,14 @@ use core::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-// The peer frame reserves about 5 KiB on Nordic before callees and exception
-// frames; leave fixed headroom for native dispatch and attached-host operations.
+// Resident forwarding plus callees/interrupt frames exceeded the former 8 KiB
+// reservation in the guarded C6 check. Keep 12 KiB for ordinary participation.
 // Ed25519 verification nests field arithmetic above peer dispatch. The 16 KiB
 // update stack overflowed on C6 during a valid remote offer; reserve 24 KiB.
 const STACK_WORDS: usize = if cfg!(feature = "firmware-update") {
     6144
 } else {
-    2048
+    3072
 };
 static mut STACK: [StackType_t; STACK_WORDS] = [0; STACK_WORDS];
 static mut CONTROL: tasks::StaticTask_t = tasks::StaticTask_t::new();
@@ -190,6 +190,9 @@ pub(crate) fn notify_work() {
 }
 
 impl Transport {
+    pub(crate) fn pending_receive(&self) -> bool {
+        self.received.pending() || port::Radio::receiving_frame()
+    }
     /// Formation uses its own receive windows. Resident traffic also gives
     /// neighbors a receive turn between transmissions and accepts local work.
     pub(crate) fn enable_peer_runtime(&mut self) {

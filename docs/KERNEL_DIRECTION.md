@@ -196,6 +196,9 @@ kernel owns both synchronization with incoming native calls and delta transport;
 appliance code supplies its actual device behavior and observations.
 
 Startup owns the static radio stack/control block and starts the existing scheduler.
+Ordinary participation reserves 12 KiB of stack; signed OTA reserves 24 KiB.
+Formation and resident participation use separate frames, and maintained update
+checks enable stack guards and report minimum free stack.
 The resident transport owns its selected driver and task waker, then runs
 `kernel::peer` on the same task. It surveys/selects a channel, discovers peers,
 serves borrowed description ranges and current-state reads, forwards compact
@@ -665,7 +668,8 @@ global object registry, auto-incremented entity IDs, or relational edge tables.
 Use static task/control storage and bounded communication buffers. Fixed rings
 with explicit eviction are transport storage, not a graph-job queue. Choose packing,
 layout, and hardware offload against the target's actual memory and latency needs.
-The radio task has a fixed 8 KiB stack and a static task control block. Nordic
+The radio task has a fixed 12 KiB stack (24 KiB with signed updates) and a static
+task control block. Nordic
 uses the HAL's caller-owned TX packet, a 128-byte RX buffer, and a four-byte ACK buffer. C6 has an aligned static DMA buffer and
 four fixed receive entries, evicting the oldest frame on overflow. The common
 transport separately owns four raw-frame records for captures made while a send
@@ -700,7 +704,10 @@ hardware staging/trial/rollback/confirmation check. Both ports use `kernel/updat
 staging and digest verification. `kernel::update` now owns strict signed-package
 authorization, one candidate, durable page checkpoints, and reset/resume. Ordinary
 peer forwarding carries bounded update requests and progress replies. Activation
-and confirmation are explicit local operations; autonomous deferral remains planned.
+with known signed costs now waits for local quiet, physical-work holds, and
+bounded neighbor absence notices. Unknown-cost updates and trial confirmation
+retain explicit local control. Watchdog expiry and automatic health confirmation
+remain planned.
 Current surface-handle compatibility and flash execution stalls are explicit
 implementation constraints. Firmware replacement remains separate from installing
 an automation's references, conditions, and native calls.
@@ -732,7 +739,7 @@ flowchart TB
     transport["kernel::radio: resident driver, notification waits and receive turns"]
     cost["wire::cost: time per byte; radio::cost: bounded measurement handoff"]
     update["kernel::update: signed candidate, page journal, resume and explicit local activation"]
-    activation["Automatic activation: local holds, timing and neighbor notices: to build"]
+    activation["update::activation: quiet/outage estimate, physical-work admission, neighbor deferral"]
     packages["tools/update_package.py + update_peer.py: signing and serving through an attached peer"]
     imagestorage["kernel/update/storage: bounded staging, duplicates, padding and digest"]
     flash["Nordic update port: bounded image staging and trial/confirm operations"]
@@ -751,6 +758,8 @@ flowchart TB
     smoke["Nordic and C6 test firmware beside their ports"]
     updatecommands["port/tests/update_commands.rs: fixture marker, length, CRC and partial-frame expiry"]
     updateconsole["port/tests/update_console.py: host fixture commands and correlated results"]
+    updatemeasure["port/tests/update_measurement.rs and tools/update_costs.py: readiness, stack and measured cost checks"]
+    updatehold["port/tests/update_activation.rs: maintained physical-work hold check"]
     usbconsole["Nordic fixture only: USB diagnostics and XIAO serial-DFU entry"]
     hostlink["Optional kernel::host: fixed exchange, read/call origins, bounded change delivery"]
     hostwire["peer/wire: shared scalar codec and optional host records"]
@@ -773,6 +782,10 @@ flowchart TB
     smoke -->|optional USB console feature| usbconsole
     smoke -->|update fixture input decoding| updatecommands
     updateconsole <-->|local USB test commands and reports| smoke
+    smoke -->|local timing and stack trace| updatemeasure
+    updatemeasure -->|measured coefficients for signing| packages
+    smoke -->|OTA activation check uses public hold| updatehold
+    updatehold -->|same admission mechanism as appliances| activation
     usbconsole -->|low-priority reporter uses existing task API| tasks
     usbconsole -->|USB peripheral driver| nordic
     tabletradio <-->|requests, completions and pushed changes| hostlink
@@ -817,8 +830,11 @@ flowchart TB
     update -->|bounded storage operations and boot selection| flash
     update -->|C6 equivalent| c6update
     packages <-->|binary host transfer and local maintenance| hostlink
-    activation -.->|local activation decision| update
-    activation -.->|path cost times transfer quantity| cost
+    activation -->|local selection and reset after renewed checks| update
+    binding -->|native access automatically holds activation| activation
+    appliance -->|hold for continuing physical work| activation
+    links -->|one-hop absence record in each retained neighbor| activation
+    discovery -->|proposal, cancellation and leaving broadcasts| activation
     smoke -->|signed OTA check uses real peer receiver| update
     flash -->|shared image layout and persistent boot-state implementation| boot
     flash -->|inactive image chunks| imagestorage
@@ -847,7 +863,7 @@ flowchart TB
     radio -->|IRQ waker notifies resident task| tasks
 
     classDef planned stroke-dasharray: 5 5;
-    class peers,activation planned;
+    class peers planned;
 ```
 
 ## Current baseline
@@ -946,8 +962,9 @@ history is bounded and volatile; this is not an exactly-once ledger.
 
 Both supported MCU ports now have a hardware-checked local staging/trial/confirmation
 path. Common signed transfer and durable resume now use the existing peer runtime.
-The next updater slice is measured local costs and automatic activation deferral,
-with appliance holds and neighbor notices.
+Measured local costs and automatic activation deferral now use appliance holds
+and neighbor notices. Next are watchdog-backed trial health confirmation and
+budgets for staging pauses; transfer completion does not establish those behaviors.
 Watchdog expiry and physical interrupted-write/swap checks
 remain distinct from the completed explicit-reset trial/confirm/revert path.
 

@@ -7,8 +7,10 @@ C6 storage/boot integration has host checks and
 Both ports share the common bounded image-storage code.
 The optional `firmware-update` service now authenticates signed packages, receives
 image ranges through ordinary peer forwarding, and resumes from durable page
-checkpoints. Activation and confirmation are explicit local operations; autonomous
-activation remains planned.
+checkpoints. With measured signed costs, activation now waits for local quiet,
+appliance holds, and one-hop neighbor coordination. Unknown costs retain explicit
+local activation. Trial confirmation and watchdog-driven failure recovery are
+separate from this activation decision.
 This plan follows the
 [kernel direction](KERNEL_DIRECTION.md).
 
@@ -212,8 +214,9 @@ inside that layout and never rewrite its recovery loader or partition map.
    either image. Do not expose a remotely activatable unsigned update path as an
    ordinary kernel feature. This slice is implemented; the current mechanisms and
    explicit limits are described below.
-3. **Autonomous activation.** Apply normalized route cost and measured local cost,
-   appliance holds, neighbor notices, and local deferral. Integrate the small
+3. **Autonomous activation.** Measured local-cost deferral, appliance holds, and
+   neighbor notices are implemented. Watchdog-backed local health confirmation
+   and staging pause budgets remain to be integrated. Integrate the small
    package-serving operation with the tablet peer; the MCU receiver owns its
    lifecycle. Add compatible-release packaging checks before unattended rollout.
 
@@ -275,14 +278,14 @@ The resident peer task owns the receiver and flash. There is no updater task,
 allocator, image buffer, or new routing table. OTA-enabled builds reserve a fixed
 24 KiB radio stack: a 16 KiB reservation overflowed on C6's remote signature path.
 Both maintained OTA fixtures enable the existing kernel stack-overflow guard.
-Ordinary builds retain their 8 KiB radio stack. The journal owns persistent transfer
+Ordinary builds now reserve 12 KiB; their smaller 8 KiB reservation overflowed
+in the guarded C6 local-update check after neighbor bookkeeping grew. The journal owns persistent transfer
 progress; boot metadata separately owns trial/confirmation/reversion.
 
-Local SelectTrial, Confirm, and Reset controls use the attached host only (host
+Explicit SelectTrial, Confirm, and Reset maintenance controls use the attached host only (host
 opcodes 6/0x86), or the kernel's local activation/confirmation API. They have no
-radio activation encoding. The initial fixtures intentionally require an explicit
-local activation and confirmation. They do not automatically confirm an image just
-because a remote transfer completed.
+radio activation encoding. Unknown-cost fixtures still require explicit local activation. Trial confirmation
+remains explicit in these checks; receipt of a package does not confirm its image.
 
 ## Packaging and maintained checks
 
@@ -334,8 +337,8 @@ candidate surface descriptions. The build/signing pipeline must supply authentic
 surface dumps and the matching candidate release; the packager does not extract
 or prove those properties from arbitrary machine code.
 
-Remaining work: measured release costs and automatic deferral, appliance activity
-holds, neighbor absence notices, watchdog trial expiry, stale-handle/rebind support,
+Remaining work: background staging budgets, watchdog trial expiry and local-health
+confirmation, stale-handle/rebind support,
 and tablet package-serving integration. Page erases and full-image verification
 are synchronous in this slice and can pause radio service. A completed transfer is
 not evidence of uninterrupted background operation. Physical power cuts during an
@@ -374,3 +377,145 @@ reply identity, and wire framing. The final run passed 95 kernel tests, 3 shared
 wire tests, 8 port boot tests, and the shared diagnostic-console stream check.
 Strict whole-kernel Clippy still encounters existing inherited-core/forwarding
 lints; it is not a passing validation gate for this checkout.
+
+
+## Local activation policy
+
+`kernel::update::activation` runs inside the resident peer task. Once verification
+succeeds, complete known signed timing coefficients enable automatic activation.
+The outage estimate includes re-verification during selection, the fixed boot cost,
+and the actual port swap extent (the whole Nordic active slot, zero on C6). Unknown
+or excessive estimates keep the image ready for explicit maintenance. Absence
+estimates are bounded at ten minutes; no arithmetic overflow becomes a free cost.
+
+The vertex waits for quiet lasting at least the estimated outage or five seconds,
+whichever is longer, plus a bounded address/time-mixed backoff below two seconds.
+This is a local heuristic based on recent activity, not a prediction of user intent
+or proof of a future idle interval. Continued activity may defer an update
+indefinitely; there is no compulsory reboot deadline. Registered local changes, native access, active
+state/surface/link reads, native calls, deltas and their relaying restart the wait.
+Periodic formation/link maintenance and update transfer records are not user work;
+outstanding read/call return paths still defer selection until answered or expired.
+
+`Appliance::with` and native invocation automatically hold admission while using
+the appliance. For a motor cycle, timer or other physical operation continuing
+past the call, retain `update::hold_activation(&context)?` until it finishes.
+The guard is one counted local hold, not a job or schedule. Busy means activation
+already closed admission; do not begin the physical operation. Dropping a hold
+records activity and wakes the resident task. Automatic selection atomically closes
+new holds, then rechecks activity and pending deltas before changing boot metadata.
+An `Appliance::with` arriving after commitment waits for reset (or reopens after a
+failed selection). Explicit USB maintenance controls remain explicit overrides.
+
+A proposal is broadcast two seconds before departure. Only maintained immediate
+neighbors retain it, in their existing link record. Nodes about to update defer to
+an already-departing neighbor; simultaneous proposals use the smaller radio address
+as a tie-break. Renewed activity cancels the proposal. A final leaving notice precedes
+selection; failed TX or a captured/in-progress reception postpones commitment.
+There is no new task, graph scheduler, routing registry, or network-wide lock.
+
+LVT v7 opcode 18 carries the network tag and a nine-byte notice: attempt `u32`,
+phase `u8` (proposed=0, leaving=1, cancel=2), and estimated outage milliseconds `u32`.
+It is one-hop broadcast only. Cancellation must match the retained attempt. Repeated
+notices do not extend their timer, and a stale proposal cannot downgrade a leaving
+notice. The record expires after its estimate plus notice time and five seconds of
+slack; an announced neighbor can remain retained beyond ordinary link expiry until
+then. Newer ordinary firmware understands notices even if it has no updater enabled.
+Older firmware ignores them. Loss, hidden terminals and partitions can still permit
+overlapping updates; this mechanism does not prove that a replacement relay path exists.
+
+Only a ready measured image shortens receive waits (to at most 250 ms) while the
+local decision is pending. Ordinary idle participation retains its existing waits.
+Formation and resident participation now use separate function frames so their
+large temporary state is not stacked together during startup. The port fixtures
+enable kernel stack guards and can report the radio task's minimum free stack.
+
+## Measuring a release
+
+The maintained local `update` fixtures report `elapsed_us` for each operation.
+C6 uses the HAL monotonic timer; Nordic uses the 64 MHz DWT cycle counter, taking
+wrapping differences before conversion. Measurements exclude serial reporting.
+`tools/update_costs.py` stages a candidate, measures page erases, chunk programming,
+verification and selection, boots the trial, checks changed fixture identity, then
+confirms it. It writes the six signed-package coefficients plus provenance to JSON.
+It requires an already provisioned matching local fixture and never installs a layout.
+
+```sh
+python tools/update_costs.py --port ACTUAL_PORT --image CANDIDATE_BIN \
+  --output costs.json --swap-bytes 380928  # Nordic layout 2; omit swap-bytes on C6
+```
+
+Programming/verification use Q24.8 microseconds per image byte. Erase uses the
+largest observed page time. Reset-to-local-peer readiness is measured separately for the original
+and trial image; on Nordic their difference supplies the per-swapped-byte term.
+The fixed term includes baseline startup and selection overhead beyond verification.
+The default 125% margin rounds upward. The existing NetworkSelected test event prevents early USB enumeration from
+being mistaken for restored peer service. USB return/host waits make boot estimates
+conservative; these are measured planning inputs, not WCET guarantees. Validate
+representative release builds and physical workloads before publishing their
+costs; an empty fixture measures only its own initialization and workload. Flash erases and full verification
+remain synchronous; automatic activation alone does not make staging uninterrupted.
+
+`prepare --ota --activation-check` adds a ten-second physical-work hold to fixture
+A after verification. Fixture B is ordinary OTA firmware. This check uses the public
+hold API, not a test opcode or a second networking loop. Activation may happen only
+after that hold, a fresh quiet interval, and the proposal window; confirmation is
+still a separate local action. Generated keys, packages, cost files and captures
+stay in ignored target directories.
+
+
+## Activation measurements and checks, 2026-10-18
+
+The maintained local fixtures measured the following on the connected C6 and
+XIAO Nordic. Coefficients include the tool's default 25% planning margin.
+
+| Signed coefficient | C6 | Nordic |
+| --- | ---: | ---: |
+| Erase microseconds/page | 38,910 | 105,207 |
+| Write Q24.8 microseconds/byte | 2,088 | 3,940 |
+| Verify Q24.8 microseconds/byte | 283 | 414 |
+| Fixed activation microseconds | 1,744,222 | 2,045,027 |
+| Swap Q24.8 microseconds/byte | 0 | 19,707 |
+| Longest observed operation with margin, microseconds | 215,059 | 153,183 |
+
+The Nordic trial returned to local peer service in approximately 25.01 seconds,
+against a 1.55-second baseline; its swap extent is 380,928 bytes. C6 trial return
+was approximately 1.37 seconds. These are fixture measurements, not universal
+board limits or guarantees for another appliance's initialization. Cost JSON,
+image digests, and raw logs remain local generated artifacts.
+
+The expanded neighbor records exposed the old ordinary 8 KiB radio-stack limit.
+C6 exception capture and the kernel guard reproduced the overflow. Formation and
+resident participation now have separate frames, and ordinary participation uses
+12 KiB; signed OTA remains at 24 KiB. The maintained local fixtures subsequently
+reported minimum free radio stack of 3,820 bytes on C6 and 3,844 bytes on Nordic
+after formation and continued operation. Both local staging/trial/confirmation
+timing runs passed. This headroom describes the tested empty appliance, not an
+arbitrary appliance callback's stack use.
+
+Portable checks cover unknown costs, activity/hold/neighbor deferral, quiet and
+notice windows, failed notice TX, tick wrap, admission versus commit, bounded
+one-hop encoding, matched cancellation, simultaneous proposal ordering, and expiry.
+There are 99 passing kernel tests, 3 shared wire tests, 8 boot tests, and the shared
+console framing check. Clippy introduces no new diagnostics in the new activation
+or timing code; inherited core/forwarding lints remain.
+
+
+For the automatic C6 check, Nordic supplied the signed 290,144-byte image over
+radio. The C6 remained ready on release 1 through 18.15 seconds after verification,
+covering the ten-second fixture hold and subsequent quiet/notice interval. Release
+2 was observed at 32.21 seconds without sending SelectTrial or Reset beforehand;
+that observation includes a host command timeout across reboot, so it is not a
+measurement of boot outage. Local confirmation and a subsequent reset retained
+release 2. The test source requested transfer only; activation belonged to the receiver.
+
+
+For the automatic Nordic check, C6 supplied the signed 129,620-byte image. Its
+coefficients and full-slot swap extent produced a 31,579 ms outage estimate. A
+remained ready through 44.38 seconds after verification, covering the fixture hold,
+the longer quiet interval, and notice window. B was observed at 70.40 seconds after
+the automatic reset/swap. No host activation command was sent. Local confirmation
+and another reset retained release 2. Both peers ended on confirmed B. These runs
+prove local automatic activation with the public hold on both ports; simultaneous
+neighbor arbitration and loss cases remain portable-model checks, not a hardware
+network-partition guarantee. Trial confirmation was explicit throughout.

@@ -47,7 +47,8 @@ the shared fixture decoder; it did not change the boot/storage implementation.
 The API is local boot machinery. The optional `kernel::update` service adds signed
 packages, download resume, and radio transfer above it. Its validated partition
 table reservation `lattice_update` (data subtype `0x40`) supplies the 8 KiB journal.
-Watchdog expiry and autonomous activation remain common-kernel work. Flash operations are synchronous and can interrupt
+The common updater now applies measured-cost, local-activity and neighbor deferral
+before automatic activation. Watchdog trial expiry remains planned. Flash operations are synchronous and can interrupt
 radio service; background scheduling is not established by these checks.
 
 ```sh

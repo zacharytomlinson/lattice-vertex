@@ -139,13 +139,30 @@ pub(crate) fn run(
     description: exposure::Description,
     native: &'static dyn crate::kernel::appliance::Native,
 ) -> ! {
+    use super::radio::MAX_FRAME_SIZE;
+    let local = radio.address();
+    let mut buffer = [0; MAX_FRAME_SIZE];
+    let mut sequence = 0u8;
+    let network = bootstrap::join_or_form(radio, local, &mut sequence, &mut buffer);
+    participate(radio, description, native, network, sequence)
+}
+
+// Formation has its own bounded scan/rendezvous state. Do not reserve the
+// resident forwarding frame underneath those startup callees on the same stack.
+#[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
+#[inline(never)]
+fn participate(
+    radio: &mut super::radio::task::Transport,
+    description: exposure::Description,
+    native: &'static dyn crate::kernel::appliance::Native,
+    network: Network,
+    mut sequence: u8,
+) -> ! {
     use super::{radio::MAX_FRAME_SIZE, tasks};
     let local = radio.address();
     let mut buffer = [0; MAX_FRAME_SIZE];
     let mut outgoing_buffer = [0; MAX_FRAME_SIZE];
     let mut piece = [0; frame::SURFACE_BYTES];
-    let mut sequence = 0u8;
-    let network = bootstrap::join_or_form(radio, local, &mut sequence, &mut buffer);
     let mut forwarder = forwarding::Forwarder::new(local, network);
     let mut invocations = invocation::Invocations::new();
     #[cfg(feature = "host-link")]
@@ -216,10 +233,29 @@ pub(crate) fn run(
         let timeout = host.wait_ms(milliseconds).map_or(timeout, |ms| {
             timeout.min(crate::milliseconds_to_ticks_checked(ms as u64).unwrap())
         });
+        #[cfg(all(
+            feature = "firmware-update",
+            any(feature = "nrf52840-update", feature = "esp32c6-update")
+        ))]
+        let timeout = if crate::kernel::update::runtime::awaiting_activation() {
+            timeout.min(crate::milliseconds_to_ticks_checked(250).unwrap())
+        } else {
+            timeout
+        };
         if let Some(message) = receive(radio, local, network.channel, &mut buffer, timeout) {
             let measured_at = ((tasks::xTaskGetTickCount() as u64 * 1000)
                 / crate::configTICK_RATE_HZ as u64) as u32;
             collect_costs(radio, &mut forwarder, measured_at);
+            #[cfg(feature = "firmware-update")]
+            if matches!(message.content,
+                Content::Invoke { network: n, .. } | Content::InvocationResult { network: n, .. }
+                | Content::ReadState { network: n, .. } | Content::StateValue { network: n, .. }
+                | Content::StateChanged { network: n, .. } | Content::ReadSurface { network: n, .. }
+                | Content::SurfacePart { network: n, .. } | Content::ReadLinks { network: n, .. }
+                | Content::LinkEntry { network: n, .. } if n == network)
+            {
+                crate::kernel::update::activation::activity();
+            }
             #[cfg(feature = "host-link")]
             if matches!(message.content,
                 Content::LinkEntry { read, .. } if read.reader == local)
@@ -233,7 +269,11 @@ pub(crate) fn run(
                 host.complete(&mut forwarder, message, now);
                 continue;
             }
-            if matches!(message.content,Content::Update{network:n,..}|Content::Updated{network:n,..} if n==network)
+            if let Content::UpdateAbsence { network: n, notice } = message.content {
+                if n == network {
+                    forwarder.record_update_absence(message.source, notice, measured_at);
+                }
+            } else if matches!(message.content,Content::Update{network:n,..}|Content::Updated{network:n,..} if n==network)
             {
                 if let Some(reply) = forwarder.receive_update(message, milliseconds, handle_update)
                 {
@@ -397,6 +437,37 @@ pub(crate) fn run(
                 );
             }
         }
+        #[cfg(all(
+            feature = "firmware-update",
+            any(feature = "nrf52840-update", feature = "esp32c6-update")
+        ))]
+        {
+            let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
+                / crate::configTICK_RATE_HZ as u64) as u32;
+            let conflict =
+                forwarder.activation_conflict(crate::kernel::update::runtime::contending(), now);
+            crate::kernel::update::runtime::poll_activation(
+                now,
+                local,
+                conflict,
+                forwarder.work_pending(),
+                |notice| {
+                    let sent = send(
+                        radio,
+                        Message {
+                            source: local,
+                            destination: None,
+                            path_cost: TimePerByte::UNKNOWN,
+                            content: Content::UpdateAbsence { network, notice },
+                        },
+                        &mut sequence,
+                        &mut outgoing_buffer,
+                    );
+                    sent && (notice.phase != lattice_peer_wire::update::AbsencePhase::Leaving
+                        || !radio.pending_receive())
+                },
+            );
+        }
     }
 }
 
@@ -449,7 +520,8 @@ fn send(
                     evicted: crate::kernel::change::evicted(),
                 },
                 // This successful send needs no dedicated fixture counter.
-                Content::ReadState { .. }
+                Content::UpdateAbsence { .. }
+                | Content::ReadState { .. }
                 | Content::Update { .. }
                 | Content::Updated { .. }
                 | Content::StateValue { .. }

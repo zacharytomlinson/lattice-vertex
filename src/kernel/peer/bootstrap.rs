@@ -91,6 +91,7 @@ fn consider(content: Content<'_>, proposal: &mut Option<Network>) -> Option<Netw
         | Content::LinkExchange { .. }
         | Content::ReadLinks { .. }
         | Content::LinkEntry { .. }
+        | Content::UpdateAbsence { .. }
         | Content::Update { .. }
         | Content::Updated { .. } => None,
     }

@@ -154,3 +154,29 @@ package resumed there, completed verification, and left activation explicit. The
 remaining transfer plus verification took about 93.5 seconds, excluding erase
 preparation. Local selection/reset booted release 2; confirmation followed by
 another reset retained release 2. See the [cross-port validation](../../../../docs/FIRMWARE_UPDATES.md#signed-ota-validation-2026-10-18) for limits.
+
+
+### Timing and automatic activation
+
+The local fixture now reports `elapsed_us` for flash operations and `radio_free`
+for the minimum free radio-task stack. Command 8 verifies a candidate without
+selecting it. Run `tools/update_costs.py` from the root against these local fixtures
+to produce measured package coefficients; it stages, selects, boots and confirms
+its candidate. Nordic additionally uses `--swap-bytes 380928` for layout revision 2.
+
+Build `prepare --ota --activation-check` for the signed check. Image A holds
+activation for ten seconds after verification through the ordinary public hold
+API; image B is the normal OTA receiver. Sign B with the measured cost JSON.
+After upload, require A to remain through the hold and quiet interval, then B to
+start without an `activate` request. Confirm B locally and reset to verify retention.
+Unknown-cost packages still require explicit maintenance. This tests local
+activation, not watchdog expiry, a real appliance cycle, or a loss-free absence
+exchange. See [the common policy](../../../../docs/FIRMWARE_UPDATES.md#local-activation-policy).
+
+
+On 2026-10-18, the measured-cost automatic check received 290,144 bytes from the
+Nordic. It remained ready on A through the ten-second physical-work hold and
+subsequent quiet/notice interval, then booted B without an activation command.
+Local confirmation and reset retained B. The guarded local timing fixture also
+reported 3,820 bytes of minimum free radio stack after formation with the new
+12 KiB ordinary reservation; OTA retains its 24 KiB reservation.

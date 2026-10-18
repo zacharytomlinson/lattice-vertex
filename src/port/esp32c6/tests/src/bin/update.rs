@@ -16,6 +16,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 #[path = "../../../../tests/update_commands.rs"]
 mod update_commands;
+#[path = "../../../../tests/update_measurement.rs"]
+mod update_measurement;
 const _: () = assert!(lattice_vertex::config::configTICK_RATE_HZ == 1000);
 
 static mut STACK: [StackType_t; 3072] = [0; 3072];
@@ -36,6 +38,7 @@ extern "C" fn console(_: *mut c_void) {
                 let seq = u32::from_le_bytes(bytes[..4].try_into().unwrap());
                 let op = bytes[4];
                 let payload = &bytes[5..];
+                let started = esp_hal::time::Instant::now();
                 let result = match (op, payload.len()) {
                     (0, 0) => Ok(()),
                     (1, 4) => {
@@ -54,9 +57,11 @@ extern "C" fn console(_: *mut c_void) {
                     (4, 32) => storage.select_trial(payload.try_into().unwrap()),
                     (5, 0) => Ok(()),
                     (6, 0) => storage.confirm(),
+                    (8, 32) => storage.verify_image(payload.try_into().unwrap()),
                     _ => Err(Error::Order),
                 };
-                report(storage, seq, op, result, progress);
+                let elapsed_us = started.elapsed().as_micros();
+                report(storage, seq, op, result, progress, elapsed_us);
                 if op == 5 && result.is_ok() {
                     lattice_vertex::delay_ms(&context, 100);
                     esp_hal::system::software_reset();
@@ -66,16 +71,23 @@ extern "C" fn console(_: *mut c_void) {
         }
         let now = kernel::tasks::xTaskGetTickCount();
         if now.wrapping_sub(last) >= 1000 {
-            report(storage, 0, 0, Ok(()), progress);
+            report(storage, 0, 0, Ok(()), progress, 0);
             last = now;
         }
         lattice_vertex::delay_ms(&context, 1);
     }
 }
 
-fn report(storage: &ImageStorage<'_>, seq: u32, op: u8, result: Result<(), Error>, progress: u32) {
+fn report(
+    storage: &ImageStorage<'_>,
+    seq: u32,
+    op: u8,
+    result: Result<(), Error>,
+    progress: u32,
+    elapsed_us: u64,
+) {
     log!(
-        "UPDATE image={} slot={} boot={:?} ready=1 seq={} op={} result={:?} progress={} tick={}",
+        "UPDATE image={} slot={} boot={:?} ready=1 seq={} op={} result={:?} progress={} tick={} elapsed_us={} radio_free={} peer_ready={}",
         if cfg!(feature = "update-image-b") {
             "B"
         } else {
@@ -87,12 +99,17 @@ fn report(storage: &ImageStorage<'_>, seq: u32, op: u8, result: Result<(), Error
         op,
         result,
         progress,
-        kernel::tasks::xTaskGetTickCount()
+        kernel::tasks::xTaskGetTickCount(), elapsed_us, update_measurement::radio_free_bytes(), update_measurement::peer_ready() as u8
     );
 }
 
 #[esp_hal::main]
 fn main() -> ! {
+    extern "C" fn stack_overflow(_: lattice_vertex::types::TaskHandle_t, _: *const u8) {
+        panic!("local update task stack overflow");
+    }
+    kernel::tasks::vTaskSetStackOverflowHook(Some(stack_overflow));
+    update_measurement::start();
     let p =
         esp_hal::init(esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()));
     let timer = esp_hal::timer::systimer::SystemTimer::new(p.SYSTIMER);

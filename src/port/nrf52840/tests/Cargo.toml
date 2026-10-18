@@ -12,10 +12,11 @@ peer-observer = ["dep:lattice-radio-test"]
 test-appliance = ["dep:lattice-radio-test"]
 xiao-bootloader = ["cortex-m-rt/set-vtor", "cortex-m-rt/set-sp"]
 usb-console = ["dep:embassy-usb", "dep:embassy-futures"]
-update-test = ["xiao-bootloader", "usb-console", "lattice-vertex/nrf52840-update"]
+update-test = ["xiao-bootloader", "usb-console", "lattice-vertex/nrf52840-update", "lattice-vertex/stack-overflow-check", "lattice-vertex/trace-facility", "lattice-vertex/test-support"]
 update-image-b = ["update-test"]
-ota-test = ["update-test", "lattice-vertex/firmware-update", "lattice-vertex/host-link", "lattice-vertex/stack-overflow-check"]
+ota-test = ["update-test", "lattice-vertex/firmware-update", "lattice-vertex/host-link"]
 ota-image-b = ["ota-test"]
+ota-activation-check = ["ota-test"]
 
 [[bin]]
 name = "ota"
