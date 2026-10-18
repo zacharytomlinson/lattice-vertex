@@ -91,11 +91,11 @@ impl<A: Send, E> Appliance<A, E> {
     pub fn with<R>(&self, context: &TaskContext, update: impl FnOnce(&mut A) -> R) -> R {
         #[cfg(feature = "firmware-update")]
         let _activity = loop {
-            if let Ok(guard) = super::update::activation::try_hold() {
+            if let Ok(guard) = super::update::hold_updates(context) {
                 break guard;
             }
-            // Activation has closed admission. A successful commit resets;
-            // a failed commit reopens it without starting hardware work here.
+            // A flash step or activation owns admission. Start hardware work
+            // only after it completes (or the selected image resets).
             crate::delay_ms(context, 1);
         };
         let mutex = self.native();
@@ -153,7 +153,7 @@ impl<A: Send, E> Native for Appliance<A, E> {
 
     fn invoke(&self, context: &TaskContext, transformer: u64, arguments: &[Value]) -> InvokeStatus {
         #[cfg(feature = "firmware-update")]
-        let Ok(_activity) = super::update::activation::try_hold() else {
+        let Ok(_activity) = super::update::hold_updates(context) else {
             return InvokeStatus::Busy;
         };
         let Some(handle) = self

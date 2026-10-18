@@ -15,7 +15,16 @@ import serial
 
 VERSION = 4
 CHUNK = 48
-PHASES = ("idle", "header", "preparing", "receiving", "ready", "fault", "selected")
+PHASES = (
+    "idle",
+    "header",
+    "preparing",
+    "receiving",
+    "ready",
+    "fault",
+    "selected",
+    "verifying",
+)
 STATUSES = (
     "ok",
     "unsupported",
@@ -134,13 +143,16 @@ class Peer:
     def update(self, owner, request):
         # Only immutable header/range transfers and bounded preparation are retried.
         # Native calls and local activation controls never enter this retry path.
-        for attempt in range(4):
+        failures = 0
+        busy_deadline = time.monotonic() + 30
+        while True:
             try:
                 op, data = self.exchange(5, struct.pack("<Q", owner) + request)
             except (TimeoutError, HostFailure) as error:
                 if isinstance(error, HostFailure) and error.code not in (1, 3, 4):
                     raise
-                if attempt == 3:
+                failures += 1
+                if failures == 4 or time.monotonic() >= busy_deadline:
                     raise
                 time.sleep(0.1)
                 continue
@@ -150,6 +162,13 @@ class Peer:
             progress["path_cost_raw"] = struct.unpack_from("<I", data, 36)[0]
             if progress["package"] != request[1:17].hex():
                 raise ValueError("package identity mismatch")
+            if progress["status"] == "busy":
+                if time.monotonic() >= busy_deadline:
+                    raise TimeoutError(
+                        f"receiver deferred staging for 30 seconds: {progress}"
+                    )
+                time.sleep(0.01)
+                continue
             if progress["status"] != "ok":
                 raise RuntimeError(progress)
             return progress
@@ -191,7 +210,7 @@ def upload(peer, owner, path, stop_after=None):
     if p["phase"] == "ready":
         print(p)
         return p
-    if p["phase"] != "receiving":
+    if p["phase"] not in ("receiving", "verifying"):
         raise RuntimeError(p)
     offset = p["accepted"]
     print(
@@ -215,7 +234,15 @@ def upload(peer, owner, path, stop_after=None):
         if stop_after is not None and offset >= stop_after:
             print("Stopped without finishing or activating:", p, flush=True)
             return p
-    p = peer.update(owner, b"\x03" + package)
+    verification_steps = 0
+    while True:
+        p = peer.update(owner, b"\x03" + package)
+        verification_steps += 1
+        if p["phase"] == "ready":
+            break
+        if p["phase"] != "verifying":
+            raise RuntimeError(p)
+    print(f"Verification steps: {verification_steps}", flush=True)
     print(
         f"Verified in {time.monotonic() - started:.2f}s; activation is decided by the receiver.",
         flush=True,

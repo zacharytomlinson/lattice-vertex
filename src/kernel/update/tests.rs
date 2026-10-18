@@ -12,6 +12,7 @@ struct Memory {
     writes: u32,
     selected: u32,
     torn_checkpoint: bool,
+    image_read_bytes: usize,
 }
 impl Flash {
     fn new() -> Self {
@@ -20,6 +21,7 @@ impl Flash {
             writes: 0,
             selected: 0,
             torn_checkpoint: false,
+            image_read_bytes: 0,
         })))
     }
 }
@@ -32,6 +34,9 @@ impl ReadNorFlash for Flash {
         16384
     }
     fn read(&mut self, o: u32, b: &mut [u8]) -> Result<(), Self::Error> {
+        if o >= 8192 {
+            self.0.borrow_mut().image_read_bytes += b.len();
+        }
         b.copy_from_slice(
             self.0
                 .borrow()
@@ -131,15 +136,19 @@ impl Storage for Backend {
             .write(&mut self.flash, o, b)
             .map_err(|_| ())
     }
-    fn verify(&mut self, h: &[u8; 32]) -> Result<(), ()> {
+    fn verify_step(&mut self, h: &[u8; 32], bytes: u32) -> Result<bool, ()> {
         self.candidate
-            .as_ref()
+            .as_mut()
             .ok_or(())?
-            .verify(&mut self.flash, h)
+            .verify_step(&mut self.flash, h, bytes)
             .map_err(|_| ())
     }
     fn select_trial(&mut self, h: &[u8; 32]) -> Result<(), ()> {
-        self.verify(h)?;
+        self.candidate
+            .as_mut()
+            .ok_or(())?
+            .verify(&mut self.flash, h)
+            .map_err(|_| ())?;
         self.flash.0.borrow_mut().selected += 1;
         Ok(())
     }
@@ -339,12 +348,44 @@ fn acknowledged_bytes_and_durable_pages_survive_restart_and_duplicate_delivery()
             Status::Ok
         );
     }
+    let read_before = flash.0.borrow().image_read_bytes;
     assert_eq!(
         r.handle(Request::Finish { package: id }).phase,
-        Phase::Ready
+        Phase::Verifying
     );
+    assert_eq!(flash.0.borrow().image_read_bytes - read_before, 256);
+    assert_eq!(
+        r.activate(),
+        Err(Status::Order),
+        "partial digest never selects a trial"
+    );
+    // A reset during verification retains the image, but restarts its RAM hash.
+    drop(r);
+    let mut r = Receiver::new(Backend::new(flash.clone()), policy);
+    let read_before = flash.0.borrow().image_read_bytes;
+    for step in 0..image.len().div_ceil(256) {
+        let before = flash.0.borrow().image_read_bytes;
+        let p = r.handle(Request::Finish { package: id });
+        assert_eq!(p.status, Status::Ok);
+        assert!(flash.0.borrow().image_read_bytes - before <= 256);
+        assert_eq!(
+            p.phase,
+            if step + 1 == image.len().div_ceil(256) {
+                Phase::Ready
+            } else {
+                Phase::Verifying
+            }
+        );
+    }
+    assert_eq!(flash.0.borrow().image_read_bytes - read_before, image.len());
     assert_eq!(flash.0.borrow().selected, 0, "receiving never activates");
+    let verified = flash.0.borrow().image_read_bytes;
     r.activate().unwrap();
+    assert_eq!(
+        flash.0.borrow().image_read_bytes,
+        verified,
+        "selection must not repeat the full scan"
+    );
     assert_eq!(flash.0.borrow().selected, 1);
     drop(r);
     let mut r = Receiver::new(Backend::new(flash), policy);

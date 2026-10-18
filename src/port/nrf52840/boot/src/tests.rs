@@ -196,7 +196,8 @@ fn trial_confirmation_and_reversion() {
             trial.confirm().unwrap();
         }
         drop(trial);
-        prepare_boot(flash.clone(), LAYOUT).unwrap();
+        let (_, state) = prepare_boot(flash.clone(), LAYOUT).unwrap();
+        assert_eq!(state, if confirm { State::Boot } else { State::Revert });
         if confirm {
             assert_eq!(&flash.active()[..bytes.len()], &bytes);
         } else {

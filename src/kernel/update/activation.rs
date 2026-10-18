@@ -46,8 +46,7 @@ impl Activation {
         busy: bool,
         neighbor_busy: bool,
     ) -> Action {
-        let candidate =
-            ready.and_then(|(h, swap)| h.costs.outage_ms(h.image_bytes, swap).map(|ms| (h.id, ms)));
+        let candidate = ready.and_then(|(h, swap)| h.costs.outage_ms(swap).map(|ms| (h.id, ms)));
         if self.package != candidate.map(|c| c.0) {
             let cancel = self.cancel();
             self.package = candidate.map(|c| c.0);

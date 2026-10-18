@@ -54,7 +54,7 @@ impl ReceiveBuffer {
 
 /// One maximum 250-kbit/s frame (MAC + FCS + PHY header/preamble) and 192 us
 /// turnaround. The extra tick covers starting just before a tick boundary.
-pub(super) const fn receive_turn_ticks(tick_hz: u32) -> u32 {
+pub(crate) const fn receive_turn_ticks(tick_hz: u32) -> u32 {
     const WINDOW_US: u64 = (MAX_FRAME_SIZE as u64 + 2 + 6) * 32 + 192;
     (WINDOW_US * tick_hz as u64).div_ceil(1_000_000) as u32 + 1
 }

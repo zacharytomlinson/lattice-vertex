@@ -9,8 +9,8 @@ The optional `firmware-update` service now authenticates signed packages, receiv
 image ranges through ordinary peer forwarding, and resumes from durable page
 checkpoints. With measured signed costs, activation now waits for local quiet,
 appliance holds, and one-hop neighbor coordination. Unknown costs retain explicit
-local activation. Trial confirmation and watchdog-driven failure recovery are
-separate from this activation decision.
+local activation. The kernel now confirms locally healthy startup automatically;
+hardware watchdog expiry resets stalled trials for bootloader reversion.
 This plan follows the
 [kernel direction](KERNEL_DIRECTION.md).
 
@@ -204,7 +204,7 @@ inside that layout and never rewrite its recovery loader or partition map.
    Nordic storage and the loader are implemented; the A/B USB fixture has run.
    Host checks cover bounds, confirmation/reversion, and interrupted swap/revert.
    Hardware staging, trial, confirmation, and reversion pass. Physical interrupted
-   swaps and watchdog expiry remain open. C6 staging, trial, rollback, and
+   swaps remain open; watchdog checks now have separate maintained fixtures. C6 staging, trial, rollback, and
    confirmation have also run on hardware. Both ports now use
    [shared image storage](../src/kernel/update/storage/README.md).
 2. **Common transfer and verification.** Add `kernel::update` for one candidate,
@@ -215,8 +215,8 @@ inside that layout and never rewrite its recovery loader or partition map.
    ordinary kernel feature. This slice is implemented; the current mechanisms and
    explicit limits are described below.
 3. **Autonomous activation.** Measured local-cost deferral, appliance holds, and
-   neighbor notices are implemented. Watchdog-backed local health confirmation
-   and staging pause budgets remain to be integrated. Integrate the small
+   neighbor notices are implemented. Local health confirmation and watchdog-backed trial recovery are implemented.
+   Cost-based staging admission and incremental verification are implemented. Integrate the small
    package-serving operation with the tablet peer; the MCU receiver owns its
    lifecycle. Add compatible-release packaging checks before unattended rollout.
 
@@ -253,12 +253,15 @@ is the first 16 bytes of SHA-256 over the complete signed header. Verification u
 `ed25519-dalek`'s strict verifier without allocation or precomputed-table features.
 No flash mutation precedes signature, target, surface, size, and newer-release
 checks. The image's complete hash and target vectors/header are checked before
-readiness and again by local trial selection.
+readiness. Selection reuses the verified digest while the candidate exclusively
+owns unchanged flash, and rechecks the small target prefix.
 
 The shared wire crate defines Header, Prepare, Data, Finish, and Status requests.
 Four independently acknowledged 48-byte header ranges assemble one offer. Each
 Prepare advances at most one erase page, or commits the journal header. Data
-carries at most 48 image bytes, its offset, and package identity. Its largest radio
+carries at most 48 image bytes, its offset, and package identity. Finish advances
+bounded verification; phase 7 (Verifying) means another Finish is required before
+Ready. Busy is backpressure: no flash progress occurred for that request. Its largest radio
 frame is 124 bytes excluding FCS, inside the 125-byte MAC limit. Requests/replies
 reuse the existing read-token/reverse-path records and learned routes; relays do
 not retain package images. New radio opcodes 16/17 and attached-host opcodes 5/0x85
@@ -284,8 +287,9 @@ progress; boot metadata separately owns trial/confirmation/reversion.
 
 Explicit SelectTrial, Confirm, and Reset maintenance controls use the attached host only (host
 opcodes 6/0x86), or the kernel's local activation/confirmation API. They have no
-radio activation encoding. Unknown-cost fixtures still require explicit local activation. Trial confirmation
-remains explicit in these checks; receipt of a package does not confirm its image.
+radio activation encoding. Unknown-cost fixtures still require explicit local activation. Confirmation now follows local startup progress; receipt of a package alone
+does not confirm its image. Explicit Confirm is idempotent after those checks
+and returns Busy until they succeed.
 
 ## Packaging and maintained checks
 
@@ -337,10 +341,9 @@ candidate surface descriptions. The build/signing pipeline must supply authentic
 surface dumps and the matching candidate release; the packager does not extract
 or prove those properties from arbitrary machine code.
 
-Remaining work: background staging budgets, watchdog trial expiry and local-health
-confirmation, stale-handle/rebind support,
-and tablet package-serving integration. Page erases and full-image verification
-are synchronous in this slice and can pause radio service. A completed transfer is
+Remaining work: shorter port-level indivisible flash pauses, stale-handle/rebind support,
+and tablet package-serving integration. Page erases remain indivisible; image
+verification is incremental. Each synchronous step can pause radio service. A completed transfer is
 not evidence of uninterrupted background operation. Physical power cuts during an
 individual flash write or swap remain distinct from reset/resume and host fault
 injection. Release version checking is relative to the running firmware; it is not
@@ -383,8 +386,7 @@ lints; it is not a passing validation gate for this checkout.
 
 `kernel::update::activation` runs inside the resident peer task. Once verification
 succeeds, complete known signed timing coefficients enable automatic activation.
-The outage estimate includes re-verification during selection, the fixed boot cost,
-and the actual port swap extent (the whole Nordic active slot, zero on C6). Unknown
+The outage estimate includes boot selection/startup and the actual port swap extent (the whole Nordic active slot, zero on C6). Unknown
 or excessive estimates keep the image ready for explicit maintenance. Absence
 estimates are bounded at ten minutes; no arithmetic overflow becomes a free cost.
 
@@ -448,13 +450,14 @@ python tools/update_costs.py --port ACTUAL_PORT --image CANDIDATE_BIN \
 Programming/verification use Q24.8 microseconds per image byte. Erase uses the
 largest observed page time. Reset-to-local-peer readiness is measured separately for the original
 and trial image; on Nordic their difference supplies the per-swapped-byte term.
-The fixed term includes baseline startup and selection overhead beyond verification.
+The fixed term includes baseline startup and the cached selection operation.
+Verification has already completed and is charged to staging, not to boot outage.
 The default 125% margin rounds upward. The existing NetworkSelected test event prevents early USB enumeration from
 being mistaken for restored peer service. USB return/host waits make boot estimates
 conservative; these are measured planning inputs, not WCET guarantees. Validate
 representative release builds and physical workloads before publishing their
-costs; an empty fixture measures only its own initialization and workload. Flash erases and full verification
-remain synchronous; automatic activation alone does not make staging uninterrupted.
+costs; an empty fixture measures only its own initialization and workload. Flash erases remain indivisible even though staging and verification are paced;
+this does not make flash service uninterrupted.
 
 `prepare --ota --activation-check` adds a ten-second physical-work hold to fixture
 A after verification. Fixture B is ordinary OTA firmware. This check uses the public
@@ -519,3 +522,195 @@ and another reset retained release 2. Both peers ended on confirmed B. These run
 prove local automatic activation with the public hold on both ports; simultaneous
 neighbor arbitration and loss cases remain portable-model checks, not a hardware
 network-partition guarantee. Trial confirmation was explicit throughout.
+
+
+## Watchdog-backed startup confirmation
+
+`update::startup` owns one local confirmation state. Storage initialization and
+appliance binding precede scheduler startup. A completed local radio energy
+measurement and an advancing kernel tick then permit confirmation in the resident
+peer task. No tablet, nucleus, reachable neighbor, packet exchange, or successful
+network formation is required. This establishes initialization of the local
+components; it does not prove arbitrary appliance behavior or future executions.
+
+The kernel writes confirmation once. An uncertain confirmation failure stops
+watchdog feeding and is not retried against potentially changed boot metadata.
+The loader resolves that state after reset. Public/manual Confirm cannot bypass
+the startup checks. Existing explicit local boot fixtures retain their manual
+confirmation path so they can still exercise healthy-but-unconfirmed reversion.
+
+Both ports reserve a nominal 30-second watchdog interval. The peer task feeds it
+after confirmed startup and on normal execution progress, never from the tick or
+radio IRQ. A stalled peer therefore cannot stay alive merely because interrupts
+continue. Both watchdogs remain active after confirmation: a later stall resets
+the confirmed image rather than reverting it. The ordinary receive/discovery waits
+are shorter than the interval. Long blocking appliance code must not monopolize
+that task for the watchdog interval.
+
+On Nordic, the loader arms WDT after the full-slot swap and before jumping to an
+unconfirmed trial, giving application startup a fresh interval. It reads the
+persistent *resulting* boot state: Embassy's `prepare_boot` return value describes
+the entry state even after a reversion. That distinction prevents treating restored
+A as another unconfirmed B. The port and loader compile the same small watchdog
+module; one reload register is enabled and counting continues during CPU sleep or
+debug halt. The peripheral cannot be stopped once started, so kernel progress
+continues feeding it after confirmation. Its configuration becomes writable again
+on system reset. [Nordic WDT reference](https://docs.nordicsemi.com/r/bundle/ps_nrf52840/page/wdt.html)
+
+The C6 loader uses RTC WDT with a 30,000 ms timeout and
+`BOOTLOADER_WDT_DISABLE_IN_USER_CODE=y`. The port rearms RTC WDT at `initialize`
+entry and retains hardware reset action; no watchdog ISR is installed.
+[Espressif watchdog reference](https://docs.espressif.com/projects/esp-idf/en/v5.5.2/esp32c6/api-reference/system/wdts.html)
+There is a known C6 handoff gap: esp-hal 1.1.2 unconditionally disables watchdogs
+inside `esp_hal::init`, before Lattice's port initialization rearms one. A stall
+inside that interval is not covered. Keep port initialization directly after HAL
+initialization/resource setup. The current implementation does not vendor or patch
+the whole HAL to change this behavior, and does not claim uninterrupted protection
+through that interval.
+
+The watchdog-capable loaders require one-time provisioning. This changes boot
+behavior without moving the revision-2 image/journal boundaries. Ordinary packages
+still update applications only; they do not install a new loader. Nordic factory
+recovery and the C6 ROM loader remain intact, and no eFuses are changed.
+
+### Maintained trial failures
+
+`update.py prepare --ota --watchdog-check` builds healthy A/B plus two signed-package
+candidates: `stall-entry` spins before peripheral initialization; `stall-radio`
+spins in the existing DiscoveryStarted test hook, after the scheduler/radio task
+starts and before the first radio operation. Both mask interrupts and spin forever.
+They execute no panic handler, software reset or host recovery command. These
+failures belong solely to the port fixtures; kernel runtime has no test failure
+opcode or extra task.
+
+Sign all three candidates using `tools/update_package.py`, release 2 and explicit
+`--unmeasured`, into `stall-entry-watchdog.lvup`, `stall-radio-watchdog.lvup`, and
+`b-watchdog.lvup`. Provision the new loader and A first, then run:
+
+```sh
+python src/port/tests/update_watchdog.py --port ACTUAL_PORT \
+  --images PORT/tests/target/ota --minimum-recovery-seconds 25
+# Nordic: use --minimum-recovery-seconds 65 to include both full-slot swaps.
+```
+
+The runner uses the local signed receiver to stage each image. It explicitly
+selects/resets into each trial, then waits for the hardware watchdog and loader to
+return A, without another reset or confirmation command. Finally it boots healthy
+B, sends no Confirm, resets B again and requires B to remain. These are boot and
+local-startup checks, not another RF or physical power-cut investigation.
+
+
+### Watchdog validation, 2026-10-18
+
+Both connected boards ran the shared signed-receiver watchdog runner with the new
+loaders. No host Confirm was issued in any case. After selecting/resetting into a
+stalled trial, the runner sent no further reset command while waiting for recovery.
+
+| Trial | C6 observed return | Nordic observed return | Result |
+| --- | ---: | ---: | --- |
+| Stall before peripheral initialization | 39.41 s | 88.27 s | Prior release 1 restored |
+| Stall in peer task before first radio operation | 35.71 s | 79.32 s | Prior release 1 restored |
+| Healthy release 2 | 11.64 s | 25.32 s | Automatic confirmation; retained after another reset |
+
+Times start at reset acknowledgement and end at a successful attached-host status.
+They include boot/swap work, peer formation, USB reconnects, and command timeouts;
+they do not measure the nominal watchdog period. Nordic failure cases include both
+full-slot swap and reversion. Both devices ended on automatically confirmed release
+2. The retained Nordic factory loader and C6 ROM recovery path were preserved;
+no fuse or laptop Wi-Fi settings changed.
+
+Host checks passed 101 kernel tests, 8 boot tests, and 3 shared-wire tests. The
+confirmation checks cover missing tick/radio progress, wrapping ticks, exactly one
+confirmation write, and fail-stop behavior after an uncertain confirmation result.
+The Nordic boot test now checks the post-reversion state returned to the loader.
+Both MCU builds passed. Existing inherited Clippy lints remain; the new startup and
+watchdog code introduced no host Clippy diagnostics. The C6 HAL handoff limitation
+above remains outside the exercised protection windows.
+
+
+## Paced staging and incremental verification
+
+The receiver performs one bounded staging step per request. `update::staging`
+admits that work on the existing peer task using the signed erase/page and
+write/verify-per-byte costs. An operation waits for recent appliance/ordinary peer
+activity to settle for its estimated duration. After completion it leaves an equal
+estimated service interval for normal work, with a minimum receive turn (six ms
+at the current PHY). Post-operation timing avoids counting stalled/lost RTOS ticks
+as if normal service had run during flash access.
+
+Pending native calls and non-update reads take precedence; outstanding update
+paths do not block one another. Captured/in-progress radio frames are serviced
+before host-originated update work. Registered changes also defer staging. A
+refused step returns Busy with unchanged progress; the receiver stores no queued
+flash job. Status, completed operations and identical written ranges stay readable.
+The supplying tool retries only immutable update requests, with ten-ms Busy
+backoff and a thirty-second per-request deferral limit. If activity continues,
+it stops and the caller can re-offer the same package later.
+
+`Appliance::with` and native invocation now acquire an update hold automatically.
+Their actual access and a flash step cannot be admitted simultaneously. A new
+local appliance access waits for an already-started flash step; a native request
+can report Busy. For physical work continuing beyond a call, retain
+`update::hold_updates(&context)?` if it cannot tolerate background flash pauses or
+automatic reboot. Keep using `hold_activation` when only reboot must wait: that
+hold intentionally allows staging, including workflows waiting for a candidate
+to become Ready. Explicit maintenance controls remain deliberate overrides.
+
+Finish uses a one-ms estimated hash-work target, capped at 1,024 image bytes per
+request. The storage layer still reads through one aligned 256-byte buffer and
+retains only the SHA-256 state and cursor. A zero coefficient still has the byte
+cap. Unknown verification costs use one 256-byte step; unknown costs otherwise
+receive only the minimum service interval. Unknown remains unknown: those cases
+have no measured pause estimate and do not qualify for automatic activation.
+
+Verifying is a volatile phase. Reset retains durable image bytes, but discards the
+partial hash and recomputes it from the beginning. Only the final matching digest
+plus port prefix validation makes the image Ready. Actual writes, erases, and
+resume reset the digest state. Selection compares the requested digest to the
+completed result instead of silently performing another whole-image scan. This
+assumes the port's exclusive ownership of its unchanged candidate region; it is
+not a fresh physical-corruption scan at activation. The low-level `verify_image`
+convenience remains synchronous for explicit local port callers, while the kernel
+uses `verify_step` exclusively.
+
+The wire remains LVT v7 / host v4 with unchanged record widths. Updater consumers
+must use the updated shared phase decoder and continue Finish while Verifying;
+they must not interpret every successful Finish reply as Ready. Older firmware
+that finishes synchronously still works with the updated supplying tool. Native
+invocation/read/delta records are unchanged, and native mutations are never retried
+by the update tool's Busy handling.
+
+This pacing gives normal work opportunities; it does not shorten an indivisible
+page erase or predict future changes. Harder latency requirements need port work
+such as partial erase or execution from RAM, and representative cost measurements.
+The release timing tool now measures cached selection directly instead of
+subtracting a verification pass that selection no longer performs.
+
+Build `prepare --ota --staging-check` to make fixture A hold all background updates
+for ten seconds when it accepts a package. Sign B using a measured cost file and
+run `src/port/tests/update_staging.py --port ACTUAL_PORT --package PACKAGE`. It
+checks Busy responses with frozen progress alongside responsive status requests,
+then completes bounded verification, selects the image and checks retained B after
+reset without host confirmation. This is a maintained local receiver/flash check;
+it does not replace the earlier radio-transfer checks or prove physical appliance
+latency during an erase.
+
+### Staging validation, 2026-10-18
+
+Both maintained fixtures passed through the local USB receiver, using the existing
+dry-run cost files. Each returned 78 Busy responses with unchanged preparation and
+byte counters during the sampled eight seconds of its ten-second hold, while
+servicing 78 intervening local status requests. After release, both completed
+staging and verification, booted release 2, confirmed startup, and retained release
+2 after another reset without a host Confirm command.
+
+| Receiver | Image bytes | Verification steps | Selection response |
+| --- | ---: | ---: | ---: |
+| ESP32-C6 | 292,208 | 324 | 31 ms |
+| nRF52840 | 132,228 | 214 | 86 ms |
+
+Selection timings include host/USB service; they are not isolated flash timings.
+These checks reused earlier coefficients to exercise pacing, not to certify new
+release cost measurements. Portable checks also cover reset during verification:
+durable bytes survive, partial hash state does not, and selection remains forbidden
+until the restarted scan completes.

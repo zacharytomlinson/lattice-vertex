@@ -128,6 +128,9 @@ pub fn disconnect(_context: &TaskContext) {
 pub(crate) fn pending() -> bool {
     access(|m| m.request.is_some())
 }
+pub(crate) fn staging_pending() -> bool {
+    access(|m| matches!(m.request, Some(Packet::Update { .. })))
+}
 fn deliver(generation: u32, packet: Packet) {
     access(|m| {
         if m.generation == generation && m.busy && m.request.is_none() && m.response.is_none() {
@@ -347,7 +350,10 @@ impl Host {
         if let Packet::Update { data, .. } = request {
             let operation = lattice_peer_wire::update::Request::decode(data.as_slice()).unwrap();
             if owner == local {
-                let progress = crate::kernel::peer::handle_update(operation);
+                let progress = crate::kernel::peer::handle_update(
+                    operation,
+                    forwarder.ordinary_work_pending(),
+                );
                 deliver(
                     generation,
                     Packet::Updated {

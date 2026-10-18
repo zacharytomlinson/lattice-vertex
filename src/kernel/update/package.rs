@@ -31,9 +31,9 @@ pub struct Costs {
     pub longest_pause_us: u32,
 }
 impl Costs {
-    /// Selection rechecks the image before reset. Include that verification and
+    /// Selection reuses the completed digest. Include boot selection/startup and
     /// the port's actual swap extent, then round outward to milliseconds.
-    pub fn outage_ms(self, image_bytes: u32, swap_bytes: u32) -> Option<u32> {
+    pub fn outage_ms(self, swap_bytes: u32) -> Option<u32> {
         if [
             self.erase_page_us,
             self.write_per_byte,
@@ -46,9 +46,7 @@ impl Costs {
         {
             return None;
         }
-        let us = self
-            .activation_us(swap_bytes)?
-            .checked_add((self.verify_per_byte as u64 * image_bytes as u64).div_ceil(256))?;
+        let us = self.activation_us(swap_bytes)?;
         let ms = u32::try_from(us.div_ceil(1000).max(1)).ok()?;
         (ms <= lattice_peer_wire::update::MAX_ABSENCE_MS).then_some(ms)
     }

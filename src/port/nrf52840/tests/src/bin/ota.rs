@@ -82,10 +82,15 @@ impl UsbSession {
 #[cfg(feature = "ota-activation-check")]
 #[path = "../../../../tests/update_activation.rs"]
 mod update_activation;
+#[cfg(feature = "ota-staging-check")]
+#[path = "../../../../tests/update_staging.rs"]
+mod update_staging;
 extern "C" fn usb_task(_: *mut c_void) {
     let context = unsafe { TaskContext::assume() };
     #[cfg(feature = "ota-activation-check")]
     let mut activation_check = update_activation::Check::new(&context);
+    #[cfg(feature = "ota-staging-check")]
+    let mut staging_check = update_staging::Check::new();
     interrupt::USBD.set_priority(interrupt::Priority::P6);
     interrupt::CLOCK_POWER.set_priority(interrupt::Priority::P6);
     let driver = usb::Driver::new(
@@ -240,14 +245,20 @@ extern "C" fn usb_task(_: *mut c_void) {
     loop {
         #[cfg(feature = "ota-activation-check")]
         activation_check.poll(&context);
+        #[cfg(feature = "ota-staging-check")]
+        staging_check.poll(&context);
         let _ = work.as_mut().poll(&mut cx);
         lattice_vertex::delay_ms(&context, 1);
     }
 }
 #[path = "../../../../tests/update_policy.rs"]
 mod update_policy;
+#[path = "../../../../tests/update_startup.rs"]
+mod update_startup;
 #[cortex_m_rt::entry]
 fn main() -> ! {
+    update_startup::before_init();
+    update_startup::observe();
     extern "C" fn stack_overflow(_: lattice_vertex::types::TaskHandle_t, _: *const u8) {
         panic!("OTA task stack overflow");
     }

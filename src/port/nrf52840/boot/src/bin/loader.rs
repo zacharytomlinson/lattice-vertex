@@ -2,19 +2,25 @@
 #![no_main]
 
 use embassy_nrf::{nvmc::Nvmc, pac};
-use lattice_nrf52840_boot::{layout::XIAO, prepare_boot};
+use lattice_nrf52840_boot::{layout::XIAO, prepare_boot, watchdog, BootState};
 
 #[cortex_m_rt::entry]
 fn main() -> ! {
     let p = embassy_nrf::init(Default::default());
+    // A debugger/core-only handoff may retain a running watchdog. Give the
+    // bounded swap its own interval, then a fresh interval to the trial.
+    watchdog::feed();
     // Only application-region flash is passed to the swap algorithm. Factory
     // MBR, SoftDevice, storage, settings and USB recovery loader remain untouched.
-    if prepare_boot(Nvmc::new(p.NVMC), XIAO).is_err() {
-        recovery();
-    }
+    let (_, state) = prepare_boot(Nvmc::new(p.NVMC), XIAO).unwrap_or_else(|_| recovery());
     let vectors = unsafe { &*(XIAO.active_start as *const [u8; 8]) };
     if !XIAO.valid_vectors(XIAO.image_capacity(), vectors) {
         recovery();
+    }
+    // Arm after the full-slot swap, before any candidate instruction executes.
+    if state == BootState::Swap {
+        watchdog::start();
+        watchdog::feed();
     }
     unsafe {
         cortex_m::interrupt::disable();

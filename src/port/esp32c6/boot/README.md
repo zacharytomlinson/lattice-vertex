@@ -7,7 +7,10 @@ OTA slots and metadata reservation, and identifies the running slot through the
 MMU mapping. Flash encryption is not supported by this first backend.
 
 The common [storage crate](../../../kernel/update/storage/README.md) owns chunk
-writes and SHA-256 checking. This port checks the ESP image header and chip target,
+writes and incremental SHA-256 checking. `verify_step` bounds image bytes per call;
+`verify_image` is its synchronous convenience wrapper. Selection reuses the
+completed digest while the candidate region remains unchanged. Resume, erases
+and new writes invalidate that result. This port checks the ESP image header and chip target,
 then writes a `New` record to the metadata sector opposite the running image's
 record. It never assumes that the highest raw sequence identifies the running
 image: invalid CRCs, invalid states, and aborted trials are excluded. The port
@@ -48,9 +51,19 @@ The API is local boot machinery. The optional `kernel::update` service adds sign
 packages, download resume, and radio transfer above it. Its validated partition
 table reservation `lattice_update` (data subtype `0x40`) supplies the 8 KiB journal.
 The common updater now applies measured-cost, local-activity and neighbor deferral
-before automatic activation. Watchdog trial expiry remains planned. Flash operations are synchronous and can interrupt
-radio service; background scheduling is not established by these checks.
+before automatic activation. Startup confirmation and hardware watchdog recovery
+are now implemented, with the documented esp-hal initialization handoff gap.
+The common updater paces flash steps and verifies incrementally. Individual flash
+operations remain synchronous and can interrupt radio service.
 
 ```sh
 cargo +stable test --lib --locked
 ```
+
+
+Watchdog handoff and automatic local startup confirmation now use the common
+[updater startup path](../../../../docs/FIRMWARE_UPDATES.md#watchdog-backed-startup-confirmation).
+Provision the new loader before relying on trial-entry protection. No flash
+boundaries change. The port reserves its watchdog, and kernel task progress
+reloads it after startup; no tick ISR or appliance callback needs to feed it.
+A confirmed image remains confirmed after a later watchdog reset.

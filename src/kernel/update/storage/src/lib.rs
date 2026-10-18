@@ -33,6 +33,13 @@ pub struct Candidate<F: NorFlash> {
     erased: u32,
     written: u32,
     failed: bool,
+    verification: Verification,
+}
+
+enum Verification {
+    NotStarted,
+    Reading { hash: Sha256, offset: u32 },
+    Complete([u8; 32]),
 }
 
 impl<F: NorFlash> Candidate<F> {
@@ -69,6 +76,7 @@ impl<F: NorFlash> Candidate<F> {
             erased: 0,
             written: 0,
             failed: false,
+            verification: Verification::NotStarted,
         })
     }
 
@@ -91,6 +99,7 @@ impl<F: NorFlash> Candidate<F> {
             completed
         };
         self.failed = false;
+        self.verification = Verification::NotStarted;
         Ok(())
     }
 
@@ -99,6 +108,7 @@ impl<F: NorFlash> Candidate<F> {
             return Err(Error::Order);
         }
         if self.erased < self.erase_length {
+            self.verification = Verification::NotStarted;
             let start = self.destination + self.erased;
             flash
                 .erase(start, start + F::ERASE_SIZE as u32)
@@ -141,6 +151,7 @@ impl<F: NorFlash> Candidate<F> {
             return Err(Error::Order);
         }
         buffer.0[..bytes.len()].copy_from_slice(bytes);
+        self.verification = Verification::NotStarted;
         if let Err(error) = flash.write(
             self.destination + offset,
             &buffer.0[..bytes.len().div_ceil(4) * 4],
@@ -153,25 +164,70 @@ impl<F: NorFlash> Candidate<F> {
         Ok(())
     }
 
-    pub fn verify(&self, flash: &mut F, expected_sha256: &[u8; 32]) -> Result<(), Error> {
+    /// Verify at most `bytes` image bytes, using the same fixed scratch buffer.
+    /// The completed digest remains valid while this candidate exclusively owns
+    /// the unchanged region. Resume, erase, and new writes invalidate it.
+    pub fn verify_step(
+        &mut self,
+        flash: &mut F,
+        expected_sha256: &[u8; 32],
+        bytes: u32,
+    ) -> Result<bool, Error> {
         if self.failed {
             return Err(Error::Order);
         }
         if self.written != self.length {
             return Err(Error::Incomplete);
         }
-        let mut hash = Sha256::new();
+        if bytes == 0 {
+            return Err(Error::Bounds);
+        }
+        if let Verification::Complete(digest) = &self.verification {
+            return if digest == expected_sha256 {
+                Ok(true)
+            } else {
+                Err(Error::Digest)
+            };
+        }
+        if matches!(self.verification, Verification::NotStarted) {
+            self.verification = Verification::Reading {
+                hash: Sha256::new(),
+                offset: 0,
+            };
+        }
+        let Verification::Reading { hash, offset } = &mut self.verification else {
+            unreachable!()
+        };
+        let end = self.length.min(offset.saturating_add(bytes));
         let mut buffer = Buffer([0; 256]);
-        for offset in (0..self.length).step_by(256) {
-            let len = core::cmp::min(256, (self.length - offset) as usize);
+        while *offset < end {
+            let len = core::cmp::min(buffer.0.len(), (end - *offset) as usize);
             flash
-                .read(self.destination + offset, &mut buffer.0[..len])
+                .read(self.destination + *offset, &mut buffer.0[..len])
                 .map_err(flash_error)?;
             hash.update(&buffer.0[..len]);
+            *offset += len as u32;
         }
-        if hash.finalize().as_slice() != expected_sha256 {
+        if *offset != self.length {
+            return Ok(false);
+        }
+        let Verification::Reading { hash, .. } =
+            core::mem::replace(&mut self.verification, Verification::NotStarted)
+        else {
+            unreachable!()
+        };
+        let digest: [u8; 32] = hash.finalize().into();
+        self.verification = Verification::Complete(digest);
+        if &digest != expected_sha256 {
             return Err(Error::Digest);
         }
+        Ok(true)
+    }
+
+    /// Synchronous convenience for local port users. Kernel staging calls
+    /// verify_step; selection of an already verified image only checks the cache.
+    pub fn verify(&mut self, flash: &mut F, expected_sha256: &[u8; 32]) -> Result<(), Error> {
+        while !self.verify_step(flash, expected_sha256, 1024)? {}
         Ok(())
     }
 }

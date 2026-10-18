@@ -27,6 +27,12 @@ host codec adds kinds 5/6 and 133/134 without altering existing host-v4 records.
 See [the updater](../../../../docs/FIRMWARE_UPDATES.md#implemented-signed-transfer)
 for the signed package and byte layout.
 
+Update phase 7 (`Verifying`) retains partial hash progress. A successful Finish
+may report this phase; send another Finish until Ready. Busy leaves progress
+unchanged and permits a later immutable-request retry. These additions keep the
+28-byte progress width and LVT v7 / host v4 envelopes. Updater consumers must use
+the updated phase decoder; ordinary read/call/change records are unaffected.
+
 `update::Absence` is the fixed nine-byte one-hop planned-outage notice. It carries
 an attempt token, phase, and bounded relative duration; LVT v7 opcode 18 encodes
 it after the network tag. It has no routed or attached-host request equivalent.

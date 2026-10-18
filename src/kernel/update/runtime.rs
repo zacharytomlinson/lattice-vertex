@@ -7,7 +7,7 @@ use super::{
     Receiver, Storage,
 };
 use crate::{kernel::tasks, port, sync::TaskContext};
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use lattice_peer_wire::update::{Progress, Request, Status};
 
 #[cfg(feature = "port-nrf52840")]
@@ -45,8 +45,8 @@ impl Storage for PlatformStorage {
     fn write(&mut self, o: u32, b: &[u8]) -> Result<(), Self::Error> {
         PlatformStorage::write(self, o, b)
     }
-    fn verify(&mut self, d: &[u8; 32]) -> Result<(), Self::Error> {
-        self.verify_image(d)
+    fn verify_step(&mut self, d: &[u8; 32], bytes: u32) -> Result<bool, Self::Error> {
+        PlatformStorage::verify_step(self, d, bytes)
     }
     fn select_trial(&mut self, d: &[u8; 32]) -> Result<(), Self::Error> {
         PlatformStorage::select_trial(self, d)
@@ -77,6 +77,10 @@ static mut RECEIVER: Option<Receiver<PlatformStorage>> = None;
 static CONTROL: AtomicU8 = AtomicU8::new(0);
 static mut ACTIVATION: Activation = Activation::new();
 static mut ACTIVITY_EPOCH: u32 = 0;
+static mut STAGING: super::staging::Staging = super::staging::Staging::new();
+static mut STARTUP: super::startup::Startup = super::startup::Startup::new(0);
+// Other tasks read this monotonic result without borrowing the peer-owned record.
+static STARTUP_CONFIRMED: AtomicBool = AtomicBool::new(false);
 static mut SNAPSHOT: Snapshot = Snapshot {
     progress: Progress {
         package: [0; 16],
@@ -106,6 +110,9 @@ pub(crate) fn initialize(storage: PlatformStorage, policy: Policy) {
             "updater already initialized"
         );
         core::ptr::addr_of_mut!(RECEIVER).write(Some(Receiver::new(storage, policy)));
+        core::ptr::addr_of_mut!(STARTUP).write(super::startup::Startup::new(
+            tasks::xTaskGetTickCount() as u32,
+        ));
         publish(Status::Ok);
     }
 }
@@ -147,7 +154,26 @@ pub fn select_trial(_: &TaskContext) -> Result<(), Status> {
 }
 /// Request local boot confirmation; observe completion through `snapshot`.
 pub fn confirm(_: &TaskContext) -> Result<(), Status> {
+    // Application code cannot bypass the kernel's startup checks.
+    if !STARTUP_CONFIRMED.load(Ordering::Acquire) {
+        return Err(Status::Busy);
+    }
     request(2)
+}
+
+/// Only the resident task calls this. A successful local radio operation plus
+/// tick progress proves startup without depending on any other vertex.
+pub(crate) fn startup_progress(radio_completed: bool) {
+    let Some(receiver) = (unsafe { (&mut *core::ptr::addr_of_mut!(RECEIVER)).as_mut() }) else {
+        return;
+    };
+    let startup = unsafe { &mut *core::ptr::addr_of_mut!(STARTUP) };
+    if startup.progress(tasks::xTaskGetTickCount() as u32, radio_completed, || {
+        receiver.confirm()
+    }) {
+        STARTUP_CONFIRMED.store(true, Ordering::Release);
+        port::watchdog::feed();
+    }
 }
 pub(crate) fn reset(_: &TaskContext) -> Result<(), Status> {
     request(3)
@@ -165,7 +191,7 @@ pub(crate) fn awaiting_activation() -> bool {
             r.phase == lattice_peer_wire::update::Phase::Ready
                 && r.header.is_some_and(|h| {
                     h.costs
-                        .outage_ms(h.image_bytes, r.storage.activation_swap_bytes())
+                        .outage_ms(r.storage.activation_swap_bytes())
                         .is_some()
                 })
         })
@@ -291,10 +317,31 @@ pub(crate) fn poll_control() {
     }
     CONTROL.store(0, Ordering::Release);
 }
-pub(crate) fn receive(request: Request<'_>) -> Progress {
+pub(crate) fn receive(request: Request<'_>, traffic_pending: bool) -> Progress {
     let reply = unsafe {
         match (&mut *core::ptr::addr_of_mut!(RECEIVER)).as_mut() {
-            Some(r) => r.handle(request),
+            Some(r) => {
+                if let Some((work, costs)) = r.staging_work(request) {
+                    let pacing = &mut *core::ptr::addr_of_mut!(STAGING);
+                    let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
+                        / crate::configTICK_RATE_HZ as u64) as u32;
+                    let busy = traffic_pending || crate::kernel::change::pending() || pending();
+                    if !pacing.admit(now, activation::epoch(), busy, work, costs) {
+                        return r.progress(request.package(), Status::Busy);
+                    }
+                    let Some(_flash) = super::staging::FlashStep::enter() else {
+                        return r.progress(request.package(), Status::Busy);
+                    };
+                    let reply = r.handle(request);
+                    let completed = ((tasks::xTaskGetTickCount() as u64 * 1000)
+                        / crate::configTICK_RATE_HZ as u64)
+                        as u32;
+                    pacing.completed(completed, work, costs);
+                    reply
+                } else {
+                    r.handle(request)
+                }
+            }
             None => Progress::unsupported(request.package()),
         }
     };

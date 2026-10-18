@@ -11,9 +11,10 @@ Nordic's flash layout and swap/trial/confirmation state remain in this port.
 
 Current status: host checks, ARM builds, and the XIAO USB staging/trial/confirm/revert
 sequence pass. The common `kernel::update` service adds signed packages, a durable
-transfer journal, and OTA messages above this local backend. Watchdog-driven trial
-expiry remains planned. Automatic quiet/hold/neighbor deferral now lives in the
-common update service. Calling `select_trial` checks SHA-256 and initial vectors; it
+transfer journal, and OTA messages above this local backend. The loader now arms
+the trial watchdog before application entry, and the common kernel confirms local
+startup and reloads the watchdog during task progress. Automatic quiet/hold/neighbor
+deferral also lives in the common update service. Calling `select_trial` requires a matching SHA-256 digest and initial vectors; it
 does **not** authenticate a release signature.
 
 ## XIAO layout
@@ -63,17 +64,21 @@ NOR write. Out-of-order/conflicting writes fail. A write error invalidates the
 in-memory candidate, requiring a fresh erase before retrying uncertain flash.
 The active image and loader are never written during staging.
 
+`verify_step` hashes a bounded number of image bytes and checks the vectors when
+the digest completes. `verify_image` is its synchronous convenience wrapper.
 `select_trial` requires the complete image, a matching digest, and vectors linked
-for the active slot. Once boot selection starts, further staging and confirmation
+for the active slot. It reuses a completed digest while the candidate region is
+unchanged; resume, erases and new writes invalidate that result. Once boot
+selection starts, further staging and confirmation
 are refused in that execution, even if metadata writing returns an error. The
 next reset resolves the persistent boot state. An unconfirmed trial cannot erase
 its rollback image. `confirm` records successful local startup; a subsequent reset
 without confirmation instead reverts through the loader.
 
-Page erase and verification are synchronous. They are not yet suitable for
-uninterrupted background radio service. The first maintained check uses explicit
-USB commands and resets. A hung application does not yet trigger rollback without
-a reset; watchdog integration remains to be added.
+Each page erase remains synchronous. The common updater paces flash steps and
+verifies incrementally, but this does not establish uninterrupted radio service.
+The local staging check uses explicit USB commands and resets. Signed OTA builds
+now confirm locally healthy startup; stalled trials reset through hardware WDT.
 
 Host checks use the real Embassy swap algorithm with a NOR model: bounds and
 vectors, duplicate writes, confirmation/reversion, and interruptions during
@@ -96,3 +101,11 @@ cargo +nightly build -Z build-std=core --release --locked \
 
 The maintained USB/RTOS fixture and upload instructions are
 [beside the port tests](../tests/UPDATE.md).
+
+
+Watchdog handoff and automatic local startup confirmation now use the common
+[updater startup path](../../../../docs/FIRMWARE_UPDATES.md#watchdog-backed-startup-confirmation).
+Provision the new loader before relying on trial-entry protection. No flash
+boundaries change. The port reserves its watchdog, and kernel task progress
+reloads it after startup; no tick ISR or appliance callback needs to feed it.
+A confirmed image remains confirmed after a later watchdog reset.

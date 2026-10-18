@@ -588,9 +588,9 @@ than a direct link. Hop limits still bound traversal. Link enumeration exposes
 both the normalized outgoing cost and the existing round-trip diagnostic; RTT
 is no longer the routing objective.
 
-The OTA service preserves these quantities in its transfer replies. Automatic
-activation planning is not implemented yet. Firmware-local flash/verification/boot
-costs remain distinct from communication time.
+The OTA service preserves these quantities in its transfer replies. Measured local
+costs drive staging admission and automatic activation deferral. Firmware-local
+flash/verification/boot costs remain distinct from communication time.
 
 ### Alternate directions and bounded redundant invocation
 
@@ -705,9 +705,9 @@ staging and digest verification. `kernel::update` now owns strict signed-package
 authorization, one candidate, durable page checkpoints, and reset/resume. Ordinary
 peer forwarding carries bounded update requests and progress replies. Activation
 with known signed costs now waits for local quiet, physical-work holds, and
-bounded neighbor absence notices. Unknown-cost updates and trial confirmation
-retain explicit local control. Watchdog expiry and automatic health confirmation
-remain planned.
+bounded neighbor absence notices. Unknown-cost activation retains explicit local control. Startup confirmation
+now follows local storage/appliance initialization, tick progress and a completed
+radio operation; hardware watchdogs recover stalled trials without a host.
 Current surface-handle compatibility and flash execution stalls are explicit
 implementation constraints. Firmware replacement remains separate from installing
 an automation's references, conditions, and native calls.
@@ -738,10 +738,13 @@ flowchart TB
     radio["Nordic/C6 radio ports: fixed buffers, energy/CCA, immediate ACK, RX progress, hardware IRQs"]
     transport["kernel::radio: resident driver, notification waits and receive turns"]
     cost["wire::cost: time per byte; radio::cost: bounded measurement handoff"]
-    update["kernel::update: signed candidate, page journal, resume and explicit local activation"]
+    update["kernel::update: signed candidate, page journal, resume and local boot decisions"]
     activation["update::activation: quiet/outage estimate, physical-work admission, neighbor deferral"]
+    health["update::startup: local progress before persistent confirmation"]
+    watchdog["Port watchdogs: boot handoff, 30-second hardware deadline, task-progress reload"]
     packages["tools/update_package.py + update_peer.py: signing and serving through an attached peer"]
-    imagestorage["kernel/update/storage: bounded staging, duplicates, padding and digest"]
+    staging["update::staging: measured admission, normal-service intervals and appliance access holds"]
+    imagestorage["kernel/update/storage: bounded writes, incremental digest and unchanged-image verification cache"]
     flash["Nordic update port: bounded image staging and trial/confirm operations"]
     boot["Nordic boot crate: shared flash layout and Embassy swap/revert loader"]
     c6update["C6 update port: actual running slot, flash, OTA record selection and confirmation"]
@@ -827,6 +830,16 @@ flowchart TB
     discovery -->|forwarded update records at their owner| update
     startup -->|start_with_updates initializes storage and build policy| update
     update -->|runs in resident peer task; local control notification| transport
+    transport -->|successful local energy sample and task progress| health
+    health -->|confirm once; stop feeding on uncertain failure| update
+    health -->|confirmed task progress| watchdog
+    boot -->|arms before trial handoff| watchdog
+    c6boot -->|retains RTC watchdog at image entry| watchdog
+    cpu -->|starts or adopts reserved watchdog| watchdog
+    update -->|one requested step, or Busy without progress| staging
+    binding -->|guarded native access excludes staging| staging
+    appliance -->|hold_updates for continuing critical physical work| staging
+    staging -->|signed per-operation cost and activity decide admission| update
     update -->|bounded storage operations and boot selection| flash
     update -->|C6 equivalent| c6update
     packages <-->|binary host transfer and local maintenance| hostlink
@@ -963,10 +976,13 @@ history is bounded and volatile; this is not an exactly-once ledger.
 Both supported MCU ports now have a hardware-checked local staging/trial/confirmation
 path. Common signed transfer and durable resume now use the existing peer runtime.
 Measured local costs and automatic activation deferral now use appliance holds
-and neighbor notices. Next are watchdog-backed trial health confirmation and
-budgets for staging pauses; transfer completion does not establish those behaviors.
-Watchdog expiry and physical interrupted-write/swap checks
-remain distinct from the completed explicit-reset trial/confirm/revert path.
+and neighbor notices. Local startup confirmation and watchdog trial recovery are now implemented.
+Staging now yields measured service intervals, honors appliance access, and
+verifies the image incrementally. Indivisible erase latency remains port work;
+pacing does not establish uninterrupted background service.
+Hardware watchdog recovery and automatic confirmation now have maintained checks
+on both ports. Physical interrupted-write/swap checks remain distinct from those
+completed timeout and explicit-reset paths.
 
 Extend the working control path into compiled-fragment installation, conditional
 activation, and their forwarding semantics. Native transformer invocation is now

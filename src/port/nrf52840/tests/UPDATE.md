@@ -172,3 +172,39 @@ automatic selection/reset and its swap. The host sent no activation command.
 Local confirmation and reset retained B. The local timing fixture measured about
 25.01 seconds from trial reset to peer readiness and reported 3,844 bytes of
 minimum free radio stack with the corrected ordinary 12 KiB reservation.
+
+
+### Watchdog trial check
+
+`prepare --ota --watchdog-check` adds `stall-entry.bin` and `stall-radio.bin` to
+healthy A/B. Provision this build's loader and A, sign the three release-2
+candidates with explicit unknown costs, then run the shared
+[`update_watchdog.py`](../../tests/update_watchdog.py) runner. Nordic needs
+`--minimum-recovery-seconds 65`; C6 uses its default 25 seconds. The
+[common instructions](../../../../docs/FIRMWARE_UPDATES.md#maintained-trial-failures)
+define package filenames and the expected lifecycle.
+
+The stalled candidates mask interrupts and spin forever without a software reset.
+The runner waits for hardware expiry and loader recovery, then verifies healthy B
+survives a reset without issuing Confirm. Normal OTA builds now confirm local
+startup automatically. The separate local USB `update` fixture retains explicit
+confirmation for its existing boot-state and timing checks.
+
+On 2026-10-18, both stalled candidates reverted to release 1 without host reset
+or confirmation while stalled. Observed return times were 88.27 s at entry
+and 79.32 s in the peer task. Healthy B returned in 25.32 s, confirmed itself,
+and remained release 2 after another reset with no Confirm command. Times include
+USB/host waits and formation, plus Nordic's swaps where applicable. See the
+[watchdog validation](../../../../docs/FIRMWARE_UPDATES.md#watchdog-validation-2026-10-18)
+for scope and the C6 HAL handoff limitation.
+
+### Background staging check
+
+Build `prepare --ota --staging-check`, provision A as above, and sign B with the
+measured cost file. Run the shared
+[`update_staging.py`](../../tests/update_staging.py) with `--port` and `--package`.
+It checks frozen staging and responsive status during a critical-work hold, then
+incremental verification, selection and retained B without host confirmation.
+The [maintained validation](../../../../docs/FIRMWARE_UPDATES.md#staging-validation-2026-10-18)
+passed on this port with a 132,228-byte image in 214 verification steps. This is a
+local receiver/flash check; RF delivery and physical appliance timing are separate.

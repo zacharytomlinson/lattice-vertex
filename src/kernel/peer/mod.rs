@@ -17,6 +17,7 @@ use frame::{Content, Message};
 
 pub(super) fn handle_update(
     request: lattice_peer_wire::update::Request<'_>,
+    traffic_pending: bool,
 ) -> lattice_peer_wire::update::Progress {
     #[cfg(all(
         feature = "firmware-update",
@@ -26,10 +27,13 @@ pub(super) fn handle_update(
         )
     ))]
     {
-        return crate::kernel::update::runtime::receive(request);
+        return crate::kernel::update::runtime::receive(request, traffic_pending);
     }
     #[allow(unreachable_code)]
-    lattice_peer_wire::update::Progress::unsupported(request.package())
+    {
+        let _ = traffic_pending;
+        lattice_peer_wire::update::Progress::unsupported(request.package())
+    }
 }
 
 #[cfg(feature = "host-link")]
@@ -176,6 +180,7 @@ fn participate(
     let period = crate::milliseconds_to_ticks_checked(2_000 + local % 997).unwrap();
     let mut last_discovery = started;
     loop {
+        super::radio::task::watchdog_progress(false);
         let now = tasks::xTaskGetTickCount();
         let milliseconds = ((now as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
         forwarder.expire(milliseconds);
@@ -189,14 +194,18 @@ fn participate(
         ))]
         crate::kernel::update::runtime::poll_control();
         #[cfg(feature = "host-link")]
-        if let Some(outgoing) = host.poll(
-            &mut forwarder,
-            &description,
-            native,
-            &mut invocations,
-            &context,
-            milliseconds,
-        ) {
+        if let Some(outgoing) = if radio.pending_receive() && host::staging_pending() {
+            None
+        } else {
+            host.poll(
+                &mut forwarder,
+                &description,
+                native,
+                &mut invocations,
+                &context,
+                milliseconds,
+            )
+        } {
             if !send(radio, outgoing, &mut sequence, &mut outgoing_buffer) {
                 forwarder.transmit_failed(&outgoing);
                 host.transmit_failed(&mut forwarder);
@@ -275,8 +284,10 @@ fn participate(
                 }
             } else if matches!(message.content,Content::Update{network:n,..}|Content::Updated{network:n,..} if n==network)
             {
-                if let Some(reply) = forwarder.receive_update(message, milliseconds, handle_update)
-                {
+                let busy = forwarder.ordinary_work_pending() || radio.pending_receive();
+                if let Some(reply) = forwarder.receive_update(message, milliseconds, |request| {
+                    handle_update(request, busy)
+                }) {
                     if !send(radio, reply, &mut sequence, &mut outgoing_buffer) {
                         forwarder.transmit_failed(&reply);
                     }

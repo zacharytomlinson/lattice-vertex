@@ -86,6 +86,12 @@ radio equivalent. Signature/compatibility checks and flash work are owned by
 the package and durable-progress semantics. An older host codec cannot originate
 these new operations; existing control/read records are unchanged.
 
+The receiver can defer a flash step with update status Busy and unchanged progress.
+An updater may retry that immutable request later. Finish can succeed in phase 7,
+Verifying, and must continue until Ready before selection. This does not authorize
+retrying a native invocation. Captured or in-progress radio frames take precedence
+over an attached host's update request; the existing mailbox retains that request.
+
 The argument section has the same 61-byte/30-value radio limit. It starts with a
 count byte and declared-width scalars. State tags are 0 value, 1 unknown attribute,
 2 busy. Native statuses are documented in [INVOCATION.md](../INVOCATION.md).

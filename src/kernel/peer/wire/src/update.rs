@@ -183,6 +183,7 @@ pub enum Phase {
     Ready = 4,
     Fault = 5,
     Selected = 6,
+    Verifying = 7,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -242,6 +243,7 @@ impl Progress {
             4 => Phase::Ready,
             5 => Phase::Fault,
             6 => Phase::Selected,
+            7 => Phase::Verifying,
             _ => return None,
         };
         let status = match bytes[17] {
@@ -302,7 +304,7 @@ mod tests {
         }
         let progress = Progress {
             package,
-            phase: Phase::Selected,
+            phase: Phase::Verifying,
             status: Status::Ok,
             accepted: u32::MAX,
             committed: u32::MAX,

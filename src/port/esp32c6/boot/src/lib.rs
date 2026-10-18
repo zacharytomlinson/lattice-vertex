@@ -203,8 +203,15 @@ impl<F: NorFlash> ImageStorage<F> {
     /// Verify staged bytes and the ESP image header without selecting a trial.
     /// Release signature authorization belongs to the common update service.
     pub fn verify_image(&mut self, expected_sha256: &[u8; 32]) -> Result<(), Error> {
-        let candidate = self.candidate.as_ref().ok_or(Error::Order)?;
-        candidate.verify(&mut self.flash, expected_sha256)?;
+        while !self.verify_step(expected_sha256, 1024)? {}
+        Ok(())
+    }
+
+    pub fn verify_step(&mut self, expected_sha256: &[u8; 32], bytes: u32) -> Result<bool, Error> {
+        let candidate = self.candidate.as_mut().ok_or(Error::Order)?;
+        if !candidate.verify_step(&mut self.flash, expected_sha256, bytes)? {
+            return Ok(false);
+        }
         let image = self.layout.images[1 - self.running];
         let mut header = Aligned([0; 24]);
         self.flash
@@ -217,9 +224,10 @@ impl<F: NorFlash> ImageStorage<F> {
         {
             return Err(Error::Image);
         }
-        Ok(())
+        Ok(true)
     }
-    /// Recheck the image and request a trial on the next local reset.
+    /// Require the complete digest and valid header before changing boot state.
+    /// An unchanged verified candidate reuses its digest rather than rereading it.
     pub fn select_trial(&mut self, expected_sha256: &[u8; 32]) -> Result<(), Error> {
         self.verify_image(expected_sha256)?;
         let record = Record {

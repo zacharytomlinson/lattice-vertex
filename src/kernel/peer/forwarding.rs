@@ -246,6 +246,14 @@ pub(super) struct Forwarder {
 const _: () = assert!(core::mem::size_of::<Forwarder>() <= 2464);
 
 impl Forwarder {
+    pub(super) fn ordinary_work_pending(&self) -> bool {
+        self.reads.iter().any(|r| {
+            r.read.reader() != 0 && !r.answered && !matches!(r.read, ReadRequest::Update(_))
+        }) || self
+            .calls
+            .iter()
+            .any(|c| c.call.caller != 0 && c.result.is_none())
+    }
     pub(super) fn work_pending(&self) -> bool {
         self.reads
             .iter()

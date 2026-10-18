@@ -16,7 +16,10 @@ update-test = ["xiao-bootloader", "usb-console", "lattice-vertex/nrf52840-update
 update-image-b = ["update-test"]
 ota-test = ["update-test", "lattice-vertex/firmware-update", "lattice-vertex/host-link"]
 ota-image-b = ["ota-test"]
+ota-stall-before-init = ["ota-image-b"]
+ota-stall-before-radio = ["ota-image-b"]
 ota-activation-check = ["ota-test"]
+ota-staging-check = ["ota-test"]
 
 [[bin]]
 name = "ota"

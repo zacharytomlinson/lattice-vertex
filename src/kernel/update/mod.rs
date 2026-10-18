@@ -11,11 +11,14 @@ pub mod package;
     all(feature = "port-esp32c6", feature = "esp32c6-update")
 ))]
 pub(crate) mod runtime;
+pub(crate) mod staging;
+mod startup;
 #[cfg(any(
     all(feature = "port-nrf52840", feature = "nrf52840-update"),
     all(feature = "port-esp32c6", feature = "esp32c6-update")
 ))]
 pub use runtime::{confirm, select_trial, snapshot, PlatformStorage};
+pub use staging::{hold_updates, UpdateHold};
 
 use lattice_peer_wire::update::{PackageId, Request};
 pub use lattice_peer_wire::update::{Phase, Progress, Status};
@@ -31,7 +34,10 @@ pub trait Storage {
     fn resume(&mut self, length: u32, completed: u32) -> Result<(), Self::Error>;
     fn erase_next_page(&mut self) -> Result<bool, Self::Error>;
     fn write(&mut self, offset: u32, data: &[u8]) -> Result<(), Self::Error>;
-    fn verify(&mut self, digest: &[u8; 32]) -> Result<(), Self::Error>;
+    /// Hash at most `bytes` image bytes; return true only after the complete digest
+    /// and port image-prefix checks pass. Retain partial progress between calls.
+    /// Resume or candidate mutation must discard that progress and its result.
+    fn verify_step(&mut self, digest: &[u8; 32], bytes: u32) -> Result<bool, Self::Error>;
     fn select_trial(&mut self, digest: &[u8; 32]) -> Result<(), Self::Error>;
     fn confirm(&mut self) -> Result<(), Self::Error>;
     /// Bytes copied by the bootloader during activation; zero for direct slot selection.
@@ -80,6 +86,49 @@ pub struct Receiver<S: Storage> {
 }
 
 impl<S: Storage> Receiver<S> {
+    /// Only real flash work is paced. Status, idempotent completed requests, and
+    /// header authorization remain responsive while staging is deferred.
+    fn staging_work(&self, request: Request<'_>) -> Option<(staging::Work, package::Costs)> {
+        let header = self.header.filter(|h| h.id == request.package())?;
+        let work = match request {
+            Request::Prepare { .. } if self.phase == Phase::Preparing => {
+                if self.initialize_journal
+                    && self.journal_pages * PAGE_BYTES >= self.storage.journal_capacity()
+                {
+                    staging::Work::Write(HEADER_BYTES as u32 + 4)
+                } else {
+                    staging::Work::ErasePage
+                }
+            }
+            Request::Data { offset, data, .. }
+                if self.phase == Phase::Receiving && offset == self.accepted =>
+            {
+                let end = offset.checked_add(data.len() as u32)?;
+                if data.is_empty() || end > header.image_bytes {
+                    return None;
+                }
+                let completed = if end == header.image_bytes {
+                    end
+                } else {
+                    end / PAGE_BYTES * PAGE_BYTES
+                };
+                staging::Work::Write(
+                    (data.len() as u32).div_ceil(4) * 4
+                        + if completed > self.committed { 8 } else { 0 },
+                )
+            }
+            Request::Finish { .. }
+                if matches!(self.phase, Phase::Receiving | Phase::Verifying)
+                    && self.accepted == header.image_bytes =>
+            {
+                staging::Work::Verify(
+                    staging::verification_bytes(header.costs).min(header.image_bytes),
+                )
+            }
+            _ => return None,
+        };
+        Some((work, header.costs))
+    }
     pub fn new(storage: S, policy: Policy) -> Self {
         let mut this = Self {
             storage,
@@ -315,15 +364,24 @@ impl<S: Storage> Receiver<S> {
             return Ok(());
         }
         let header = self.header.ok_or(Status::Order)?;
-        if self.phase != Phase::Receiving || self.accepted != header.image_bytes {
+        if !matches!(self.phase, Phase::Receiving | Phase::Verifying)
+            || self.accepted != header.image_bytes
+        {
             return Err(Status::Order);
         }
-        if self.storage.verify(&header.image_sha256).is_err() {
-            self.phase = Phase::Fault;
-            journal::consume(&mut self.storage).map_err(|_| Status::Storage)?;
-            return Err(Status::Verification);
+        self.phase = Phase::Verifying;
+        match self.storage.verify_step(
+            &header.image_sha256,
+            staging::verification_bytes(header.costs),
+        ) {
+            Ok(true) => self.phase = Phase::Ready,
+            Ok(false) => {}
+            Err(_) => {
+                self.phase = Phase::Fault;
+                journal::consume(&mut self.storage).map_err(|_| Status::Storage)?;
+                return Err(Status::Verification);
+            }
         }
-        self.phase = Phase::Ready;
         Ok(())
     }
 

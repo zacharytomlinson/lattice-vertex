@@ -13,7 +13,10 @@ update-test = ["lattice-vertex/esp32c6-update", "lattice-vertex/stack-overflow-c
 update-image-b = ["update-test"]
 ota-test = ["update-test", "lattice-vertex/firmware-update", "lattice-vertex/host-link"]
 ota-image-b = ["ota-test"]
+ota-stall-before-init = ["ota-image-b"]
+ota-stall-before-radio = ["ota-image-b"]
 ota-activation-check = ["ota-test"]
+ota-staging-check = ["ota-test"]
 
 [[bin]]
 name = "ota"

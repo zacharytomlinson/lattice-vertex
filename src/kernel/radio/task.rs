@@ -189,6 +189,19 @@ pub(crate) fn notify_work() {
     }
 }
 
+/// Watchdog reloads require task progress. The timer IRQ never feeds it.
+pub(crate) fn watchdog_progress(radio_completed: bool) {
+    #[cfg(any(feature = "nrf52840-update", feature = "esp32c6-update"))]
+    {
+        #[cfg(feature = "firmware-update")]
+        crate::kernel::update::runtime::startup_progress(radio_completed);
+        // Local boot fixtures intentionally retain explicit confirmation.
+        #[cfg(not(feature = "firmware-update"))]
+        port::watchdog::feed();
+    }
+    let _ = radio_completed;
+}
+
 impl Transport {
     pub(crate) fn pending_receive(&self) -> bool {
         self.received.pending() || port::Radio::receiving_frame()
@@ -217,13 +230,15 @@ impl Transport {
         let timeout =
             crate::milliseconds_to_ticks_checked(u64::from(duration_us).div_ceil(1000) + 20)
                 .unwrap();
-        wait(
+        let result = wait(
             self.radio.energy_detect(duration_us),
             &self.waker,
             timeout,
             WaitMode::Hardware,
         )
-        .unwrap_or(Err(Error::Aborted))
+        .unwrap_or(Err(Error::Aborted));
+        watchdog_progress(result.is_ok());
+        result
     }
 
     pub fn receive(

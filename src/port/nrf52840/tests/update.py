@@ -74,6 +74,10 @@ def write_hex(path, memory):
 
 
 def prepare(args):
+    if args.staging_check and not args.ota:
+        raise ValueError("--staging-check requires --ota")
+    if args.watchdog_check and not args.ota:
+        raise ValueError("--watchdog-check requires --ota")
     if args.activation_check and not args.ota:
         raise ValueError("--activation-check requires --ota")
     out = HERE / ("target/ota" if args.ota else "target/update")
@@ -86,7 +90,11 @@ def prepare(args):
     loader = read_hex(out / "loader.hex")
     check_image(loader, regions["loader_start"], regions["state_start"])
     images = {}
-    for name, features in ([("a", "ota-test"), ("b", "ota-image-b")] if args.ota else [("a", "update-test"), ("b", "update-image-b")]):
+    builds = [("a", "ota-test"), ("b", "ota-image-b")] if args.ota else [("a", "update-test"), ("b", "update-image-b")]
+    if args.watchdog_check:
+        builds += [("stall-entry", "ota-stall-before-init"), ("stall-radio", "ota-stall-before-radio")]
+    for name, features in builds:
+        if args.staging_check and name == "a": features += ",ota-staging-check"
         if args.activation_check and name == "a": features += ",ota-activation-check"
         subprocess.run(common + ["--bin", "ota" if args.ota else "update", "--features", features], cwd=HERE, check=True)
         elf = HERE / "target" / TARGET / ("release/ota" if args.ota else "release/update")
@@ -138,6 +146,8 @@ def main():
     build.add_argument("--nrfutil", default="adafruit-nrfutil")
     build.add_argument("--objcopy", default="objcopy")
     build.add_argument("--activation-check", action="store_true", help="hold automatic activation for ten seconds after verification in image A")
+    build.add_argument("--staging-check", action="store_true", help="hold staging for ten seconds after accepting an offer in image A")
+    build.add_argument("--watchdog-check", action="store_true", help="also build stalled trial images for hardware rollback checks")
     build.add_argument("--ota", action="store_true", help="build the signed receiver and binary host interface")
     for action in ["status", "stage", "reset", "confirm", "dfu"]:
         command = sub.add_parser(action)

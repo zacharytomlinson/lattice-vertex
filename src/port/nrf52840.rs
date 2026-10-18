@@ -19,6 +19,9 @@ use cortex_m::peripheral::SYST;
 mod radio;
 #[cfg(feature = "nrf52840-update")]
 pub mod update;
+#[cfg(feature = "nrf52840-update")]
+#[path = "nrf52840/boot/src/watchdog.rs"]
+pub(crate) mod watchdog;
 pub(crate) use radio::Radio;
 /// Transfer this peripheral to [`crate::kernel::start`].
 pub type RadioPeripheral = hal::Peri<'static, hal::peripherals::RADIO>;
@@ -61,6 +64,8 @@ pub fn initialize(mut systick: SYST) -> hal::Peripherals {
     // Retain internal LFCLK and disabled DC/DC defaults: neither a second
     // crystal nor board-specific regulator inductors are needed for this port.
     let peripherals = hal::init(config);
+    #[cfg(feature = "nrf52840-update")]
+    watchdog::start();
     INITIALIZED.store(true, Ordering::Release);
     peripherals
 }

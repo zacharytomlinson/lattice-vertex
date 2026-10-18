@@ -13,6 +13,8 @@ use lattice_vertex::{
 esp_bootloader_esp_idf::esp_app_desc!();
 #[path = "../../../../tests/update_policy.rs"]
 mod update_policy;
+#[path = "../../../../tests/update_startup.rs"]
+mod update_startup;
 static mut USB: Option<UsbSerialJtag<'static, Blocking>> = None;
 static mut STACK: [StackType_t; 2048] = [0; 2048];
 static mut CONTROL: kernel::tasks::StaticTask_t = kernel::tasks::StaticTask_t::new();
@@ -24,10 +26,15 @@ extern "C" fn stack_overflow(_: lattice_vertex::types::TaskHandle_t, _: *const u
 #[cfg(feature = "ota-activation-check")]
 #[path = "../../../../tests/update_activation.rs"]
 mod update_activation;
+#[cfg(feature = "ota-staging-check")]
+#[path = "../../../../tests/update_staging.rs"]
+mod update_staging;
 extern "C" fn usb_task(_: *mut c_void) {
     let context = unsafe { TaskContext::assume() };
     #[cfg(feature = "ota-activation-check")]
     let mut activation_check = update_activation::Check::new(&context);
+    #[cfg(feature = "ota-staging-check")]
+    let mut staging_check = update_staging::Check::new();
     let mut usb = unsafe { USB.take().unwrap() };
     let mut decoder = host::Decoder::new();
     let mut output = [0; host::MAX_PACKET + 1];
@@ -35,6 +42,8 @@ extern "C" fn usb_task(_: *mut c_void) {
     loop {
         #[cfg(feature = "ota-activation-check")]
         activation_check.poll(&context);
+        #[cfg(feature = "ota-staging-check")]
+        staging_check.poll(&context);
         let mut rejected = None;
         while let Ok(byte) = usb.read_byte() {
             if let Some(request) = decoder.push(byte) {
@@ -62,6 +71,8 @@ extern "C" fn usb_task(_: *mut c_void) {
 }
 #[esp_hal::main]
 fn main() -> ! {
+    update_startup::before_init();
+    update_startup::observe();
     kernel::tasks::vTaskSetStackOverflowHook(Some(stack_overflow));
     let p =
         esp_hal::init(esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()));

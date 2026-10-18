@@ -27,6 +27,8 @@ use core::{arch::asm, ffi::c_void};
 mod radio;
 #[cfg(feature = "esp32c6-update")]
 pub mod update;
+#[cfg(feature = "esp32c6-update")]
+pub(crate) mod watchdog;
 pub(crate) use radio::Radio;
 /// Transfer this peripheral to [`crate::kernel::start`].
 pub type RadioPeripheral = esp_hal::peripherals::IEEE802154<'static>;
@@ -73,6 +75,8 @@ extern "C" {
 /// when the scheduler starts, after its ready lists and current TCB are valid.
 /// Resource ownership prevents another safe HAL user from reconfiguring them.
 pub fn initialize(alarm: Alarm<'static>, software_interrupt: SoftwareInterrupt<'static, 0>) {
+    #[cfg(feature = "esp32c6-update")]
+    watchdog::start();
     assert_eq!(
         tasks::xTaskGetSchedulerState(),
         tasks::taskSCHEDULER_NOT_STARTED

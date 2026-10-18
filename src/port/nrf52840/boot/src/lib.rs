@@ -3,11 +3,13 @@
 //!
 //! No transport, scheduler, or appliance definitions live in this crate. The
 //! separately linked loader and the kernel port use these same flash boundaries.
-//! Staging is currently sequential and restarts after reset. Package signatures,
-//! persistent download progress, and autonomous activation belong to the later
-//! common updater. No remote message can reach this local storage API today.
+//! The common updater owns package authorization, durable transfer progress and
+//! activation. This crate owns the flash regions, persistent boot state, and
+//! loader watchdog handoff.
 
 pub mod layout;
+#[cfg(feature = "loader")]
+pub mod watchdog;
 
 use core::cell::RefCell;
 use embassy_boot::{AlignedBuffer, BlockingFirmwareState, BootLoader, BootLoaderConfig, State};
@@ -170,9 +172,16 @@ impl<F: NorFlash> ImageStorage<F> {
     /// Verify staged bytes and vectors without changing boot selection.
     /// Release signature authorization belongs to the common update service.
     pub fn verify_image(&mut self, expected_sha256: &[u8; 32]) -> Result<(), Error> {
-        let candidate = self.candidate.as_ref().ok_or(Error::Order)?;
+        while !self.verify_step(expected_sha256, 1024)? {}
+        Ok(())
+    }
+
+    pub fn verify_step(&mut self, expected_sha256: &[u8; 32], bytes: u32) -> Result<bool, Error> {
+        let candidate = self.candidate.as_mut().ok_or(Error::Order)?;
         let flash = self.flash.get_mut().get_mut();
-        candidate.verify(flash, expected_sha256)?;
+        if !candidate.verify_step(flash, expected_sha256, bytes)? {
+            return Ok(false);
+        }
         let mut vectors = [0; 8];
         flash
             .read(self.layout.dfu_start, &mut vectors)
@@ -180,10 +189,11 @@ impl<F: NorFlash> ImageStorage<F> {
         if !self.layout.valid_vectors(candidate.length(), &vectors) {
             return Err(Error::Vectors);
         }
-        Ok(())
+        Ok(true)
     }
 
-    /// Recheck the image and request a trial on the next local reset.
+    /// Require the complete digest and valid vectors before changing boot state.
+    /// An unchanged verified candidate reuses its digest rather than rereading it.
     pub fn select_trial(&mut self, expected_sha256: &[u8; 32]) -> Result<(), Error> {
         self.verify_image(expected_sha256)?;
         self.selected = true;
@@ -262,6 +272,7 @@ impl<F: NorFlash> ImageStorage<F> {
 
 /// Run the shared swap/revert algorithm before starting the active image.
 /// Only the loader calls this on hardware; it can overwrite the active slot.
+/// Returns the resulting state, including Revert after restoring the prior image.
 pub fn prepare_boot<F: NorFlash>(flash: F, layout: Layout) -> Result<(F, BootState), Error> {
     validate(&flash, layout)?;
     let flash = Mutex::new(RefCell::new(flash));
@@ -271,9 +282,12 @@ pub fn prepare_boot<F: NorFlash>(flash: F, layout: Layout) -> Result<(F, BootSta
         state: partition(&flash, layout.state_start, layout.active_start),
     });
     let mut page = AlignedBuffer([0; PAGE_SIZE as usize]);
-    let state = loader
+    loader
         .prepare_boot(page.as_mut())
         .map_err(|_| Error::Boot)?;
+    // Embassy returns the entry state even after reversion. Read the resulting
+    // state so the loader arms trial supervision only for the actual trial.
+    let state = loader.read_state(page.as_mut()).map_err(|_| Error::Boot)?;
     Ok((flash.into_inner().into_inner(), state))
 }
 

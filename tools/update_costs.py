@@ -105,8 +105,7 @@ def measure(args):
             "write_per_byte": margin(write_max),
             "verify_per_byte": margin((verify * 256 + len(data) - 1) // len(data)),
             "activation_us": margin(
-                (baseline if args.swap_bytes else max(baseline, trial))
-                + max(0, select - verify)
+                (baseline if args.swap_bytes else max(baseline, trial)) + select
             ),
             "swap_per_byte": margin(
                 (swap * 256 + args.swap_bytes - 1) // args.swap_bytes

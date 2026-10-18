@@ -16,7 +16,12 @@ pub(crate) use task::start;
 #[doc(hidden)]
 pub mod testing;
 
-#[cfg(any(test, feature = "port-nrf52840", feature = "port-esp32c6"))]
+#[cfg(any(
+    test,
+    feature = "firmware-update",
+    feature = "port-nrf52840",
+    feature = "port-esp32c6"
+))]
 pub(crate) mod receive;
 
 #[cfg(any(test, feature = "port-nrf52840", feature = "port-esp32c6"))]
