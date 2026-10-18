@@ -1,0 +1,159 @@
+#![no_std]
+// SPDX-License-Identifier: MIT
+//! Bounded inactive-image writes shared by the MCU update ports. The port owns
+//! the flash reservation and boot selection; this crate owns sequential chunk
+//! acceptance, erase progress, duplicate handling, padding, and digest checking.
+//! Progress is volatile. No network handler, allocator, or boot policy lives here.
+
+use embedded_storage::nor_flash::{NorFlash, NorFlashError, NorFlashErrorKind};
+use sha2::{Digest, Sha256};
+
+#[repr(align(4))]
+struct Buffer([u8; 256]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    Bounds,
+    Order,
+    Incomplete,
+    Digest,
+    Flash(NorFlashErrorKind),
+}
+fn flash_error(error: impl NorFlashError) -> Error {
+    Error::Flash(error.kind())
+}
+
+/// One image in a port-reserved inactive region. `erase_length` can cover the
+/// whole slot for a swapping loader or only the image's sectors for direct boot.
+pub struct Candidate<F: NorFlash> {
+    _flash: core::marker::PhantomData<fn() -> F>,
+    destination: u32,
+    length: u32,
+    erase_length: u32,
+    erased: u32,
+    written: u32,
+    failed: bool,
+}
+
+impl<F: NorFlash> Candidate<F> {
+    pub fn new(
+        flash: &F,
+        destination: u32,
+        capacity: u32,
+        length: u32,
+        erase_length: u32,
+    ) -> Result<Self, Error> {
+        if F::WRITE_SIZE != 4
+            || F::READ_SIZE != 1
+            || F::ERASE_SIZE == 0
+            || F::ERASE_SIZE > u32::MAX as usize
+            || !F::ERASE_SIZE.is_multiple_of(4)
+            || !destination.is_multiple_of(F::ERASE_SIZE as u32)
+            || !capacity.is_multiple_of(F::ERASE_SIZE as u32)
+            || length == 0
+            || length > capacity
+            || erase_length < length
+            || erase_length > capacity
+            || !erase_length.is_multiple_of(F::ERASE_SIZE as u32)
+            || destination
+                .checked_add(capacity)
+                .is_none_or(|end| end as usize > flash.capacity())
+        {
+            return Err(Error::Bounds);
+        }
+        Ok(Self {
+            _flash: core::marker::PhantomData,
+            destination,
+            length,
+            erase_length,
+            erased: 0,
+            written: 0,
+            failed: false,
+        })
+    }
+
+    pub fn length(&self) -> u32 {
+        self.length
+    }
+
+    pub fn erase_next_page(&mut self, flash: &mut F) -> Result<bool, Error> {
+        if self.failed || self.written != 0 {
+            return Err(Error::Order);
+        }
+        if self.erased < self.erase_length {
+            let start = self.destination + self.erased;
+            flash
+                .erase(start, start + F::ERASE_SIZE as u32)
+                .map_err(flash_error)?;
+            self.erased += F::ERASE_SIZE as u32;
+        }
+        Ok(self.erased == self.erase_length)
+    }
+
+    pub fn write(&mut self, flash: &mut F, offset: u32, bytes: &[u8]) -> Result<(), Error> {
+        if self.failed {
+            return Err(Error::Order);
+        }
+        let end = offset
+            .checked_add(bytes.len().try_into().map_err(|_| Error::Bounds)?)
+            .ok_or(Error::Bounds)?;
+        if bytes.is_empty()
+            || bytes.len() > 256
+            || !offset.is_multiple_of(4)
+            || end > self.length
+            || (end != self.length && !bytes.len().is_multiple_of(4))
+        {
+            return Err(Error::Bounds);
+        }
+        if self.erased != self.erase_length {
+            return Err(Error::Incomplete);
+        }
+        let mut buffer = Buffer([0xff; 256]);
+        if end <= self.written {
+            flash
+                .read(self.destination + offset, &mut buffer.0[..bytes.len()])
+                .map_err(flash_error)?;
+            return if &buffer.0[..bytes.len()] == bytes {
+                Ok(())
+            } else {
+                Err(Error::Order)
+            };
+        }
+        if offset != self.written {
+            return Err(Error::Order);
+        }
+        buffer.0[..bytes.len()].copy_from_slice(bytes);
+        if let Err(error) = flash.write(
+            self.destination + offset,
+            &buffer.0[..bytes.len().div_ceil(4) * 4],
+        ) {
+            // An uncertain NOR write must be erased before another write attempt.
+            self.failed = true;
+            return Err(flash_error(error));
+        }
+        self.written = end;
+        Ok(())
+    }
+
+    pub fn verify(&self, flash: &mut F, expected_sha256: &[u8; 32]) -> Result<(), Error> {
+        if self.failed {
+            return Err(Error::Order);
+        }
+        if self.written != self.length {
+            return Err(Error::Incomplete);
+        }
+        let mut hash = Sha256::new();
+        let mut buffer = Buffer([0; 256]);
+        for offset in (0..self.length).step_by(256) {
+            let len = core::cmp::min(256, (self.length - offset) as usize);
+            flash
+                .read(self.destination + offset, &mut buffer.0[..len])
+                .map_err(flash_error)?;
+            hash.update(&buffer.0[..len]);
+        }
+        if hash.finalize().as_slice() != expected_sha256 {
+            return Err(Error::Digest);
+        }
+        Ok(())
+    }
+}

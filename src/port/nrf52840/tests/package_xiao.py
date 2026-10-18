@@ -7,8 +7,8 @@ import struct
 import subprocess
 
 
-def validate(hex_path):
-    """Check every emitted address before handing an image to the DFU tool."""
+def read_hex(hex_path):
+    """Read and checksum Intel HEX records without interpreting a boot layout."""
     memory = {}
     base = 0
     for line in hex_path.read_text().splitlines():
@@ -24,14 +24,20 @@ def validate(hex_path):
             base = int.from_bytes(data, "big") << (4 if kind == 2 else 16)
         elif kind == 0:
             address = base + int.from_bytes(record[1:3], "big")
-            if not 0x27000 <= address < address + count <= 0xED000:
-                raise ValueError(f"record outside XIAO application region: {address:#x}")
             for offset, byte in enumerate(data):
                 if address + offset in memory:
                     raise ValueError("overlapping Intel HEX data")
                 memory[address + offset] = byte
         elif kind not in (1, 3, 5):
             raise ValueError(f"unsupported Intel HEX record: {kind}")
+    return memory
+
+
+def validate(hex_path):
+    """Check every emitted address before handing an image to the DFU tool."""
+    memory = read_hex(hex_path)
+    if any(not 0x27000 <= address < 0xED000 for address in memory):
+        raise ValueError("record outside XIAO application region")
     if not memory or min(memory) != 0x27000:
         raise ValueError("missing XIAO application vector table at 0x27000")
     sp, reset = struct.unpack("<II", bytes(memory[0x27000 + i] for i in range(8)))

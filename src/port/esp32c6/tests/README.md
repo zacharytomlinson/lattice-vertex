@@ -1,5 +1,8 @@
 # ESP32-C6 kernel smoke test
 
+The [image staging and trial-boot check](UPDATE.md) uses the normal kernel with
+two OTA slots and an ESP-IDF-format rollback loader, without an ESP-IDF runtime.
+
 For the integrated radio path, use the [radio test](../../../kernel/radio/TESTING.md).
 For ordinary kernel peer discovery with passive logging, use the
 [discovery check](../../../kernel/peer/TESTING.md).

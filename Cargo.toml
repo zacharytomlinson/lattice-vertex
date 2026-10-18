@@ -41,6 +41,9 @@ port-test = ["std", "arch-32bit", "tick-32bit"]  # Deterministic host test port
 test-support = []
 # Optional local host attachment; ordinary appliances carry no USB/host state.
 host-link = ["lattice-peer-wire/host", "use-mutexes"]
+# Local Nordic staging/boot integration. Common OTA transport is separate work.
+nrf52840-update = ["port-nrf52840", "dep:lattice-nrf52840-boot"]
+esp32c6-update = ["port-esp32c6", "dep:lattice-c6-boot", "dep:esp-storage", "dep:esp-bootloader-esp-idf"]
 
 # Architecture width for BaseType_t, UBaseType_t, StackType_t
 arch-32bit = []
@@ -121,6 +124,10 @@ tickless-idle = []            # configUSE_TICKLESS_IDLE
 
 [dependencies]
 lattice-peer-wire = { path = "src/kernel/peer/wire" }
+lattice-nrf52840-boot = { path = "src/port/nrf52840/boot", optional = true }
+lattice-c6-boot = { path = "src/port/esp32c6/boot", optional = true }
+esp-storage = { version = "=0.9.0", optional = true, features = ["esp32c6", "bytewise-read"] }
+esp-bootloader-esp-idf = { version = "=0.5.0", optional = true, features = ["esp32c6"] }
 lattice-ir = { git = "ssh://git@github.com/zacharytomlinson/lattice-ir.git", rev = "8cc8629fc6b94f32848d0fc0336db8cbcea79596" }
 # Portable MAC framing for common peer discovery; no allocator or radio driver.
 ieee802154 = "=0.6.1"

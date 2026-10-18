@@ -692,8 +692,13 @@ then chooses a local activation opportunity. The port and bootloader own trial,
 confirmation, and recovery. Any capable peer can supply the package; neither the
 tablet nor nucleus is a required update coordinator.
 
-This is planned behavior. The first slice is local staging and boot recovery on
-Nordic and C6, followed by the common transfer path and autonomous activation.
+The Nordic local storage/boot slice is implemented with host checks and a passing
+XIAO USB/RTOS staging, trial, confirmation, and reversion check. Its port and separately
+linked loader share one flash layout and the Embassy swap/revert implementation.
+C6 boot integration and test images now have host/build checks, with physical
+validation pending. Both ports use `kernel/update/storage` for bounded chunk
+staging and digest verification. Common OTA transfer, package authorization, and
+autonomous activation remain planned.
 Current surface-handle compatibility and flash execution stalls are explicit
 implementation constraints. Firmware replacement remains separate from installing
 an automation's references, conditions, and native calls.
@@ -724,9 +729,12 @@ flowchart TB
     radio["Nordic/C6 radio ports: fixed buffers, energy/CCA, immediate ACK, RX progress, hardware IRQs"]
     transport["kernel::radio: resident driver, notification waits and receive turns"]
     cost["wire::cost: time per byte; radio::cost: bounded measurement handoff"]
-    update["kernel::update: image staging, verification and local activation: to build"]
-    flash["Port flash and trial/confirm operations: to build"]
-    boot["Bootloader image selection and recovery integration: to build"]
+    update["Common update service: transfer, package authorization and local activation: to build"]
+    imagestorage["kernel/update/storage: bounded staging, duplicates, padding and digest"]
+    flash["Nordic update port: bounded image staging and trial/confirm operations"]
+    boot["Nordic boot crate: shared flash layout and Embassy swap/revert loader"]
+    c6update["C6 update port: actual running slot, flash, OTA record selection and confirmation"]
+    c6boot["ESP-IDF second-stage loader: trial and rollback; hardware check pending"]
     mac["radio::mac: ACK matching, four attempts, backoff, eight recent senders"]
     rxbuffer["radio::receive: four owned frames captured before peer dispatch"]
     probe["src/kernel/radio/tests: transport probe, discovery counters and surface-range observer"]
@@ -799,8 +807,15 @@ flowchart TB
     update -.->|same path cost times transfer quantity| cost
     update -.->|bounded background work in existing execution contexts| tasks
     update -.->|bounded storage operations and boot selection| flash
-    flash -.->|persistent trial and confirmation state| boot
-    boot -.->|selected image starts normal kernel| startup
+    update -.->|C6 equivalent| c6update
+    flash -->|shared image layout and persistent boot-state implementation| boot
+    flash -->|inactive image chunks| imagestorage
+    c6update -->|inactive image chunks| imagestorage
+    c6update -->|ESP-IDF OTA records| c6boot
+    c6boot -->|selected image starts normal kernel| startup
+    boot -->|selected image starts normal kernel| startup
+    smoke -->|USB update fixture exercises real storage| flash
+    smoke -->|C6 USB update fixture exercises real storage| c6update
     transport -->|bounded link delivery and duplicate filtering| mac
     radio -->|ACK frame recognition| mac
     transport -->|owns selected driver| radio
@@ -820,7 +835,7 @@ flowchart TB
     radio -->|IRQ waker notifies resident task| tasks
 
     classDef planned stroke-dasharray: 5 5;
-    class peers,update,flash,boot planned;
+    class peers,update planned;
 ```
 
 ## Current baseline
@@ -854,9 +869,10 @@ and grouped-delta ordering. Kernel task/protocol behavior remains in common sour
 portable codecs, fixture counters, and hardware logging live in separate test crates.
 
 Authentication, tablet UI integration, installed compiled fragments, and
-their distributed activation remain open. Firmware updating and boot recovery
-integration are planned in [the updater design](FIRMWARE_UPDATES.md), not provided
-by the existing serial upload fixtures. Local dependents are immediate native
+their distributed activation remain open. Nordic local staging and boot recovery
+have host and XIAO hardware validation. C6 local staging/metadata has host/build
+validation; its hardware lifecycle check is pending. OTA transport and activation policy remain planned in
+[the updater design](FIRMWARE_UPDATES.md). Local dependents are immediate native
 callbacks, not an installed distributed DAG. The earlier LVT v6/host v3 Linux/tablet USB companion path
 has exercised native calls, state reads and pushed deltas on Nordic hardware;
 this does not establish physical appliance behavior or loss-free RF. The v7/v4
@@ -916,9 +932,11 @@ history is bounded and volatile; this is not an exactly-once ledger.
    bounded buffering and explicit local-loss notices. Both MCU images build. The
    tablet daemon and installed conditional activation remain open.
 
-The immediate next work is [firmware staging and trial-boot recovery](FIRMWARE_UPDATES.md#implementation-sequence),
-starting with a concrete boot layout and local two-image check. Transfer policy
-then reuses the kernel's measured unit costs and existing peer communication.
+The immediate next work is physical validation of the built C6
+[firmware staging and trial-boot recovery](FIRMWARE_UPDATES.md#implementation-sequence) path.
+Common transfer policy then reuses the kernel's measured unit costs and existing
+peer communication. Nordic watchdog expiry and physical interrupted-swap checks
+remain distinct from the completed explicit-reset trial/confirm/revert path.
 
 Extend the working control path into compiled-fragment installation, conditional
 activation, and their forwarding semantics. Native transformer invocation is now

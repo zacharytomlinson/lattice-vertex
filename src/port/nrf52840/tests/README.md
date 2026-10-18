@@ -1,5 +1,8 @@
 # nRF52840 board checks
 
+The [image staging and trial-boot check](UPDATE.md) exercises the Nordic update
+storage and bootloader through USB, using two small kernel images and no RF probe.
+
 For the integrated radio path, use the [radio test](../../../kernel/radio/TESTING.md).
 For ordinary kernel peer discovery with passive logging, use the
 [discovery check](../../../kernel/peer/TESTING.md).

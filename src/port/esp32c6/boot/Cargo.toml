@@ -1,0 +1,15 @@
+[package]
+name = "lattice-c6-boot"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace]
+
+[dependencies]
+lattice-image-storage = { path = "../../../kernel/update/storage" }
+embedded-storage = "=0.3.1"
+
+[dev-dependencies]
+sha2 = { version = "=0.10.9", default-features = false }

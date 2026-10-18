@@ -25,6 +25,8 @@
 use core::{arch::asm, ffi::c_void};
 
 mod radio;
+#[cfg(feature = "esp32c6-update")]
+pub mod update;
 pub(crate) use radio::Radio;
 /// Transfer this peripheral to [`crate::kernel::start`].
 pub type RadioPeripheral = esp_hal::peripherals::IEEE802154<'static>;

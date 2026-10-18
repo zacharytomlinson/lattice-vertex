@@ -1,8 +1,11 @@
 # Firmware updates
 
-Status: implementation plan. The kernel has transport, forwarding, and normalized
-communication costs; image storage, update messages, and trial-boot integration
-are not implemented yet. This plan follows the
+Status: Nordic local staging and trial/revert integration now have host checks
+and [XIAO hardware validation](../src/port/nrf52840/tests/UPDATE.md#validation).
+C6 storage/boot integration has host checks and built test images; physical
+validation is pending. Both ports share the common bounded image-storage code.
+Signed update messages, download resume, and autonomous activation remain planned.
+This plan follows the
 [kernel direction](KERNEL_DIRECTION.md).
 
 An update replaces a vertex's appliance/RTOS image. It is separate from installing
@@ -149,17 +152,20 @@ hidden inside the updater or mistaken for installed-program migration support.
 
 ## Port work
 
-**nRF52840:** start from `embassy-boot`'s active, DFU, and persistent-state regions
-and resumable trial/swap behavior. Its DFU region needs at least one erase page
-more than the active image. This is a proposed dependency, not an existing kernel
-facility. [Embassy boot documentation](https://docs.embassy.dev/embassy-boot/0.7.0/default/index.html)
+**nRF52840:** the [port boot crate](../src/port/nrf52840/boot/README.md) now integrates
+`embassy-boot` 0.7.0 and provides the same bounded storage operations to the kernel
+port. Its DFU region includes the extra erase page needed by the swap algorithm.
+[Embassy boot documentation](https://docs.embassy.dev/embassy-boot/0.7.0/default/index.html)
 
 The current [XIAO layout](../src/port/nrf52840/tests/memory-xiao.x) gives the
 application `0x27000..0xED000`; it does not reserve a second image or boot-state
-region. Establish and check a concrete layout before provisioning. Preserve the
-factory USB recovery path on these boards; do not infer rollback support from
-their existing application-only serial DFU. A boot stage within the factory
-application region is an option to evaluate, not a proven boot chain.
+region. The new update layout reserves a 32 KiB loader, 4 KiB boot state, 376 KiB
+active image, and 380 KiB DFU region inside that span. Two-step factory provisioning
+keeps its CRC over the immutable loader only; the port rejects a CRC span covering
+mutable regions. The factory recovery loader is retained. Provisioning, staging,
+trial/revert, and confirmed reboot have run on the XIAO. The full-slot swap took
+about 25 seconds through USB re-enumeration; physical interrupted-swap checks
+remain separate from host fault injection.
 
 The current Embassy NVMC driver writes four-byte words and erases 4 KiB pages
 synchronously. Nordic documents flash-execution stalls and partial erase for
@@ -167,11 +173,14 @@ shortening individual stalls. Decide the staging operation size from that behavi
 do not run an entire image erase inside peer dispatch and assume interrupts keep
 working. [Nordic NVMC reference](https://docs.nordicsemi.com/r/bundle/ps_nrf52840/page/nvmc.html)
 
-**ESP32-C6:** reuse the ESP-IDF-format bootloader already used by the port fixtures.
-The existing `esp-bootloader-esp-idf` 0.5.0 dependency supplies OTA partition and
-boot-state access; flash I/O still needs port integration. Provision two application
-slots and OTA metadata with rollback enabled in the bootloader. This does not
-require adopting ESP-IDF's scheduler or networking runtime.
+**ESP32-C6:** the [port backend](../src/port/esp32c6/boot/README.md) now reads the
+validated partition table and actual MMU mapping, and uses `esp-storage` for flash.
+Its metadata decoder excludes corrupt and aborted records, preserves the running
+image's record while selecting a trial, and confirms only the running image.
+The convenience library's sequence-only OTA selector is not used after rollback.
+The maintained test builds an ESP-IDF v5.5.4 loader with rollback enabled and two
+1 MiB application slots. Host checks and builds pass; hardware validation is pending.
+This uses no ESP-IDF application scheduler or networking runtime.
 [Espressif OTA documentation](https://docs.espressif.com/projects/esp-idf/en/release-v5.4/esp32c6/api-reference/system/ota.html)
 
 One-time provisioning establishes the boot layout. Ordinary OTA packages operate
@@ -184,6 +193,12 @@ inside that layout and never rewrite its recovery loader or partition map.
    staging, trial, confirmation, and reversion, with a recoverable interrupted
    write/boot transition. Measure flash stalls and boot time. Keep maintained checks
    beside the ports and boot support beside the code that owns it.
+   Nordic storage and the loader are implemented; the A/B USB fixture has run.
+   Host checks cover bounds, confirmation/reversion, and interrupted swap/revert.
+   Hardware staging, trial, confirmation, and reversion pass. Physical interrupted
+   swaps and watchdog expiry remain open. C6 storage/boot selection and its fixture
+   are built and host-checked, awaiting physical validation. Both ports now use
+   [shared image storage](../src/kernel/update/storage/README.md).
 2. **Common transfer and verification.** Add `kernel::update` for one candidate,
    package checks, durable progress, and port calls. Extend `kernel::peer` with the
    bounded update records and route them through existing forwarding. Prove a

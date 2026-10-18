@@ -59,7 +59,18 @@ impl<const N: usize> fmt::Write for Text<N> {
     }
 }
 
+#[allow(dead_code)] // The update fixture uses run_with_commands instead.
 pub fn run(context: &TaskContext) -> ! {
+    run_with_commands(context, |_| {}, || false)
+}
+
+/// Optional byte input for maintained board checks; ordinary radio diagnostics
+/// keep their existing report-only behavior. Handlers run on this fixture task.
+pub fn run_with_commands(
+    context: &TaskContext,
+    receive: fn(&[u8]),
+    report_ready: fn() -> bool,
+) -> ! {
     interrupt::USBD.set_priority(interrupt::Priority::P6);
     interrupt::CLOCK_POWER.set_priority(interrupt::Priority::P6);
     let driver = usb::Driver::new(
@@ -96,25 +107,38 @@ pub fn run(context: &TaskContext) -> ! {
         &mut control,
     );
     let class = CdcAcmClass::new(&mut builder, &mut state, 64);
-    let (mut sender, receiver) = class.split();
+    let (mut sender, mut receiver) = class.split();
     let mut device = builder.build();
     let reporter = async {
         let mut last = tasks::xTaskGetTickCount();
         let mut reset_since = None;
+        let mut input = [0; 64];
+        let mut service_input = |cx: &mut Context<'_>, reset_since: &mut Option<_>| {
+            check_bootloader(
+                receiver.line_coding().data_rate(),
+                receiver.dtr(),
+                reset_since,
+            );
+            // This Nordic driver's read only suspends before DMA begins. DMA
+            // itself completes synchronously, so dropping Pending retains no
+            // buffer ownership and lets us sample CDC control on the next poll.
+            let read = { pin!(receiver.read_packet(&mut input)).as_mut().poll(cx) };
+            if let Poll::Ready(Ok(len)) = read {
+                receive(&input[..len]);
+            }
+        };
         loop {
-            poll_fn(|_| {
-                check_bootloader(
-                    receiver.line_coding().data_rate(),
-                    receiver.dtr(),
-                    &mut reset_since,
-                );
+            poll_fn(|cx| {
+                service_input(cx, &mut reset_since);
                 let now = tasks::xTaskGetTickCount();
+                let pending = report_ready();
                 if !sender.dtr() {
                     last = now;
                     return Poll::Pending;
                 }
-                if now.wrapping_sub(last)
-                    >= lattice_vertex::milliseconds_to_ticks_checked(1000).unwrap()
+                if pending
+                    || now.wrapping_sub(last)
+                        >= lattice_vertex::milliseconds_to_ticks_checked(1000).unwrap()
                 {
                     Poll::Ready(())
                 } else {
@@ -134,11 +158,7 @@ pub fn run(context: &TaskContext) -> ! {
             {
                 let mut write = pin!(sender.write_packet(bytes));
                 let result = poll_fn(|cx| {
-                    check_bootloader(
-                        receiver.line_coding().data_rate(),
-                        receiver.dtr(),
-                        &mut reset_since,
-                    );
+                    service_input(cx, &mut reset_since);
                     write.as_mut().poll(cx)
                 })
                 .await;

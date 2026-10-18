@@ -9,10 +9,17 @@ publish = false
 [features]
 radio-probe = ["dep:lattice-radio-test"]
 peer-observer = ["dep:lattice-radio-test"]
+update-test = ["lattice-vertex/esp32c6-update"]
+update-image-b = ["update-test"]
 
 [[bin]]
 name = "radio"
 path = "src/bin/radio.rs"
+
+[[bin]]
+name = "update"
+path = "src/bin/update.rs"
+required-features = ["update-test"]
 
 [dependencies]
 lattice-radio-test = { path = "../../../kernel/radio/tests", optional = true, features = ["runtime"] }

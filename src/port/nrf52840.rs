@@ -17,6 +17,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use cortex_m::peripheral::SYST;
 
 mod radio;
+#[cfg(feature = "nrf52840-update")]
+pub mod update;
 pub(crate) use radio::Radio;
 /// Transfer this peripheral to [`crate::kernel::start`].
 pub type RadioPeripheral = hal::Peri<'static, hal::peripherals::RADIO>;

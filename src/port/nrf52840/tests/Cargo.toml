@@ -12,10 +12,17 @@ peer-observer = ["dep:lattice-radio-test"]
 test-appliance = ["dep:lattice-radio-test"]
 xiao-bootloader = ["cortex-m-rt/set-vtor", "cortex-m-rt/set-sp"]
 usb-console = ["dep:embassy-usb", "dep:embassy-futures"]
+update-test = ["xiao-bootloader", "usb-console", "lattice-vertex/nrf52840-update"]
+update-image-b = ["update-test"]
 
 [[bin]]
 name = "radio"
 path = "src/bin/radio.rs"
+
+[[bin]]
+name = "update"
+path = "src/bin/update.rs"
+required-features = ["update-test"]
 
 [dependencies]
 lattice-radio-test = { path = "../../../kernel/radio/tests", optional = true, features = ["runtime"] }
