@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::{cell::RefCell, rc::Rc, vec, vec::Vec};
 
 const LAYOUT: Layout = Layout {
+    journal: None,
     ota_data: Region {
         offset: 0xe000,
         length: 0x2000,

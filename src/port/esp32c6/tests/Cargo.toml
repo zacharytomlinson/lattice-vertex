@@ -11,6 +11,13 @@ radio-probe = ["dep:lattice-radio-test"]
 peer-observer = ["dep:lattice-radio-test"]
 update-test = ["lattice-vertex/esp32c6-update"]
 update-image-b = ["update-test"]
+ota-test = ["update-test", "lattice-vertex/firmware-update", "lattice-vertex/host-link", "lattice-vertex/stack-overflow-check"]
+ota-image-b = ["ota-test"]
+
+[[bin]]
+name = "ota"
+path = "src/bin/ota.rs"
+required-features = ["ota-test"]
 
 [[bin]]
 name = "radio"

@@ -25,7 +25,14 @@ use core::{
 
 // The peer frame reserves about 5 KiB on Nordic before callees and exception
 // frames; leave fixed headroom for native dispatch and attached-host operations.
-static mut STACK: [StackType_t; 2048] = [0; 2048];
+// Ed25519 verification nests field arithmetic above peer dispatch. The 16 KiB
+// update stack overflowed on C6 during a valid remote offer; reserve 24 KiB.
+const STACK_WORDS: usize = if cfg!(feature = "firmware-update") {
+    6144
+} else {
+    2048
+};
+static mut STACK: [StackType_t; STACK_WORDS] = [0; STACK_WORDS];
 static mut CONTROL: tasks::StaticTask_t = tasks::StaticTask_t::new();
 static mut PERIPHERAL: Option<port::RadioPeripheral> = None;
 static WAKE_TARGET: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
@@ -86,6 +93,16 @@ unsafe fn drop_waker(_: *const ()) {}
 static WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(clone_waker, wake, wake, drop_waker);
 
 fn local_pending() -> bool {
+    #[cfg(all(
+        feature = "firmware-update",
+        any(
+            all(feature = "port-nrf52840", feature = "nrf52840-update"),
+            all(feature = "port-esp32c6", feature = "esp32c6-update")
+        )
+    ))]
+    if crate::kernel::update::runtime::pending() {
+        return true;
+    }
     #[cfg(feature = "host-link")]
     if crate::kernel::peer::host::pending() {
         return true;

@@ -41,9 +41,10 @@ port-test = ["std", "arch-32bit", "tick-32bit"]  # Deterministic host test port
 test-support = []
 # Optional local host attachment; ordinary appliances carry no USB/host state.
 host-link = ["lattice-peer-wire/host", "use-mutexes"]
-# Local Nordic staging/boot integration. Common OTA transport is separate work.
+# Port storage/boot integration, optionally consumed by the common signed updater.
 nrf52840-update = ["port-nrf52840", "dep:lattice-nrf52840-boot"]
 esp32c6-update = ["port-esp32c6", "dep:lattice-c6-boot", "dep:esp-storage", "dep:esp-bootloader-esp-idf"]
+firmware-update = ["dep:ed25519-dalek", "dep:sha2", "dep:lattice-image-storage", "dep:embedded-storage"]
 
 # Architecture width for BaseType_t, UBaseType_t, StackType_t
 arch-32bit = []
@@ -123,6 +124,10 @@ tickless-idle = []            # configUSE_TICKLESS_IDLE
 # mini-list-item = []  # configUSE_MINI_LIST_ITEM optimization
 
 [dependencies]
+ed25519-dalek = { version = "=2.2.0", default-features = false, optional = true }
+sha2 = { version = "=0.10.9", default-features = false, optional = true }
+lattice-image-storage = { path = "src/kernel/update/storage", optional = true }
+embedded-storage = { version = "=0.3.1", optional = true }
 lattice-peer-wire = { path = "src/kernel/peer/wire" }
 lattice-nrf52840-boot = { path = "src/port/nrf52840/boot", optional = true }
 lattice-c6-boot = { path = "src/port/esp32c6/boot", optional = true }

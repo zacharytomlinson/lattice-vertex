@@ -56,6 +56,15 @@ pub(super) struct SurfaceRead {
     pub offset: u16,
 }
 
+/// Update exchanges reuse the existing bounded read-token and reverse-path budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct UpdateRead {
+    pub reader: u64,
+    pub owner: u64,
+    pub request: u16,
+    pub package: lattice_peer_wire::update::PackageId,
+}
+
 /// Read one exposed attribute. Read tokens share the surface-read namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct StateRead {
@@ -95,6 +104,18 @@ pub(super) struct LinkRead {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Content<'a> {
+    Update {
+        network: Network,
+        read: UpdateRead,
+        remaining: u8,
+        bytes: &'a [u8],
+    },
+    Updated {
+        network: Network,
+        read: UpdateRead,
+        hops: u8,
+        progress: lattice_peer_wire::update::Progress,
+    },
     Discover,
     Present(Network),
     Propose(Network),
@@ -190,7 +211,7 @@ pub(super) struct Message<'a> {
 pub(super) struct InvalidFrame;
 
 fn carries_cost(opcode: u8) -> bool {
-    matches!(opcode, 5 | 7 | 9 | 12 | 15)
+    matches!(opcode, 5 | 7 | 9 | 12 | 15 | 17)
 }
 
 impl<'a> Message<'a> {
@@ -198,6 +219,41 @@ impl<'a> Message<'a> {
         let mut payload = [0; MAX_PAYLOAD];
         payload[..4].copy_from_slice(MAGIC);
         let mut size = match self.content {
+            Content::Update {
+                network,
+                read,
+                remaining,
+                bytes,
+            } => {
+                assert!(bytes.len() <= lattice_peer_wire::update::REQUEST_BYTES);
+                payload[4] = 16;
+                payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
+                payload[13] = network.channel;
+                payload[14..22].copy_from_slice(&read.reader.to_le_bytes());
+                payload[22..30].copy_from_slice(&read.owner.to_le_bytes());
+                payload[30..32].copy_from_slice(&read.request.to_le_bytes());
+                payload[32] = remaining;
+                payload[33..33 + bytes.len()].copy_from_slice(bytes);
+                33 + bytes.len()
+            }
+            Content::Updated {
+                network,
+                read,
+                hops,
+                progress,
+            } => {
+                payload[4] = 17;
+                payload[5..13].copy_from_slice(&network.founder.to_le_bytes());
+                payload[13] = network.channel;
+                payload[14..22].copy_from_slice(&read.reader.to_le_bytes());
+                payload[22..30].copy_from_slice(&read.owner.to_le_bytes());
+                payload[30..32].copy_from_slice(&read.request.to_le_bytes());
+                payload[32] = hops;
+                let mut bytes = [0; lattice_peer_wire::update::PROGRESS_BYTES];
+                progress.encode(&mut bytes);
+                payload[33..33 + bytes.len()].copy_from_slice(&bytes);
+                33 + bytes.len()
+            }
             Content::Discover => 5,
             Content::Present(network) | Content::Propose(network) => {
                 payload[4] = match self.content {
@@ -509,6 +565,57 @@ impl<'a> Message<'a> {
             (payload, TimePerByte::UNKNOWN)
         };
         let content = match (p[4], p.len(), destination) {
+            (16, 50..=MAX_PAYLOAD, _) | (17, 61, Some(_)) => {
+                let network = Network {
+                    founder: u64::from_le_bytes(p[5..13].try_into().unwrap()),
+                    channel: p[13],
+                };
+                let mut read = UpdateRead {
+                    reader: u64::from_le_bytes(p[14..22].try_into().unwrap()),
+                    owner: u64::from_le_bytes(p[22..30].try_into().unwrap()),
+                    request: u16::from_le_bytes(p[30..32].try_into().unwrap()),
+                    package: [0; 16],
+                };
+                let scope = p[32];
+                if !network.valid()
+                    || network.channel != channel
+                    || !valid_address(read.reader)
+                    || !valid_address(read.owner)
+                    || read.reader == read.owner
+                    || !(1..=MAX_HOPS).contains(&scope)
+                {
+                    return Err(InvalidFrame);
+                }
+                if p[4] == 16 {
+                    if (scope == MAX_HOPS && source != read.reader)
+                        || lattice_peer_wire::update::Request::decode(&p[33..]).is_none()
+                    {
+                        return Err(InvalidFrame);
+                    }
+                    read.package = lattice_peer_wire::update::Request::decode(&p[33..])
+                        .ok_or(InvalidFrame)?
+                        .package();
+                    Content::Update {
+                        network,
+                        read,
+                        remaining: scope,
+                        bytes: &p[33..],
+                    }
+                } else {
+                    if scope == 1 && source != read.owner {
+                        return Err(InvalidFrame);
+                    }
+                    let progress = lattice_peer_wire::update::Progress::decode(&p[33..])
+                        .ok_or(InvalidFrame)?;
+                    read.package = progress.package;
+                    Content::Updated {
+                        network,
+                        read,
+                        hops: scope,
+                        progress,
+                    }
+                }
+            }
             (0, 5, None) => Content::Discover,
             (1 | 2, 14, _) => {
                 let network = Network {
@@ -894,6 +1001,7 @@ impl<'a> Message<'a> {
             | Content::SurfacePart { hops, .. }
             | Content::InvocationResult { hops, .. }
             | Content::StateValue { hops, .. }
+            | Content::Updated { hops, .. }
             | Content::LinkEntry { hops, .. } => Some(hops),
             _ => None,
         };

@@ -167,10 +167,9 @@ impl<F: NorFlash> ImageStorage<F> {
             .map_err(Into::into)
     }
 
-    /// Verify the staged bytes and vectors, then request a trial on the next reset.
-    /// This is local boot machinery, not package authorization. A future remote
-    /// updater must verify a trusted package signature before invoking it.
-    pub fn select_trial(&mut self, expected_sha256: &[u8; 32]) -> Result<(), Error> {
+    /// Verify staged bytes and vectors without changing boot selection.
+    /// Release signature authorization belongs to the common update service.
+    pub fn verify_image(&mut self, expected_sha256: &[u8; 32]) -> Result<(), Error> {
         let candidate = self.candidate.as_ref().ok_or(Error::Order)?;
         let flash = self.flash.get_mut().get_mut();
         candidate.verify(flash, expected_sha256)?;
@@ -181,9 +180,79 @@ impl<F: NorFlash> ImageStorage<F> {
         if !self.layout.valid_vectors(candidate.length(), &vectors) {
             return Err(Error::Vectors);
         }
+        Ok(())
+    }
+
+    /// Recheck the image and request a trial on the next local reset.
+    pub fn select_trial(&mut self, expected_sha256: &[u8; 32]) -> Result<(), Error> {
+        self.verify_image(expected_sha256)?;
         self.selected = true;
         self.candidate = None;
         self.with_state(|s| s.mark_updated())
+    }
+
+    pub fn resume(&mut self, length: u32, completed: u32) -> Result<(), Error> {
+        self.begin(length)?;
+        self.candidate
+            .as_mut()
+            .unwrap()
+            .resume(completed)
+            .map_err(Into::into)
+    }
+    pub fn journal_capacity(&self) -> u32 {
+        self.layout.end - self.layout.journal_start
+    }
+    pub fn journal_read(&mut self, offset: u32, data: &mut [u8]) -> Result<(), Error> {
+        if offset
+            .checked_add(data.len() as u32)
+            .is_none_or(|end| end > self.journal_capacity())
+        {
+            return Err(Error::Bounds);
+        }
+        self.flash
+            .get_mut()
+            .get_mut()
+            .read(self.layout.journal_start + offset, data)
+            .map_err(flash_error)
+    }
+    pub fn journal_erase(&mut self, page: u32) -> Result<(), Error> {
+        if self.selected || self.boot == State::Swap {
+            return Err(Error::TrialPending);
+        }
+        let offset = page.checked_mul(PAGE_SIZE).ok_or(Error::Bounds)?;
+        if offset
+            .checked_add(PAGE_SIZE)
+            .is_none_or(|end| end > self.journal_capacity())
+        {
+            return Err(Error::Bounds);
+        }
+        let start = self.layout.journal_start + offset;
+        self.flash
+            .get_mut()
+            .get_mut()
+            .erase(start, start + PAGE_SIZE)
+            .map_err(flash_error)
+    }
+    pub fn journal_write(&mut self, offset: u32, data: &[u8]) -> Result<(), Error> {
+        if self.selected || self.boot == State::Swap {
+            return Err(Error::TrialPending);
+        }
+        if data.len() > 256
+            || !offset.is_multiple_of(4)
+            || !data.len().is_multiple_of(4)
+            || offset
+                .checked_add(data.len() as u32)
+                .is_none_or(|end| end > self.journal_capacity())
+        {
+            return Err(Error::Bounds);
+        }
+        let mut aligned = AlignedBuffer([0; 256]);
+        aligned.0[..data.len()].copy_from_slice(data);
+        self.flash
+            .get_mut()
+            .get_mut()
+            .write(self.layout.journal_start + offset, &aligned.0[..data.len()])
+            .map_err(flash_error)
     }
 
     pub fn into_flash(self) -> F {
@@ -198,7 +267,7 @@ pub fn prepare_boot<F: NorFlash>(flash: F, layout: Layout) -> Result<(F, BootSta
     let flash = Mutex::new(RefCell::new(flash));
     let mut loader = BootLoader::new(BootLoaderConfig {
         active: partition(&flash, layout.active_start, layout.dfu_start),
-        dfu: partition(&flash, layout.dfu_start, layout.end),
+        dfu: partition(&flash, layout.dfu_start, layout.journal_start),
         state: partition(&flash, layout.state_start, layout.active_start),
     });
     let mut page = AlignedBuffer([0; PAGE_SIZE as usize]);

@@ -30,6 +30,7 @@ in `target/update/provenance.json`. Preparation does not access a device.
 | `0xE000..0x10000` | Two OTA metadata sectors |
 | `0x10000..0x110000` | `ota_0`, 1 MiB |
 | `0x110000..0x210000` | `ota_1`, 1 MiB |
+| `0x210000..0x212000` | `lattice_update`, 8 KiB transfer journal |
 
 The fixture is packaged for the current 8 MiB C6 development boards. The runtime
 reads flash capacity and layout rather than requiring an appliance author to
@@ -74,12 +75,82 @@ Repeat staging B, reset, check B, then run `update.py confirm` and reset again.
 B must remain in slot 1 as `Valid`. The loader selects the other image directly;
 no copying of a complete slot is needed during reset.
 
-Both port fixtures use the same [host framing helper](../../tests/update_console.py).
-Its sequence correlation distinguishes command results from periodic logs. The
+Both port fixtures use the same [host framing helper](../../tests/update_console.py)
+and [command decoder](../../tests/update_commands.rs). Commands carry a binary
+marker, bounded length, and CRC16; incomplete input expires after 250 ms. Image
+writes carry 48 bytes so the entire command fits a 64-byte USB packet. Sequence
+correlation distinguishes command results from periodic logs. Build/flash the
+fixtures together with their host tools; the older length-only format is retired. The
 staging path accepts identical duplicate chunks without programming them again,
 and verifies SHA-256 before selecting a trial. This digest check is not release
 signature authorization. Explicit reset exercises rollback; watchdog-driven
 expiry is still to be implemented.
 
-Status: host checks and builds pass. Physical provisioning, USB staging, trial,
-rollback, confirmation, and power-loss behavior remain unvalidated on C6.
+## Validation
+
+On 2026-10-17, an ESP32-C6 revision 0.2 with 8 MiB flash, base MAC ending `67:98`,
+completed provisioning and the following sequence through the ordinary kernel.
+Its full 8 MiB flash was backed up before provisioning. Secure boot and flash
+encryption were disabled; no eFuses were changed.
+
+| Action | Observed image, slot, and state |
+| --- | --- |
+| Initial startup | A, slot 0, `Valid` |
+| Stage B, verify, select and reset | B, slot 1, `PendingVerify` |
+| Reset without confirmation | A, slot 0, `Valid` |
+| Stage B again, select and reset | B, slot 1, `PendingVerify` |
+| Confirm B and reset | B, slot 1, `Valid` |
+
+The candidate image was 190,448 bytes. Reset-acknowledgement to the first successful
+USB status took about 0.28 seconds for both trial and rollback, and 0.26 seconds
+after confirmation. These observations include an intentional 250 ms host wait
+and serial reconnection, so they bound the observed recovery rather than measure
+bare bootloader time. The C6 selected the target slot directly without copying it.
+
+On 2026-10-18, an unplug/reconnect with only 52 bytes of an unselected candidate
+staged returned to confirmed B in slot 1 (`Valid`, `progress=0`), with kernel
+reports running. The incomplete download did not replace the confirmed image.
+
+That check also exposed the old diagnostic parser consuming ASCII `image` as a
+command sequence and waiting for a bogus command body. Serial echo/probing is the
+suspected source of the text; it was not traced to a particular host service.
+The shared marker/checksum decoder fixes that framing failure. On C6, injected log
+text was ignored, a corrupt reset command was rejected without rebooting, and a
+partial frame expired before the next valid command. The revised 190,928-byte
+fixture was staged and confirmed through the running updater. The same decoder
+subsequently passed these checks on [Nordic hardware](../../nrf52840/tests/UPDATE.md#validation).
+Portable decoder checks run with:
+
+```sh
+rustc --edition 2021 --test ../../tests/update_commands.rs -o target/update-command-tests
+target/update-command-tests
+```
+
+Physical power removal during an individual flash write or metadata commit remains
+untested; uncertain metadata writes currently have host fault-injection checks.
+Watchdog-driven expiry and OTA transport are separate from this local USB check.
+
+## Signed OTA fixture
+
+`LATTICE_UPDATE_PUBLIC_KEY=PUBLIC_KEY_HEX python update.py prepare --ota` builds
+A/B images running the common signed receiver and ordinary binary host link in
+`target/ota`. Use the same provisioning procedure above with that directory. These
+images use `tools/update_peer.py` from the repository root, not the diagnostic
+`update.py status/stage` console. See [signed transfer and packaging](../../../../docs/FIRMWARE_UPDATES.md#packaging-and-maintained-checks).
+The supplying peer and receiving peer must both be connected to the formed network.
+The receiving USB connection is needed only for explicit local activation,
+confirmation, and reset in this check; image transfer itself is over radio.
+
+Both OTA fixture tasks use the existing kernel stack-overflow guard. No fixture
+keys, generated images, captures, or vendor comparison firmware belong in source.
+
+For OTA provisioning also write `target/ota/journal-empty.bin` at `0x210000`.
+The two application slots and OTA selection sectors retain their existing addresses.
+
+On 2026-10-18, the signed OTA fixture received a 286,208-byte release-2 image
+from the Nordic peer over Lattice radio. An interrupted transfer accepted 9,024
+bytes but checkpointed 8,192. A local reset recovered 8,192; re-offering the same
+package resumed there, completed verification, and left activation explicit. The
+remaining transfer plus verification took about 93.5 seconds, excluding erase
+preparation. Local selection/reset booted release 2; confirmation followed by
+another reset retained release 2. See the [cross-port validation](../../../../docs/FIRMWARE_UPDATES.md#signed-ota-validation-2026-10-18) for limits.

@@ -3,6 +3,10 @@
 The [image staging and trial-boot check](UPDATE.md) uses the normal kernel with
 two OTA slots and an ESP-IDF-format rollback loader, without an ESP-IDF runtime.
 
+The same page describes the `ota-test` A/B fixture for signed image transfer and
+durable resume through the actual peer runtime. It is separate from the local
+USB diagnostic command fixture.
+
 For the integrated radio path, use the [radio test](../../../kernel/radio/TESTING.md).
 For ordinary kernel peer discovery with passive logging, use the
 [discovery check](../../../kernel/peer/TESTING.md).

@@ -74,8 +74,12 @@ check B, run `update.py confirm`, and reset again. B must remain active and repo
 
 The tool checks each command result and verifies SHA-256 before selecting a trial.
 It leaves reset as a separate action. All commands carry a sequence so periodic
-logs cannot be mistaken for a new completion. Packet segmentation is handled as
-a USB byte stream. Erase is one page per command; writes use 52-byte chunks.
+logs cannot be mistaken for a new completion. The shared
+[decoder](../../tests/update_commands.rs) requires a binary marker, bounded length,
+and CRC16, and expires incomplete input after 250 ms. Packet segmentation is
+handled as a USB byte stream. Erase is one page per command; writes use 48-byte
+chunks, keeping each command within 64 USB bytes. Build/flash the fixtures with
+their matching host tools; the older length-only framing is retired.
 No boot images or protocol commands are embedded in ordinary kernel builds.
 
 Once normal trial/revert works, interrupt one staging operation and one swap with
@@ -101,8 +105,43 @@ staged, and no trial selected, returned to confirmed B: `boot=Boot`, `ready=1`,
 did not replace the confirmed image. Download progress is currently volatile;
 continuing that candidate requires a new staging operation.
 
+On 2026-10-18, the revised 90,924-byte B fixture was installed through the running
+updater and booted as `Swap`. It was confirmed and retained `Boot` after another
+reset. The shared marker/checksum decoder ignored injected log text, rejected a
+corrupt reset command without rebooting, and recovered after a partial frame
+expired. Both Nordic and C6 now have hardware validation of the revised console
+format. The earlier lifecycle observations above used the original console format.
+
 The 2,804-byte loader and 90,684-byte candidate fit their checked regions. Swap and
 reversion took about 25 seconds including USB re-enumeration; the full slot is
 swapped regardless of the smaller candidate length. Software factory-DFU entry
 also worked. Physical power removal during an individual flash write or swap has
 not been exercised; those interruptions currently have host fault-injection checks.
+
+## Signed OTA fixture
+
+`LATTICE_UPDATE_PUBLIC_KEY=PUBLIC_KEY_HEX python update.py prepare --ota` builds
+A/B images running the common signed receiver and ordinary binary host link in
+`target/ota`. Use the same provisioning procedure above with that directory. These
+images use `tools/update_peer.py` from the repository root, not the diagnostic
+`update.py status/stage` console. See [signed transfer and packaging](../../../../docs/FIRMWARE_UPDATES.md#packaging-and-maintained-checks).
+The supplying peer and receiving peer must both be connected to the formed network.
+The receiving USB connection is needed only for explicit local activation,
+confirmation, and reset in this check; image transfer itself is over radio.
+
+Both OTA fixture tasks use the existing kernel stack-overflow guard. No fixture
+keys, generated images, captures, or vendor comparison firmware belong in source.
+
+The OTA layout is revision 2: active `0x30000..0x8D000`, DFU plus swap page
+`0x8D000..0xEB000`, journal `0xEB000..0xED000`. Old revision-1 fixtures require
+reprovisioning with both generated factory DFU packages before OTA. For an OTA
+fixture already running, use the 1200-baud/DTR sequence for factory recovery; it
+does not implement the older diagnostic `dfu` command.
+
+On 2026-10-18, the signed OTA fixture received a 126,364-byte release-2 image
+from the C6 peer over Lattice radio. An interrupted transfer accepted 9,024
+bytes but checkpointed 8,192. A local reset recovered 8,192; re-offering the same
+package resumed there, completed verification, and left activation explicit. The
+remaining transfer plus verification took about 41.8 seconds, excluding erase
+preparation. Local selection/reset booted release 2; confirmation followed by
+another reset retained release 2. See the [cross-port validation](../../../../docs/FIRMWARE_UPDATES.md#signed-ota-validation-2026-10-18) for limits.

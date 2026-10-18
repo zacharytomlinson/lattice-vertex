@@ -2,9 +2,13 @@
 
 Status: Nordic local staging and trial/revert integration now have host checks
 and [XIAO hardware validation](../src/port/nrf52840/tests/UPDATE.md#validation).
-C6 storage/boot integration has host checks and built test images; physical
-validation is pending. Both ports share the common bounded image-storage code.
-Signed update messages, download resume, and autonomous activation remain planned.
+C6 storage/boot integration has host checks and
+[hardware staging/trial/rollback/confirmation validation](../src/port/esp32c6/tests/UPDATE.md#validation).
+Both ports share the common bounded image-storage code.
+The optional `firmware-update` service now authenticates signed packages, receives
+image ranges through ordinary peer forwarding, and resumes from durable page
+checkpoints. Activation and confirmation are explicit local operations; autonomous
+activation remains planned.
 This plan follows the
 [kernel direction](KERNEL_DIRECTION.md).
 
@@ -159,8 +163,8 @@ port. Its DFU region includes the extra erase page needed by the swap algorithm.
 
 The current [XIAO layout](../src/port/nrf52840/tests/memory-xiao.x) gives the
 application `0x27000..0xED000`; it does not reserve a second image or boot-state
-region. The new update layout reserves a 32 KiB loader, 4 KiB boot state, 376 KiB
-active image, and 380 KiB DFU region inside that span. Two-step factory provisioning
+region. Update layout revision 2 reserves a 32 KiB loader, 4 KiB boot state, 372 KiB
+active image, 376 KiB DFU region, and 8 KiB transfer journal inside that span. Two-step factory provisioning
 keeps its CRC over the immutable loader only; the port rejects a CRC span covering
 mutable regions. The factory recovery loader is retained. Provisioning, staging,
 trial/revert, and confirmed reboot have run on the XIAO. The full-slot swap took
@@ -179,7 +183,9 @@ Its metadata decoder excludes corrupt and aborted records, preserves the running
 image's record while selecting a trial, and confirms only the running image.
 The convenience library's sequence-only OTA selector is not used after rollback.
 The maintained test builds an ESP-IDF v5.5.4 loader with rollback enabled and two
-1 MiB application slots. Host checks and builds pass; hardware validation is pending.
+1 MiB application slots. Host checks, builds, and the hardware lifecycle check pass.
+First successful status after trial/rollback reset arrived in about 0.28 seconds,
+including a 250 ms host wait; the loader selects the image in place.
 This uses no ESP-IDF application scheduler or networking runtime.
 [Espressif OTA documentation](https://docs.espressif.com/projects/esp-idf/en/release-v5.4/esp32c6/api-reference/system/ota.html)
 
@@ -196,15 +202,16 @@ inside that layout and never rewrite its recovery loader or partition map.
    Nordic storage and the loader are implemented; the A/B USB fixture has run.
    Host checks cover bounds, confirmation/reversion, and interrupted swap/revert.
    Hardware staging, trial, confirmation, and reversion pass. Physical interrupted
-   swaps and watchdog expiry remain open. C6 storage/boot selection and its fixture
-   are built and host-checked, awaiting physical validation. Both ports now use
+   swaps and watchdog expiry remain open. C6 staging, trial, rollback, and
+   confirmation have also run on hardware. Both ports now use
    [shared image storage](../src/kernel/update/storage/README.md).
 2. **Common transfer and verification.** Add `kernel::update` for one candidate,
    package checks, durable progress, and port calls. Extend `kernel::peer` with the
    bounded update records and route them through existing forwarding. Prove a
    dropped or duplicated range and a restarted receiver resume without corrupting
    either image. Do not expose a remotely activatable unsigned update path as an
-   ordinary kernel feature.
+   ordinary kernel feature. This slice is implemented; the current mechanisms and
+   explicit limits are described below.
 3. **Autonomous activation.** Apply normalized route cost and measured local cost,
    appliance holds, neighbor notices, and local deferral. Integrate the small
    package-serving operation with the tablet peer; the MCU receiver owns its
@@ -214,3 +221,156 @@ Host checks cover the common state transitions and bounds. Hardware checks answe
 the flash and boot questions on both ports. RF capture experiments remain in the
 external lab; none becomes an updater dependency. Review this sequence and the
 [implementation map](KERNEL_DIRECTION.md#implementation-map) as each slice lands.
+
+## Implemented signed transfer
+
+Enable `firmware-update` together with the selected port's `nrf52840-update` or
+`esp32c6-update` feature. `kernel::start_with_updates` receives that port's storage
+and a build-provisioned `update::package::Policy`, then starts the normal kernel.
+The policy contains the trusted Ed25519 public key, platform, boot-layout revision,
+appliance family, current release, and exposed-surface fingerprint. Startup checks
+the fingerprint against the actual encoded appliance surface. A transmitting peer
+cannot choose the receiver's key or compatibility policy.
+
+The package is a 192-byte numeric header followed by the image:
+
+| Byte range | Field |
+| --- | --- |
+| 0–7 | `LVUP`, format u16, platform u16 |
+| 8–27 | Layout u32, appliance family 16 bytes |
+| 28–59 | SHA-256 of the current/candidate exported surface |
+| 60–71 | Release u64, image length u32 |
+| 72–103 | Image SHA-256 |
+| 104–127 | Six u32 local-cost coefficients, in the order listed above |
+| 128–191 | Ed25519 signature over bytes 0–127 |
+
+Integers are little-endian. Per-byte local costs are Q24.8 microseconds; other
+coefficients are integer microseconds. `0xffffffff` means unknown. Package identity
+is the first 16 bytes of SHA-256 over the complete signed header. Verification uses
+`ed25519-dalek`'s strict verifier without allocation or precomputed-table features.
+No flash mutation precedes signature, target, surface, size, and newer-release
+checks. The image's complete hash and target vectors/header are checked before
+readiness and again by local trial selection.
+
+The shared wire crate defines Header, Prepare, Data, Finish, and Status requests.
+Four independently acknowledged 48-byte header ranges assemble one offer. Each
+Prepare advances at most one erase page, or commits the journal header. Data
+carries at most 48 image bytes, its offset, and package identity. Its largest radio
+frame is 124 bytes excluding FCS, inside the 125-byte MAC limit. Requests/replies
+reuse the existing read-token/reverse-path records and learned routes; relays do
+not retain package images. New radio opcodes 16/17 and attached-host opcodes 5/0x85
+are additive to LVT v7/host v4. Older peers cannot relay these new records until
+updated; receivers built without the update service return Unsupported.
+
+Each port reserves an 8 KiB journal. A signed header becomes recoverable only when
+its commit marker is written. Append-only offset/complement records checkpoint
+complete 4 KiB pages or the final image length. A torn record is skipped, never
+rewritten. Restart revalidates the signed header, erases the unfinished page and
+remaining staging area, and returns the committed offset. The host can re-offer
+the same package and continue there. Accepted bytes may exceed durable bytes.
+The journal is consumed before trial selection so a reverted trial cannot be
+silently reselected from retained download metadata.
+
+The resident peer task owns the receiver and flash. There is no updater task,
+allocator, image buffer, or new routing table. OTA-enabled builds reserve a fixed
+24 KiB radio stack: a 16 KiB reservation overflowed on C6's remote signature path.
+Both maintained OTA fixtures enable the existing kernel stack-overflow guard.
+Ordinary builds retain their 8 KiB radio stack. The journal owns persistent transfer
+progress; boot metadata separately owns trial/confirmation/reversion.
+
+Local SelectTrial, Confirm, and Reset controls use the attached host only (host
+opcodes 6/0x86), or the kernel's local activation/confirmation API. They have no
+radio activation encoding. The initial fixtures intentionally require an explicit
+local activation and confirmation. They do not automatically confirm an image just
+because a remote transfer completed.
+
+## Packaging and maintained checks
+
+From the repository root, with Python `cryptography` and `pyserial` installed:
+
+```sh
+python tools/update_package.py keygen --key /PRIVATE/PATH/release-key
+# Pass the printed PUBLIC key to either port's build, never the private seed.
+export LATTICE_UPDATE_PUBLIC_KEY=PUBLIC_KEY_HEX
+```
+
+Both port build scripts accept `update.py prepare --ota`, placing artifacts in
+that port's ignored `tests/target/ota`. Follow the port's provisioning procedure
+with those artifacts. Nordic needs both factory DFU uploads; C6 additionally
+provisions `journal-empty.bin` at `0x210000`. Revision 1 Nordic images used different
+slot boundaries: provision the revision 2 loader/application together before OTA;
+an ordinary package cannot migrate the layout. Preserve existing recovery loaders.
+
+The empty-appliance fixtures use family `01010101010101010101010101010101`, layout
+2, release A=1 and B=2. Their serialized surface is `LSF`, byte 1, byte 32, then
+eight zero bytes. Keep that file beside the ignored generated artifacts.
+
+```sh
+python tools/update_package.py pack --image PORT/tests/target/ota/b.bin \
+  --surface CURRENT_SURFACE --candidate-surface CANDIDATE_SURFACE \
+  --key /PRIVATE/PATH/release-key --output PORT/tests/target/ota/b.lvup \
+  --platform PLATFORM --layout 2 --release 2 \
+  --appliance 01010101010101010101010101010101 --unmeasured
+python tools/update_peer.py --port SOURCE_USB info
+python tools/update_peer.py --port SOURCE_USB upload --owner RECEIVER_HEX PACKAGE
+python tools/update_peer.py --port RECEIVER_USB info
+python tools/update_peer.py --port RECEIVER_USB activate
+# Reconnect after the trial starts, inspect release and local operation, then:
+python tools/update_peer.py --port RECEIVER_USB confirm
+python tools/update_peer.py --port RECEIVER_USB reset
+```
+
+Platform is 1 for Nordic, 2 for C6. `--stop-after BYTES` stops an upload without
+selection, allowing reset/resume checks. The supplying computer streams through
+its attached peer; the actual receiver gets the package over Lattice radio.
+The tool retries immutable transfer requests with bounded attempts and preserves
+package/offset identity. It never retries a native transformer invocation.
+
+`--unmeasured` explicitly records unknown timing and is appropriate only for these
+manually activated fixtures. Release packaging instead requires `--costs JSON`
+with `erase_page_us`, `write_per_byte`, `verify_per_byte`, `activation_us`,
+`swap_per_byte`, and `longest_pause_us`. It also requires byte-identical current and
+candidate surface descriptions. The build/signing pipeline must supply authentic
+surface dumps and the matching candidate release; the packager does not extract
+or prove those properties from arbitrary machine code.
+
+Remaining work: measured release costs and automatic deferral, appliance activity
+holds, neighbor absence notices, watchdog trial expiry, stale-handle/rebind support,
+and tablet package-serving integration. Page erases and full-image verification
+are synchronous in this slice and can pause radio service. A completed transfer is
+not evidence of uninterrupted background operation. Physical power cuts during an
+individual flash write or swap remain distinct from reset/resume and host fault
+injection. Release version checking is relative to the running firmware; it is not
+hardware-enforced anti-rollback or secure boot.
+
+## Signed OTA validation, 2026-10-18
+
+The XIAO Nordic ending `D64C` and 8 MiB C6 ending `67:98` ran the maintained
+empty-appliance OTA fixtures on their ordinary formed network. C6 TX stayed at
+20 dBm; the laptop's Wi-Fi adapter was not used for the test.
+
+| Transfer | Image bytes | Interrupted accepted / committed | After receiver reset | Final result |
+| --- | ---: | ---: | ---: | --- |
+| Nordic → C6 | 286,208 | 9,024 / 8,192 | 8,192 / 8,192 | Verified, locally selected, release 2 booted and confirmed, retained after reset |
+| C6 → Nordic | 126,364 | 9,024 / 8,192 | 8,192 / 8,192 | Verified, locally selected, release 2 booted and confirmed, retained after reset |
+
+The remaining radio transfers and final verification took approximately 93.5 s
+and 41.8 s respectively, excluding preparation and activation. These are observed
+fixture durations, not release cost coefficients. The Nordic also rejected a
+modified signed header as Signature and a valid C6 package as Target before
+preparing it. Local-reset resume is proven here; this run did not remove power
+mid-write or interrupt a boot-time swap.
+
+The initial C6 remote-offer run exposed a real 16 KiB task-stack overflow. Raw
+USB exception capture localized it, and the kernel stack guard reproduced it.
+The fixed 24 KiB reservation passed both complete transfers with guards enabled.
+No RF settings were changed to mask that failure. This evidence checks the
+exercised stack path, not every possible appliance's added call depth.
+
+Portable checks cover rejection before flash mutation, durable versus accepted
+progress, duplicate bytes without reprogramming, torn checkpoints, header-buffer
+ownership, consumed-trial metadata, verification failure, cost arithmetic, routed
+reply identity, and wire framing. The final run passed 95 kernel tests, 3 shared
+wire tests, 8 port boot tests, and the shared diagnostic-console stream check.
+Strict whole-kernel Clippy still encounters existing inherited-core/forwarding
+lints; it is not a passing validation gate for this checkout.

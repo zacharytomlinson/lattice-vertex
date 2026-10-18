@@ -5,6 +5,7 @@ pub mod cost;
 #[cfg(feature = "host")]
 pub mod host;
 pub mod scalar;
+pub mod update;
 pub const CALL_ARGUMENT_BYTES: usize = 61;
 pub const MAX_CALL_ARGUMENTS: usize = 30;
 pub const SURFACE_BYTES: usize = 63;

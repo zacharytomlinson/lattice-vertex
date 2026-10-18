@@ -18,12 +18,14 @@ use port::nrf52840::{
 #[path = "../usb_console.rs"]
 mod usb_console;
 
+#[path = "../../../../tests/update_commands.rs"]
+mod update_commands;
+const _: () = assert!(lattice_vertex::config::configTICK_RATE_HZ == 1000);
+
 static mut STACK: [StackType_t; 3072] = [0; 3072];
 static mut CONTROL: kernel::tasks::StaticTask_t = kernel::tasks::StaticTask_t::new();
 static mut STORAGE: Option<ImageStorage<'static>> = None;
-static mut INPUT: [u8; 64] = [0; 64];
-static mut INPUT_LEN: usize = 0;
-static mut EXPECTED: usize = 0;
+static mut DECODER: update_commands::Decoder = update_commands::Decoder::new();
 static mut SEQUENCE: u32 = 0;
 static mut OPCODE: u8 = 0;
 static mut RESULT: Result<(), Error> = Ok(());
@@ -42,19 +44,8 @@ fn receive(bytes: &[u8]) {
     // USB is a byte stream: a record may be split or coalesced across packets.
     for &byte in bytes {
         unsafe {
-            if EXPECTED == 0 {
-                if (5..=64).contains(&byte) {
-                    EXPECTED = byte as usize;
-                }
-                INPUT_LEN = 0;
-                continue;
-            }
-            INPUT[INPUT_LEN] = byte;
-            INPUT_LEN += 1;
-            if INPUT_LEN == EXPECTED {
-                command(&INPUT[..EXPECTED]);
-                EXPECTED = 0;
-                INPUT_LEN = 0;
+            if let Some(body) = DECODER.push(byte, kernel::tasks::xTaskGetTickCount()) {
+                command(body);
             }
         }
     }

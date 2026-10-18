@@ -12,7 +12,8 @@ local return paths without withdrawing the resident peer. It cannot undo a nativ
 operation that has already reached its owner. No graph execution queue is added.
 
 The implemented operations are status, cursor-based link reads, immutable surface
-ranges, current-state reads, and native transformer invocation. Local requests use
+ranges, current-state reads, native transformer invocation, and signed-image
+transfer records. Local update maintenance is available when the receiver is enabled. Local requests use
 the existing description/native binding. Remote requests use the ordinary radio
 messages, bounded read/call paths, duplicate handling, and route learning. Replies
 terminate at the local caller. Host tokens are not radio neighbors or credentials.
@@ -65,14 +66,25 @@ bytes and a loss notice is 12 bytes.
 | 2 ReadSurface | owner `u64`, offset `u16` |
 | 3 ReadState | owner `u64`, attribute `u64` |
 | 4 Invoke | owner `u64`, transformer `u64`, scalar argument list |
+| 5 Update | owner `u64`, one bounded `wire::update::Request` |
+| 6 UpdateControl | local action `u8`: status=0, select trial=1, confirm=2, reset=3 |
 | 128 Ready | address `u64`, founder `u64`, channel `u8` |
 | 129 Link | owner/after/via `u64`, revision `u32`, peer `u64`, round-trip milliseconds `u16`, outgoing cost `u32` |
 | 130 Surface | owner `u64`, offset/total `u16`, up to 63 bytes |
 | 131 State | owner/attribute `u64`, result tag; values add sequence `u32` and typed scalar or 255 unavailable |
 | 132 Invoked | owner/transformer `u64`, native status `u8` |
+| 133 Updated | owner `u64`, update progress (28 bytes), outgoing path cost `u32` |
+| 134 UpdateControlResult | update progress (28 bytes), running release `u64` |
 | 144 Changed | owner/attribute `u64`, sequence `u32`, typed scalar or 255 unavailable |
 | 145 ChangesLost | evicted event count `u32` |
 | 255 Error | reason `u8`: busy, invalid request, transmit failure, timeout |
+
+Update records are additive to host v4. `Update` shares existing read-token and
+reverse-path storage; `UpdateControl` always acts on the attached MCU and has no
+radio equivalent. Signature/compatibility checks and flash work are owned by
+`kernel::update`, not the host transport. The [firmware update documentation](../../../../docs/FIRMWARE_UPDATES.md#implemented-signed-transfer) defines
+the package and durable-progress semantics. An older host codec cannot originate
+these new operations; existing control/read records are unchanged.
 
 The argument section has the same 61-byte/30-value radio limit. It starts with a
 count byte and declared-width scalars. State tags are 0 value, 1 unknown attribute,

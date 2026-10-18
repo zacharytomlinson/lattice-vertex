@@ -8,9 +8,10 @@ the candidate record holds only bounds and volatile progress.
 
 This small `no_std` crate can be consumed by port boot-support crates without
 linking an RTOS into the separately built Nordic loader. It is part of the common
-kernel source, not an application update loop. The common network update service,
-package signatures, persistent download checkpoints, and activation policy are
-still to be implemented.
+kernel source, not an application update loop. The parent `kernel::update` service
+owns signed packages, persistent page checkpoints, and local activation. This
+crate resumes only from a caller-validated durable offset; it never interprets
+network packets or trusts a remote offset itself. Automatic activation is planned.
 
 The port owns the inactive reservation and the decision to change boot metadata.
 Nordic erases the full active-sized candidate area because its loader swaps the
@@ -21,4 +22,5 @@ available. Signature authorization remains distinct from a matching byte digest.
 The port integration checks exercise this component through their real image
 handling paths: [Nordic](../../../port/nrf52840/boot/src/tests.rs) and
 [C6](../../../port/esp32c6/boot/src/tests.rs). Flash geometry and address ranges
-are checked before erase or write; progress is currently restarted after reset.
+are checked before erase or write. A durable page boundary resumes the written
+prefix while requiring the remaining erase pages to be prepared again.

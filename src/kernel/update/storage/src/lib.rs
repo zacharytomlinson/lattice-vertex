@@ -76,8 +76,26 @@ impl<F: NorFlash> Candidate<F> {
         self.length
     }
 
+    /// Resume only at a durable page boundary (or a complete image). Erase the
+    /// unfinished page and remainder again before accepting further writes.
+    pub fn resume(&mut self, completed: u32) -> Result<(), Error> {
+        if completed > self.length
+            || (completed != self.length && !completed.is_multiple_of(F::ERASE_SIZE as u32))
+        {
+            return Err(Error::Bounds);
+        }
+        self.written = completed;
+        self.erased = if completed == self.length {
+            self.erase_length
+        } else {
+            completed
+        };
+        self.failed = false;
+        Ok(())
+    }
+
     pub fn erase_next_page(&mut self, flash: &mut F) -> Result<bool, Error> {
-        if self.failed || self.written != 0 {
+        if self.failed {
             return Err(Error::Order);
         }
         if self.erased < self.erase_length {

@@ -14,6 +14,13 @@ xiao-bootloader = ["cortex-m-rt/set-vtor", "cortex-m-rt/set-sp"]
 usb-console = ["dep:embassy-usb", "dep:embassy-futures"]
 update-test = ["xiao-bootloader", "usb-console", "lattice-vertex/nrf52840-update"]
 update-image-b = ["update-test"]
+ota-test = ["update-test", "lattice-vertex/firmware-update", "lattice-vertex/host-link", "lattice-vertex/stack-overflow-check"]
+ota-image-b = ["ota-test"]
+
+[[bin]]
+name = "ota"
+path = "src/bin/ota.rs"
+required-features = ["ota-test"]
 
 [[bin]]
 name = "radio"

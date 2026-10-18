@@ -35,12 +35,19 @@ as on Nordic; both images stay in their own flash regions.
 Current validation: host checks cover reference CRCs, aborted/torn metadata,
 running-slot mismatch, protected rollback images, confirmation, uncertain metadata
 commits, bounds, duplicates, and wrong-target images. C6 builds and the maintained
-vendor bootloader build pass. Physical validation is pending in the
-[USB fixture](../tests/UPDATE.md).
+vendor bootloader build pass. The [USB fixture](../tests/UPDATE.md#validation) has
+also completed staging, trial boot, reset without confirmation back to A, and
+confirmation followed by a reset retaining B on an 8 MiB C6. First successful
+status arrived within about 0.28 seconds of reset acknowledgement, including the
+host's 250 ms wait. Physical interrupted writes remain separate from host checks.
+A full unplug/reconnect with an incomplete, unselected candidate also retained
+confirmed B. The test-console framing issue found during that check was fixed in
+the shared fixture decoder; it did not change the boot/storage implementation.
 
-The API is local boot machinery. It is not yet a remotely accessible updater:
-package signatures, download resume, watchdog expiry, and autonomous activation
-remain common-kernel work. Flash operations are synchronous and can interrupt
+The API is local boot machinery. The optional `kernel::update` service adds signed
+packages, download resume, and radio transfer above it. Its validated partition
+table reservation `lattice_update` (data subtype `0x40`) supplies the 8 KiB journal.
+Watchdog expiry and autonomous activation remain common-kernel work. Flash operations are synchronous and can interrupt
 radio service; background scheduling is not established by these checks.
 
 ```sh

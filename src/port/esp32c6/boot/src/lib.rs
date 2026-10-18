@@ -39,6 +39,7 @@ impl Region {
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub ota_data: Region,
+    pub journal: Option<Region>,
     pub images: [Region; 2],
 }
 impl Layout {
@@ -53,6 +54,9 @@ impl Layout {
             && !a.overlaps(b)
             && !a.overlaps(self.ota_data)
             && !b.overlaps(self.ota_data)
+            && self.journal.is_none_or(|j| {
+                j.valid(capacity) && !j.overlaps(a) && !j.overlaps(b) && !j.overlaps(self.ota_data)
+            })
     }
 }
 
@@ -196,9 +200,9 @@ impl<F: NorFlash> ImageStorage<F> {
             .map_err(Into::into)
     }
 
-    /// Select a verified local image for trial. Package signature authorization
-    /// must be performed by the future common updater before calling this.
-    pub fn select_trial(&mut self, expected_sha256: &[u8; 32]) -> Result<(), Error> {
+    /// Verify staged bytes and the ESP image header without selecting a trial.
+    /// Release signature authorization belongs to the common update service.
+    pub fn verify_image(&mut self, expected_sha256: &[u8; 32]) -> Result<(), Error> {
         let candidate = self.candidate.as_ref().ok_or(Error::Order)?;
         candidate.verify(&mut self.flash, expected_sha256)?;
         let image = self.layout.images[1 - self.running];
@@ -213,6 +217,11 @@ impl<F: NorFlash> ImageStorage<F> {
         {
             return Err(Error::Image);
         }
+        Ok(())
+    }
+    /// Recheck the image and request a trial on the next local reset.
+    pub fn select_trial(&mut self, expected_sha256: &[u8; 32]) -> Result<(), Error> {
+        self.verify_image(expected_sha256)?;
         let record = Record {
             sequence: metadata::next_sequence(&self.records, 1 - self.running)?,
             state: BootState::New,
@@ -225,6 +234,65 @@ impl<F: NorFlash> ImageStorage<F> {
             self.layout.ota_data.offset + destination as u32 * SECTOR_SIZE,
             record,
         )
+    }
+    pub fn resume(&mut self, length: u32, completed: u32) -> Result<(), Error> {
+        self.begin(length)?;
+        self.candidate
+            .as_mut()
+            .unwrap()
+            .resume(completed)
+            .map_err(Into::into)
+    }
+    pub fn journal_capacity(&self) -> u32 {
+        self.layout.journal.map_or(0, |j| j.length)
+    }
+    pub fn journal_read(&mut self, offset: u32, data: &mut [u8]) -> Result<(), Error> {
+        let j = self.layout.journal.ok_or(Error::Layout)?;
+        if offset
+            .checked_add(data.len() as u32)
+            .is_none_or(|end| end > j.length)
+        {
+            return Err(Error::Bounds);
+        }
+        self.flash
+            .read(j.offset + offset, data)
+            .map_err(flash_error)
+    }
+    pub fn journal_erase(&mut self, page: u32) -> Result<(), Error> {
+        if self.selected || self.boot_state() == BootState::PendingVerify {
+            return Err(Error::TrialPending);
+        }
+        let j = self.layout.journal.ok_or(Error::Layout)?;
+        let offset = page.checked_mul(SECTOR_SIZE).ok_or(Error::Bounds)?;
+        if offset
+            .checked_add(SECTOR_SIZE)
+            .is_none_or(|end| end > j.length)
+        {
+            return Err(Error::Bounds);
+        }
+        self.flash
+            .erase(j.offset + offset, j.offset + offset + SECTOR_SIZE)
+            .map_err(flash_error)
+    }
+    pub fn journal_write(&mut self, offset: u32, data: &[u8]) -> Result<(), Error> {
+        if self.selected || self.boot_state() == BootState::PendingVerify {
+            return Err(Error::TrialPending);
+        }
+        let j = self.layout.journal.ok_or(Error::Layout)?;
+        if data.len() > 256
+            || !offset.is_multiple_of(4)
+            || !data.len().is_multiple_of(4)
+            || offset
+                .checked_add(data.len() as u32)
+                .is_none_or(|end| end > j.length)
+        {
+            return Err(Error::Bounds);
+        }
+        let mut aligned = Aligned([0; 256]);
+        aligned.0[..data.len()].copy_from_slice(data);
+        self.flash
+            .write(j.offset + offset, &aligned.0[..data.len()])
+            .map_err(flash_error)
     }
 }
 

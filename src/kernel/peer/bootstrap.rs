@@ -90,7 +90,9 @@ fn consider(content: Content<'_>, proposal: &mut Option<Network>) -> Option<Netw
         | Content::StateValue { .. }
         | Content::LinkExchange { .. }
         | Content::ReadLinks { .. }
-        | Content::LinkEntry { .. } => None,
+        | Content::LinkEntry { .. }
+        | Content::Update { .. }
+        | Content::Updated { .. } => None,
     }
 }
 

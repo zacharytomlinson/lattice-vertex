@@ -3,6 +3,10 @@
 The [image staging and trial-boot check](UPDATE.md) exercises the Nordic update
 storage and bootloader through USB, using two small kernel images and no RF probe.
 
+The same page describes the `ota-test` A/B fixture for signed image transfer and
+durable resume through the actual peer runtime. It is separate from the local
+USB diagnostic command fixture.
+
 For the integrated radio path, use the [radio test](../../../kernel/radio/TESTING.md).
 For ordinary kernel peer discovery with passive logging, use the
 [discovery check](../../../kernel/peer/TESTING.md).

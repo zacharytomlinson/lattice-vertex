@@ -585,8 +585,8 @@ than a direct link. Hop limits still bound traversal. Link enumeration exposes
 both the normalized outgoing cost and the existing round-trip diagnostic; RTT
 is no longer the routing objective.
 
-These quantities are available for updater planning, but no OTA service or updater
-scheduler is implemented by this change. Firmware-local flash/verification/boot
+The OTA service preserves these quantities in its transfer replies. Automatic
+activation planning is not implemented yet. Firmware-local flash/verification/boot
 costs remain distinct from communication time.
 
 ### Alternate directions and bounded redundant invocation
@@ -695,10 +695,12 @@ tablet nor nucleus is a required update coordinator.
 The Nordic local storage/boot slice is implemented with host checks and a passing
 XIAO USB/RTOS staging, trial, confirmation, and reversion check. Its port and separately
 linked loader share one flash layout and the Embassy swap/revert implementation.
-C6 boot integration and test images now have host/build checks, with physical
-validation pending. Both ports use `kernel/update/storage` for bounded chunk
-staging and digest verification. Common OTA transfer, package authorization, and
-autonomous activation remain planned.
+C6 boot integration and test images now have host/build checks and a passing
+hardware staging/trial/rollback/confirmation check. Both ports use `kernel/update/storage` for bounded chunk
+staging and digest verification. `kernel::update` now owns strict signed-package
+authorization, one candidate, durable page checkpoints, and reset/resume. Ordinary
+peer forwarding carries bounded update requests and progress replies. Activation
+and confirmation are explicit local operations; autonomous deferral remains planned.
 Current surface-handle compatibility and flash execution stalls are explicit
 implementation constraints. Firmware replacement remains separate from installing
 an automation's references, conditions, and native calls.
@@ -729,12 +731,14 @@ flowchart TB
     radio["Nordic/C6 radio ports: fixed buffers, energy/CCA, immediate ACK, RX progress, hardware IRQs"]
     transport["kernel::radio: resident driver, notification waits and receive turns"]
     cost["wire::cost: time per byte; radio::cost: bounded measurement handoff"]
-    update["Common update service: transfer, package authorization and local activation: to build"]
+    update["kernel::update: signed candidate, page journal, resume and explicit local activation"]
+    activation["Automatic activation: local holds, timing and neighbor notices: to build"]
+    packages["tools/update_package.py + update_peer.py: signing and serving through an attached peer"]
     imagestorage["kernel/update/storage: bounded staging, duplicates, padding and digest"]
     flash["Nordic update port: bounded image staging and trial/confirm operations"]
     boot["Nordic boot crate: shared flash layout and Embassy swap/revert loader"]
     c6update["C6 update port: actual running slot, flash, OTA record selection and confirmation"]
-    c6boot["ESP-IDF second-stage loader: trial and rollback; hardware check pending"]
+    c6boot["ESP-IDF second-stage loader: trial and rollback"]
     mac["radio::mac: ACK matching, four attempts, backoff, eight recent senders"]
     rxbuffer["radio::receive: four owned frames captured before peer dispatch"]
     probe["src/kernel/radio/tests: transport probe, discovery counters and surface-range observer"]
@@ -745,6 +749,8 @@ flowchart TB
     nordic["embassy-nrf chip initialization"]
     hal["esp-hal startup, timers, and interrupt routing: C6 only"]
     smoke["Nordic and C6 test firmware beside their ports"]
+    updatecommands["port/tests/update_commands.rs: fixture marker, length, CRC and partial-frame expiry"]
+    updateconsole["port/tests/update_console.py: host fixture commands and correlated results"]
     usbconsole["Nordic fixture only: USB diagnostics and XIAO serial-DFU entry"]
     hostlink["Optional kernel::host: fixed exchange, read/call origins, bounded change delivery"]
     hostwire["peer/wire: shared scalar codec and optional host records"]
@@ -765,6 +771,8 @@ flowchart TB
     smoke -->|creates static tasks and starts scheduler| tasks
     smoke -->|radio-probe or peer-observer feature includes| probe
     smoke -->|optional USB console feature| usbconsole
+    smoke -->|update fixture input decoding| updatecommands
+    updateconsole <-->|local USB test commands and reports| smoke
     usbconsole -->|low-priority reporter uses existing task API| tasks
     usbconsole -->|USB peripheral driver| nordic
     tabletradio <-->|requests, completions and pushed changes| hostlink
@@ -803,11 +811,15 @@ flowchart TB
     cost -->|samples retained with adjacent peers| links
     links -->|directional unit cost| forwarding
     forwarding -->|suffix cost in correlated replies| cost
-    discovery -.->|update records through existing forwarding| update
-    update -.->|same path cost times transfer quantity| cost
-    update -.->|bounded background work in existing execution contexts| tasks
-    update -.->|bounded storage operations and boot selection| flash
-    update -.->|C6 equivalent| c6update
+    discovery -->|forwarded update records at their owner| update
+    startup -->|start_with_updates initializes storage and build policy| update
+    update -->|runs in resident peer task; local control notification| transport
+    update -->|bounded storage operations and boot selection| flash
+    update -->|C6 equivalent| c6update
+    packages <-->|binary host transfer and local maintenance| hostlink
+    activation -.->|local activation decision| update
+    activation -.->|path cost times transfer quantity| cost
+    smoke -->|signed OTA check uses real peer receiver| update
     flash -->|shared image layout and persistent boot-state implementation| boot
     flash -->|inactive image chunks| imagestorage
     c6update -->|inactive image chunks| imagestorage
@@ -835,7 +847,7 @@ flowchart TB
     radio -->|IRQ waker notifies resident task| tasks
 
     classDef planned stroke-dasharray: 5 5;
-    class peers,update planned;
+    class peers,activation planned;
 ```
 
 ## Current baseline
@@ -871,7 +883,7 @@ portable codecs, fixture counters, and hardware logging live in separate test cr
 Authentication, tablet UI integration, installed compiled fragments, and
 their distributed activation remain open. Nordic local staging and boot recovery
 have host and XIAO hardware validation. C6 local staging/metadata has host/build
-validation; its hardware lifecycle check is pending. OTA transport and activation policy remain planned in
+and hardware validation. OTA transport and activation policy remain planned in
 [the updater design](FIRMWARE_UPDATES.md). Local dependents are immediate native
 callbacks, not an installed distributed DAG. The earlier LVT v6/host v3 Linux/tablet USB companion path
 has exercised native calls, state reads and pushed deltas on Nordic hardware;
@@ -932,10 +944,11 @@ history is bounded and volatile; this is not an exactly-once ledger.
    bounded buffering and explicit local-loss notices. Both MCU images build. The
    tablet daemon and installed conditional activation remain open.
 
-The immediate next work is physical validation of the built C6
-[firmware staging and trial-boot recovery](FIRMWARE_UPDATES.md#implementation-sequence) path.
-Common transfer policy then reuses the kernel's measured unit costs and existing
-peer communication. Nordic watchdog expiry and physical interrupted-swap checks
+Both supported MCU ports now have a hardware-checked local staging/trial/confirmation
+path. Common signed transfer and durable resume now use the existing peer runtime.
+The next updater slice is measured local costs and automatic activation deferral,
+with appliance holds and neighbor notices.
+Watchdog expiry and physical interrupted-write/swap checks
 remain distinct from the completed explicit-reset trial/confirm/revert path.
 
 Extend the working control path into compiled-fragment installation, conditional

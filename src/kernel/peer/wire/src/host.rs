@@ -58,6 +58,26 @@ impl Arguments {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Packet {
+    UpdateControl {
+        token: u32,
+        action: crate::update::Control,
+    },
+    UpdateControlResult {
+        token: u32,
+        progress: crate::update::Progress,
+        release: u64,
+    },
+    Update {
+        token: u32,
+        owner: u64,
+        data: Bytes<{ crate::update::REQUEST_BYTES }>,
+    },
+    Updated {
+        token: u32,
+        owner: u64,
+        progress: crate::update::Progress,
+        cost: crate::cost::TimePerByte,
+    },
     Status {
         token: u32,
     },
@@ -137,6 +157,10 @@ impl Packet {
         match self {
             Self::Changed { .. } | Self::ChangesLost { .. } => 0,
             Self::Status { token }
+            | Self::UpdateControl { token, .. }
+            | Self::UpdateControlResult { token, .. }
+            | Self::Update { token, .. }
+            | Self::Updated { token, .. }
             | Self::ReadLinks { token, .. }
             | Self::Ready { token, .. }
             | Self::Link { token, .. }
@@ -153,6 +177,8 @@ impl Packet {
         matches!(
             self,
             Self::Status { .. }
+                | Self::UpdateControl { .. }
+                | Self::Update { .. }
                 | Self::ReadLinks { .. }
                 | Self::ReadSurface { .. }
                 | Self::ReadState { .. }
@@ -165,6 +191,41 @@ impl Packet {
         body[0] = VERSION;
         body[2..6].copy_from_slice(&self.token().to_le_bytes());
         let len = match self {
+            Self::UpdateControl { action, .. } => {
+                body[1] = 6;
+                body[6] = action as u8;
+                7
+            }
+            Self::UpdateControlResult {
+                progress, release, ..
+            } => {
+                body[1] = 0x86;
+                let mut bytes = [0; crate::update::PROGRESS_BYTES];
+                progress.encode(&mut bytes);
+                body[6..34].copy_from_slice(&bytes);
+                body[34..42].copy_from_slice(&release.to_le_bytes());
+                42
+            }
+            Self::Update { owner, data, .. } => {
+                body[1] = 5;
+                body[6..14].copy_from_slice(&owner.to_le_bytes());
+                body[14..14 + data.as_slice().len()].copy_from_slice(data.as_slice());
+                14 + data.as_slice().len()
+            }
+            Self::Updated {
+                owner,
+                progress,
+                cost,
+                ..
+            } => {
+                body[1] = 0x85;
+                body[6..14].copy_from_slice(&owner.to_le_bytes());
+                let mut bytes = [0; crate::update::PROGRESS_BYTES];
+                progress.encode(&mut bytes);
+                body[14..42].copy_from_slice(&bytes);
+                body[42..46].copy_from_slice(&cost.raw().to_le_bytes());
+                46
+            }
             Self::Status { .. } => {
                 body[1] = 0;
                 6
@@ -400,6 +461,31 @@ fn decode_body(b: &[u8]) -> Option<Packet> {
     let token = u32::from_le_bytes(b[2..6].try_into().ok()?);
     let value = |at| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
     Some(match (b[1], b.len()) {
+        (6, 7) => Packet::UpdateControl {
+            token,
+            action: crate::update::Control::decode(b[6])?,
+        },
+        (0x86, 42) => Packet::UpdateControlResult {
+            token,
+            progress: crate::update::Progress::decode(&b[6..34])?,
+            release: value(34),
+        },
+        (5, 31..=85) => {
+            crate::update::Request::decode(&b[14..])?;
+            Packet::Update {
+                token,
+                owner: value(6),
+                data: Bytes::new(&b[14..])?,
+            }
+        }
+        (0x85, 46) => Packet::Updated {
+            token,
+            owner: value(6),
+            progress: crate::update::Progress::decode(&b[14..42])?,
+            cost: crate::cost::TimePerByte::from_raw(u32::from_le_bytes(
+                b[42..46].try_into().ok()?,
+            )),
+        },
         (0, 6) => Packet::Status { token },
         (1, 30) => Packet::ReadLinks {
             token,
@@ -545,7 +631,34 @@ mod tests {
     use super::*;
     #[test]
     fn stream_boundaries_and_invalid_records_do_not_change_messages() {
+        let mut update = [0; crate::update::REQUEST_BYTES];
+        let n = crate::update::Request::Data {
+            package: [5; 16],
+            offset: u32::MAX,
+            data: &[255; crate::update::DATA_BYTES],
+        }
+        .encode(&mut update);
         let records = [
+            Packet::Update {
+                token: 9,
+                owner: 19,
+                data: Bytes::new(&update[..n]).unwrap(),
+            },
+            Packet::Updated {
+                token: 9,
+                owner: 19,
+                progress: crate::update::Progress::unsupported([5; 16]),
+                cost: crate::cost::TimePerByte::UNKNOWN,
+            },
+            Packet::UpdateControl {
+                token: 10,
+                action: crate::update::Control::SelectTrial,
+            },
+            Packet::UpdateControlResult {
+                token: 10,
+                progress: crate::update::Progress::unsupported([5; 16]),
+                release: u64::MAX,
+            },
             Packet::Status { token: 0 },
             Packet::Changed {
                 change: StateChange {

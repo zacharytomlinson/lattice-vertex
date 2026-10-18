@@ -15,6 +15,86 @@ mod links;
 
 use frame::{Content, Message};
 
+pub(super) fn handle_update(
+    request: lattice_peer_wire::update::Request<'_>,
+) -> lattice_peer_wire::update::Progress {
+    #[cfg(all(
+        feature = "firmware-update",
+        any(
+            all(feature = "port-nrf52840", feature = "nrf52840-update"),
+            all(feature = "port-esp32c6", feature = "esp32c6-update")
+        )
+    ))]
+    {
+        return crate::kernel::update::runtime::receive(request);
+    }
+    #[allow(unreachable_code)]
+    lattice_peer_wire::update::Progress::unsupported(request.package())
+}
+
+#[cfg(feature = "host-link")]
+fn update_control(
+    context: &crate::sync::TaskContext,
+    action: lattice_peer_wire::update::Control,
+) -> Result<Option<(lattice_peer_wire::update::Progress, u64)>, lattice_peer_wire::update::Status> {
+    #[cfg(all(
+        feature = "firmware-update",
+        any(
+            all(feature = "port-nrf52840", feature = "nrf52840-update"),
+            all(feature = "port-esp32c6", feature = "esp32c6-update")
+        )
+    ))]
+    {
+        use crate::kernel::update::runtime;
+        use lattice_peer_wire::update::Control;
+        match action {
+            Control::Status => {
+                let s = runtime::snapshot(context);
+                return Ok(Some((s.progress, s.release)));
+            }
+            Control::SelectTrial => runtime::select_trial(context)?,
+            Control::Confirm => runtime::confirm(context)?,
+            Control::Reset => {
+                runtime::reset(context)?;
+                let s = runtime::snapshot(context);
+                return Ok(Some((s.progress, s.release)));
+            }
+        }
+        return Ok(None);
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = (context, action);
+        Err(lattice_peer_wire::update::Status::Unsupported)
+    }
+}
+#[cfg(feature = "host-link")]
+fn update_control_complete(
+    context: &crate::sync::TaskContext,
+) -> Option<(lattice_peer_wire::update::Progress, u64)> {
+    #[cfg(all(
+        feature = "firmware-update",
+        any(
+            all(feature = "port-nrf52840", feature = "nrf52840-update"),
+            all(feature = "port-esp32c6", feature = "esp32c6-update")
+        )
+    ))]
+    {
+        let s = crate::kernel::update::runtime::snapshot(context);
+        if s.control_pending {
+            return None;
+        }
+        let mut progress = s.progress;
+        progress.status = s.control_result;
+        return Some((progress, s.release));
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = context;
+        None
+    }
+}
+
 // Common discovery filter, not an allocated PAN or membership credential.
 const PAN_ID: u16 = 0x4c56;
 
@@ -83,6 +163,14 @@ pub(crate) fn run(
         let milliseconds = ((now as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
         forwarder.expire(milliseconds);
         collect_costs(radio, &mut forwarder, milliseconds);
+        #[cfg(all(
+            feature = "firmware-update",
+            any(
+                all(feature = "port-nrf52840", feature = "nrf52840-update"),
+                all(feature = "port-esp32c6", feature = "esp32c6-update")
+            )
+        ))]
+        crate::kernel::update::runtime::poll_control();
         #[cfg(feature = "host-link")]
         if let Some(outgoing) = host.poll(
             &mut forwarder,
@@ -138,13 +226,22 @@ pub(crate) fn run(
                 || matches!(message.content, Content::SurfacePart { read, .. } if read.reader == local)
                 || matches!(message.content, Content::StateValue { read, .. } if read.reader == local)
                 || matches!(message.content, Content::InvocationResult { call, .. } if call.caller == local)
+                || matches!(message.content, Content::Updated { read, .. } if read.reader == local)
             {
                 let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
                     / crate::configTICK_RATE_HZ as u64) as u32;
                 host.complete(&mut forwarder, message, now);
                 continue;
             }
-            if let Content::LinkExchange { network: n, .. } = message.content {
+            if matches!(message.content,Content::Update{network:n,..}|Content::Updated{network:n,..} if n==network)
+            {
+                if let Some(reply) = forwarder.receive_update(message, milliseconds, handle_update)
+                {
+                    if !send(radio, reply, &mut sequence, &mut outgoing_buffer) {
+                        forwarder.transmit_failed(&reply);
+                    }
+                }
+            } else if let Content::LinkExchange { network: n, .. } = message.content {
                 if n == network {
                     let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
                         / crate::configTICK_RATE_HZ as u64) as u32;
@@ -353,6 +450,8 @@ fn send(
                 },
                 // This successful send needs no dedicated fixture counter.
                 Content::ReadState { .. }
+                | Content::Update { .. }
+                | Content::Updated { .. }
                 | Content::StateValue { .. }
                 | Content::LinkExchange { .. }
                 | Content::ReadLinks { .. }

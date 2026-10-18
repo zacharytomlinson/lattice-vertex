@@ -8,7 +8,8 @@ use super::{
     exposure::Description,
     frame::{
         Content, Invocation, InvokeStatus, LinkPhase, LinkRead, Message, StateChange, StateRead,
-        StateReadResult, SurfaceOwner, SurfaceRead, CALL_ARGUMENT_BYTES, MAX_HOPS, SURFACE_BYTES,
+        StateReadResult, SurfaceOwner, SurfaceRead, UpdateRead, CALL_ARGUMENT_BYTES, MAX_HOPS,
+        SURFACE_BYTES,
     },
     links::Links,
     Network,
@@ -86,6 +87,7 @@ impl Route {
 /// All read kinds share one bounded reverse-path budget and token namespace.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReadRequest {
+    Update(UpdateRead),
     Surface(SurfaceRead),
     State(StateRead),
     Links(LinkRead),
@@ -93,6 +95,7 @@ pub(super) enum ReadRequest {
 impl ReadRequest {
     pub(super) fn reader(self) -> u64 {
         match self {
+            Self::Update(r) => r.reader,
             Self::Surface(r) => r.reader,
             Self::State(r) => r.reader,
             Self::Links(r) => r.reader,
@@ -100,6 +103,7 @@ impl ReadRequest {
     }
     pub(super) fn owner(self) -> u64 {
         match self {
+            Self::Update(r) => r.owner,
             Self::Surface(r) => r.owner,
             Self::State(r) => r.owner,
             Self::Links(r) => r.owner,
@@ -107,6 +111,7 @@ impl ReadRequest {
     }
     fn request(self) -> u16 {
         match self {
+            Self::Update(r) => r.request,
             Self::Surface(r) => r.request,
             Self::State(r) => r.request,
             Self::Links(r) => r.request,
@@ -347,6 +352,7 @@ impl Forwarder {
         let direct = match message.content {
             Content::OwnerFound { hops, .. }
             | Content::SurfacePart { hops, .. }
+            | Content::Updated { hops, .. }
             | Content::InvocationResult { hops, .. }
             | Content::StateValue { hops, .. }
             | Content::LinkEntry { hops, .. } => hops == 1,
@@ -429,28 +435,16 @@ impl Forwarder {
         request: ReadRequest,
         now: u32,
     ) -> Option<Message<'static>> {
-        let reader = request.reader();
-        let owner = request.owner();
-        self.expire(now);
-        if reader != self.local
-            || owner == self.local
-            || matches!(request, ReadRequest::Links(read) if read.via == self.local && !self.links.contains(owner))
-            || self
-                .reads
-                .iter()
-                .any(|p| p.read.reader() == self.local && p.read.request() == request.request())
-        {
+        if matches!(request, ReadRequest::Update(_)) {
             return None;
         }
-        let onward = self
-            .next_hop(request.direction(self.local), self.local, MAX_HOPS)
-            .unwrap_or(0);
-        self.remember_read(request, self.local, onward, false, now);
+        let destination = self.originate_read_path(request, now)?;
         Some(Message {
             path_cost: TimePerByte::UNKNOWN,
             source: self.local,
-            destination: (onward != 0).then_some(onward),
+            destination,
             content: match request {
+                ReadRequest::Update(_) => return None, // payload-bearing origin uses originate_update
                 ReadRequest::Links(read) => Content::ReadLinks {
                     network: self.network,
                     read,
@@ -471,6 +465,123 @@ impl Forwarder {
     }
 
     #[cfg(feature = "host-link")]
+    fn originate_read_path(&mut self, request: ReadRequest, now: u32) -> Option<Option<u64>> {
+        let reader = request.reader();
+        let owner = request.owner();
+        self.expire(now);
+        if reader != self.local
+            || owner == self.local
+            || matches!(request, ReadRequest::Links(read) if read.via == self.local && !self.links.contains(owner))
+            || self
+                .reads
+                .iter()
+                .any(|p| p.read.reader() == self.local && p.read.request() == request.request())
+        {
+            return None;
+        }
+        let onward = self
+            .next_hop(request.direction(self.local), self.local, MAX_HOPS)
+            .unwrap_or(0);
+        self.remember_read(request, self.local, onward, false, now);
+        Some((onward != 0).then_some(onward))
+    }
+
+    #[cfg(feature = "host-link")]
+    pub(super) fn originate_update<'a>(
+        &mut self,
+        read: UpdateRead,
+        bytes: &'a [u8],
+        now: u32,
+    ) -> Option<Message<'a>> {
+        let destination = self.originate_read_path(ReadRequest::Update(read), now)?;
+        Some(Message {
+            source: self.local,
+            destination,
+            path_cost: TimePerByte::UNKNOWN,
+            content: Content::Update {
+                network: self.network,
+                read,
+                remaining: MAX_HOPS,
+                bytes,
+            },
+        })
+    }
+
+    pub(super) fn receive_update<'a>(
+        &mut self,
+        incoming: Message<'a>,
+        now: u32,
+        mut handle: impl FnMut(
+            lattice_peer_wire::update::Request<'_>,
+        ) -> lattice_peer_wire::update::Progress,
+    ) -> Option<Message<'a>> {
+        self.expire(now);
+        match incoming.content {
+            Content::Update {
+                network,
+                read,
+                remaining,
+                bytes,
+            } if network == self.network => {
+                let next = self
+                    .begin_read(ReadRequest::Update(read), incoming.source, remaining, now)?
+                    .onward;
+                if read.owner == self.local {
+                    let request = lattice_peer_wire::update::Request::decode(bytes)?;
+                    return Some(Message {
+                        source: self.local,
+                        destination: Some(incoming.source),
+                        path_cost: TimePerByte::ZERO,
+                        content: Content::Updated {
+                            network,
+                            read,
+                            hops: 1,
+                            progress: handle(request),
+                        },
+                    });
+                }
+                Some(Message {
+                    source: self.local,
+                    destination: (next != 0).then_some(next),
+                    path_cost: TimePerByte::UNKNOWN,
+                    content: Content::Update {
+                        network,
+                        read,
+                        remaining: remaining - 1,
+                        bytes,
+                    },
+                })
+            }
+            Content::Updated {
+                network,
+                read,
+                hops,
+                progress,
+            } if network == self.network && incoming.destination == Some(self.local) => {
+                let previous = self.return_read(
+                    ReadRequest::Update(read),
+                    incoming.source,
+                    hops,
+                    now,
+                    incoming.path_cost,
+                )?;
+                Some(Message {
+                    source: self.local,
+                    destination: Some(previous),
+                    path_cost: self.response_cost(incoming),
+                    content: Content::Updated {
+                        network,
+                        read,
+                        hops: hops + 1,
+                        progress,
+                    },
+                })
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "host-link")]
     pub(super) fn complete_read<'a>(
         &mut self,
         incoming: Message<'a>,
@@ -478,6 +589,12 @@ impl Forwarder {
     ) -> Option<Message<'a>> {
         self.expire(now);
         let (network, request, hops) = match incoming.content {
+            Content::Updated {
+                network,
+                read,
+                hops,
+                ..
+            } => (network, ReadRequest::Update(read), hops),
             Content::LinkEntry {
                 network,
                 read,
@@ -1505,6 +1622,7 @@ impl Forwarder {
     pub(super) fn transmit_failed(&mut self, outgoing: &Message<'_>) {
         let owner = match outgoing.content {
             Content::ReadSurface { read, .. } => read.owner,
+            Content::Update { read, .. } => read.owner,
             Content::ReadState { read, .. } => read.owner,
             Content::ReadLinks { read, .. } => ReadRequest::Links(read).direction(self.local),
             Content::Invoke { call, .. } => call.owner,
@@ -1534,6 +1652,86 @@ mod tests {
         founder: 1,
         channel: 15,
     };
+
+    #[test]
+    #[cfg(feature = "host-link")]
+    fn update_ranges_use_read_paths_and_correlate_package_replies() {
+        use lattice_peer_wire::update::{Phase, Progress, Request, Status, REQUEST_BYTES};
+        let mut origin = Forwarder::new(1, NET);
+        let mut relay = Forwarder::new(2, NET);
+        let mut owner = Forwarder::new(3, NET);
+        let read = UpdateRead {
+            reader: 1,
+            owner: 3,
+            request: 42,
+            package: [9; 16],
+        };
+        let mut payload = [0; REQUEST_BYTES];
+        let data = [0x55; 48];
+        let n = Request::Data {
+            package: read.package,
+            offset: 4096,
+            data: &data,
+        }
+        .encode(&mut payload);
+        let message = origin.originate_update(read, &payload[..n], 0).unwrap();
+        let mut wire = [0; MAX_FRAME_SIZE];
+        let n = message.encode(1, &mut wire);
+        assert!(n <= MAX_FRAME_SIZE);
+        let incoming = Message::decode(&wire[..n], 2, NET.channel).unwrap();
+        let message = relay
+            .receive_update(incoming, 1, |_| panic!("relay executed update"))
+            .unwrap();
+        let mut second = [0; MAX_FRAME_SIZE];
+        let n = message.encode(2, &mut second);
+        let incoming = Message::decode(&second[..n], 3, NET.channel).unwrap();
+        let message = owner
+            .receive_update(incoming, 2, |request| {
+                assert_eq!(
+                    request,
+                    Request::Data {
+                        package: read.package,
+                        offset: 4096,
+                        data: &data
+                    }
+                );
+                Progress {
+                    package: read.package,
+                    phase: Phase::Receiving,
+                    status: Status::Ok,
+                    accepted: 4144,
+                    committed: 4096,
+                    prepared: 0,
+                }
+            })
+            .unwrap();
+        assert!(owner
+            .receive_update(incoming, 3, |_| panic!("duplicate path dispatched"))
+            .is_none());
+        let mut third = [0; MAX_FRAME_SIZE];
+        let n = message.encode(3, &mut third);
+        let incoming = Message::decode(&third[..n], 2, NET.channel).unwrap();
+        let message = relay
+            .receive_update(incoming, 4, |_| panic!("reply dispatched update"))
+            .unwrap();
+        let n = message.encode(4, &mut wire);
+        let incoming = Message::decode(&wire[..n], 1, NET.channel).unwrap();
+        let mut unrelated = incoming;
+        if let Content::Updated {
+            ref mut read,
+            ref mut progress,
+            ..
+        } = unrelated.content
+        {
+            read.package = [8; 16];
+            progress.package = read.package;
+        }
+        assert!(origin.complete_read(unrelated, 5).is_none());
+        let result = origin.complete_read(incoming, 5).unwrap();
+        assert!(
+            matches!(result.content,Content::Updated{read:r,progress,..} if r==read && progress.committed==4096)
+        );
+    }
     struct On;
     impl State for On {
         type Appliance = ();

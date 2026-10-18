@@ -10,9 +10,9 @@ same [common storage crate](../../../kernel/update/storage/README.md) as C6.
 Nordic's flash layout and swap/trial/confirmation state remain in this port.
 
 Current status: host checks, ARM builds, and the XIAO USB staging/trial/confirm/revert
-sequence pass. This is local boot/storage integration. Signed packages, download resume,
-OTA messages, watchdog-driven trial expiry, and automatic activation are later
-common-kernel work. Calling `select_trial` checks SHA-256 and initial vectors; it
+sequence pass. The common `kernel::update` service adds signed packages, a durable
+transfer journal, and OTA messages above this local backend. Watchdog-driven trial
+expiry and automatic activation remain planned. Calling `select_trial` checks SHA-256 and initial vectors; it
 does **not** authenticate a release signature.
 
 ## XIAO layout
@@ -25,9 +25,13 @@ application linker generator, and provisioning tool.
 | Below `0x27000` | Existing MBR/SoftDevice, untouched |
 | `0x27000..0x2F000` | Lattice loader, 32 KiB reserved |
 | `0x2F000..0x30000` | Embassy boot progress, 4 KiB |
-| `0x30000..0x8E000` | Active image, 376 KiB |
-| `0x8E000..0xED000` | Candidate/rollback image plus swap page, 380 KiB |
+| `0x30000..0x8D000` | Active image, 372 KiB |
+| `0x8D000..0xEB000` | Candidate/rollback image plus swap page, 376 KiB |
+| `0xEB000..0xED000` | Signed transfer header and page checkpoints, 8 KiB |
 | `0xED000` and above | Existing storage/factory recovery loader/settings, untouched |
+
+This is layout revision 2. The earlier local fixture used 376/380 KiB slots and
+no journal; migrate with the two provisioning uploads before using OTA.
 
 The application is always linked at the active address. During reset, the Lattice
 loader performs any pending swap/revert, validates the active vectors, resets the
@@ -76,7 +80,7 @@ staging, swapping, and reverting. They are not hardware power-loss evidence.
 
 On the checked XIAO, reset-to-USB-return took approximately 24.6 seconds for a
 trial swap and 24.8 seconds for reversion. Confirmation followed by reset returned
-within the one-second observation interval. The loader swaps the entire 376 KiB
+within the one-second observation interval. That revision-1 loader swapped the entire 376 KiB
 active slot, even for the 90,684-byte test image. These observations include factory
 boot and USB enumeration; they are not guaranteed activation bounds or isolated
 flash timings. The release loader occupies 2,804 flash bytes; its swap buffer uses

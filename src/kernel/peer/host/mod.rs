@@ -5,7 +5,7 @@
 use super::{
     exposure::Description,
     forwarding::{Forwarder, ReadRequest},
-    frame::{Content, Invocation, LinkRead, Message, StateRead, SurfaceRead},
+    frame::{Content, Invocation, LinkRead, Message, StateRead, SurfaceRead, UpdateRead},
     invocation::Invocations,
 };
 use crate::kernel::appliance::Native;
@@ -13,7 +13,7 @@ use crate::kernel::radio::cost::TimePerByte;
 use crate::{port, sync::TaskContext, types::UBaseType_t};
 pub use lattice_peer_wire::host::{Arguments, Bytes, Decoder, Failure, Packet, MAX_PACKET};
 pub use lattice_peer_wire::StateChange;
-use lattice_peer_wire::{CALL_ARGUMENT_BYTES, SURFACE_BYTES};
+use lattice_peer_wire::SURFACE_BYTES;
 const CHANGE_CAPACITY: usize = 8;
 const READ_TIMEOUT_MS: u32 = 8_000;
 
@@ -138,11 +138,13 @@ fn deliver(generation: u32, packet: Packet) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Operation {
     Read(ReadRequest),
+    Control,
     Call(Invocation),
 }
 impl Operation {
     fn cancel(self, forwarder: &mut Forwarder) {
         match self {
+            Self::Control => {}
             Self::Read(read) => forwarder.cancel_read(read),
             Self::Call(call) => forwarder.cancel_call(call),
         }
@@ -157,14 +159,14 @@ struct Pending {
 pub(super) struct Host {
     next_token: Option<u16>,
     pending: Option<Pending>,
-    arguments: [u8; CALL_ARGUMENT_BYTES],
+    payload: [u8; lattice_peer_wire::update::REQUEST_BYTES],
 }
 impl Host {
     pub(super) const fn new() -> Self {
         Self {
             next_token: None,
             pending: None,
-            arguments: [0; CALL_ARGUMENT_BYTES],
+            payload: [0; lattice_peer_wire::update::REQUEST_BYTES],
         }
     }
     pub(super) fn poll<'a>(
@@ -176,6 +178,23 @@ impl Host {
         context: &TaskContext,
         now: u32,
     ) -> Option<Message<'a>> {
+        if let Some(p) = &self.pending {
+            if p.operation == Operation::Control {
+                if let Some((progress, release)) =
+                    crate::kernel::peer::update_control_complete(context)
+                {
+                    let p = self.pending.take().unwrap();
+                    deliver(
+                        p.generation,
+                        Packet::UpdateControlResult {
+                            token: p.host_token,
+                            progress,
+                            release,
+                        },
+                    );
+                }
+            }
+        }
         if let Some(pending) = &self.pending {
             let connected = access(|m| m.generation == pending.generation);
             if !connected || now.wrapping_sub(pending.started) >= READ_TIMEOUT_MS {
@@ -207,11 +226,46 @@ impl Host {
             );
             return None;
         }
+        if let Packet::UpdateControl { action, .. } = request {
+            use lattice_peer_wire::update::Progress;
+            match crate::kernel::peer::update_control(context, action) {
+                Ok(Some((progress, release))) => deliver(
+                    generation,
+                    Packet::UpdateControlResult {
+                        token,
+                        progress,
+                        release,
+                    },
+                ),
+                Ok(None) => {
+                    self.pending = Some(Pending {
+                        generation,
+                        host_token: token,
+                        operation: Operation::Control,
+                        started: now,
+                    })
+                }
+                Err(status) => {
+                    let mut progress = Progress::unsupported([0; 16]);
+                    progress.status = status;
+                    deliver(
+                        generation,
+                        Packet::UpdateControlResult {
+                            token,
+                            progress,
+                            release: 0,
+                        },
+                    );
+                }
+            }
+            return None;
+        }
         let owner = match request {
             Packet::ReadLinks { owner, .. }
             | Packet::ReadSurface { owner, .. }
             | Packet::ReadState { owner, .. }
-            | Packet::Invoke { owner, .. } => owner,
+            | Packet::Invoke { owner, .. }
+            | Packet::Update { owner, .. } => owner,
             _ => unreachable!("submit rejects replies"),
         };
         let valid = |a| a != 0 && a != u64::MAX;
@@ -222,6 +276,9 @@ impl Host {
                 }
                 Packet::ReadState { attribute, .. } => !valid(attribute),
                 Packet::Invoke { transformer, .. } => !valid(transformer),
+                Packet::Update { data, .. } => {
+                    lattice_peer_wire::update::Request::decode(data.as_slice()).is_none()
+                }
                 _ => false,
             };
         if invalid {
@@ -261,14 +318,58 @@ impl Host {
                 );
             } else {
                 let args = arguments.as_slice();
-                self.arguments[..args.len()].copy_from_slice(args);
+                self.payload[..args.len()].copy_from_slice(args);
                 if let Some(outgoing) =
-                    forwarder.originate_call(call, &self.arguments[..args.len()], now)
+                    forwarder.originate_call(call, &self.payload[..args.len()], now)
                 {
                     self.pending = Some(Pending {
                         generation,
                         host_token: token,
                         operation: Operation::Call(call),
+                        started: now,
+                    });
+                    return Some(outgoing);
+                }
+                deliver(
+                    generation,
+                    Packet::Error {
+                        token,
+                        failure: Failure::InvalidRequest,
+                    },
+                );
+            }
+            return None;
+        }
+        if let Packet::Update { data, .. } = request {
+            let operation = lattice_peer_wire::update::Request::decode(data.as_slice()).unwrap();
+            if owner == local {
+                let progress = crate::kernel::peer::handle_update(operation);
+                deliver(
+                    generation,
+                    Packet::Updated {
+                        token,
+                        owner,
+                        progress,
+                        cost: TimePerByte::ZERO,
+                    },
+                );
+            } else {
+                let radio_token = self.next_token.map_or(token as u16, |n| n.wrapping_add(1));
+                self.next_token = Some(radio_token);
+                let read = UpdateRead {
+                    reader: local,
+                    owner,
+                    request: radio_token,
+                    package: operation.package(),
+                };
+                self.payload[..data.as_slice().len()].copy_from_slice(data.as_slice());
+                if let Some(outgoing) =
+                    forwarder.originate_update(read, &self.payload[..data.as_slice().len()], now)
+                {
+                    self.pending = Some(Pending {
+                        generation,
+                        host_token: token,
+                        operation: Operation::Read(ReadRequest::Update(read)),
                         started: now,
                     });
                     return Some(outgoing);
@@ -408,6 +509,15 @@ impl Host {
                 return;
             };
             match message.content {
+                Content::Updated { read, progress, .. } => (
+                    Operation::Read(ReadRequest::Update(read)),
+                    Packet::Updated {
+                        token,
+                        owner: read.owner,
+                        progress,
+                        cost: forwarder.cost_to(read.owner),
+                    },
+                ),
                 Content::LinkEntry {
                     read,
                     revision,

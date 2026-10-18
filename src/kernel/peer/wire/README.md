@@ -17,3 +17,12 @@ acknowledged MAC payload byte in Q24.8. It supports path composition, exact
 relative ratios, and quantity estimates without allocation or floating point.
 Zero represents an empty path, `0xffffffff` unknown; unknown/overflow never
 becomes a free path. Measurement and routing policy belong to the kernel.
+
+
+`update` owns the bounded header/data/preparation/status request grammar and
+progress reply shared by radio forwarding and USB. It also defines local-only
+update maintenance controls. Signature verification, journals, flash access, and
+activation decisions stay in `kernel::update` and the platform ports. The optional
+host codec adds kinds 5/6 and 133/134 without altering existing host-v4 records.
+See [the updater](../../../../docs/FIRMWARE_UPDATES.md#implemented-signed-transfer)
+for the signed package and byte layout.

@@ -1,9 +1,12 @@
+#[path = "../../tests/update_build.rs"]
+mod update_build;
 #[allow(dead_code)]
 #[path = "../boot/src/layout.rs"]
 mod update_layout;
 
 fn main() {
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    update_build::policy(&out);
     if std::env::var_os("CARGO_FEATURE_UPDATE_TEST").is_some() {
         let l = update_layout::XIAO;
         std::fs::write(out.join("memory.x"), format!(

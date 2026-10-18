@@ -14,6 +14,10 @@ use lattice_vertex::{
 use port::esp32c6::update::{self, Error, ImageStorage};
 esp_bootloader_esp_idf::esp_app_desc!();
 
+#[path = "../../../../tests/update_commands.rs"]
+mod update_commands;
+const _: () = assert!(lattice_vertex::config::configTICK_RATE_HZ == 1000);
+
 static mut STACK: [StackType_t; 3072] = [0; 3072];
 static mut CONTROL: kernel::tasks::StaticTask_t = kernel::tasks::StaticTask_t::new();
 static mut STORAGE: Option<ImageStorage<'static>> = None;
@@ -23,26 +27,15 @@ extern "C" fn console(_: *mut c_void) {
     let context = unsafe { TaskContext::assume() };
     let storage = unsafe { STORAGE.as_mut().unwrap() };
     let mut usb = unsafe { USB.take().unwrap() };
-    let mut bytes = [0; 64];
-    let mut expected = 0;
-    let mut received = 0;
+    let mut decoder = update_commands::Decoder::new();
     let mut last = 0;
     let mut progress = 0;
     loop {
         while let Ok(byte) = usb.read_byte() {
-            if expected == 0 {
-                if (5..=64).contains(&byte) {
-                    expected = byte as usize;
-                }
-                received = 0;
-                continue;
-            }
-            bytes[received] = byte;
-            received += 1;
-            if received == expected {
+            if let Some(bytes) = decoder.push(byte, kernel::tasks::xTaskGetTickCount()) {
                 let seq = u32::from_le_bytes(bytes[..4].try_into().unwrap());
                 let op = bytes[4];
-                let payload = &bytes[5..expected];
+                let payload = &bytes[5..];
                 let result = match (op, payload.len()) {
                     (0, 0) => Ok(()),
                     (1, 4) => {
@@ -68,8 +61,6 @@ extern "C" fn console(_: *mut c_void) {
                     lattice_vertex::delay_ms(&context, 100);
                     esp_hal::system::software_reset();
                 }
-                expected = 0;
-                received = 0;
                 last = kernel::tasks::xTaskGetTickCount();
             }
         }

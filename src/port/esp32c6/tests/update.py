@@ -17,7 +17,7 @@ import time
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1] / "tests"))
-from update_console import Console
+from update_console import Console, CHUNK_SIZE
 
 
 def check_image(data):
@@ -42,7 +42,7 @@ def prepare(args):
     for option in ['CONFIG_SECURE_BOOT=y', 'CONFIG_SECURE_FLASH_ENC_ENABLED=y', 'CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=y']:
         if option in config:
             raise ValueError(f'unsupported provisioning option: {option}')
-    out = HERE/'target/update'
+    out = HERE/('target/ota' if args.ota else 'target/update')
     out.mkdir(parents=True, exist_ok=True)
     loader = (build/'bootloader/bootloader.bin').read_bytes()
     if len(loader) > 0x8000 or loader[0] != 0xe9:
@@ -50,17 +50,18 @@ def prepare(args):
     (out/'bootloader.bin').write_bytes(loader)
     shutil.copyfile(build/'partition_table/partition-table.bin', out/'partition-table.bin')
     (out/'otadata-empty.bin').write_bytes(b'\xff' * 0x2000)
-    for image, features in [('a', 'update-test'), ('b', 'update-image-b')]:
+    (out/'journal-empty.bin').write_bytes(b'\xff' * 0x2000)
+    for image, features in ([('a','ota-test'),('b','ota-image-b')] if args.ota else [('a','update-test'),('b','update-image-b')]):
         subprocess.run(['cargo', '+nightly', 'build', '-Z', 'build-std=core', '--release', '--locked',
-                        '--bin', 'update', '--features', features], cwd=HERE, check=True)
-        elf = HERE/'target/riscv32imac-unknown-none-elf/release/update'
+                        '--bin', 'ota' if args.ota else 'update', '--features', features], cwd=HERE, check=True)
+        elf = HERE/('target/riscv32imac-unknown-none-elf/release/ota' if args.ota else 'target/riscv32imac-unknown-none-elf/release/update')
         shutil.copyfile(elf, out/f'{image}.elf')
         subprocess.run(['espflash', 'save-image', '--chip', 'esp32c6', '--flash-size', '8mb',
                         '--flash-mode', 'dio', '--flash-freq', '40mhz', '--skip-update-check',
                         str(elf), str(out/f'{image}.bin')], check=True)
         check_image((out/f'{image}.bin').read_bytes())
     files = {name: hashlib.sha256((out/name).read_bytes()).hexdigest()
-             for name in ['bootloader.bin', 'partition-table.bin', 'otadata-empty.bin', 'a.bin', 'b.bin']}
+             for name in ['bootloader.bin', 'partition-table.bin', 'otadata-empty.bin', 'journal-empty.bin', 'a.bin', 'b.bin']}
     (out/'provenance.json').write_text(json.dumps({
         'idf_version': version,
         'idf_commit': subprocess.check_output(['git', '-C', str(idf), 'rev-parse', 'HEAD'], text=True).strip(),
@@ -79,8 +80,8 @@ def drive(args):
             print(console.command(1, struct.pack('<I', len(data))))
             while 'progress=1 ' not in console.command(2):
                 pass
-            for offset in range(0, len(data), 52):
-                console.command(3, struct.pack('<I', offset) + data[offset:offset+52])
+            for offset in range(0, len(data), CHUNK_SIZE):
+                console.command(3, struct.pack('<I', offset) + data[offset:offset+CHUNK_SIZE])
             print(console.command(4, hashlib.sha256(data).digest()))
             print('Verified and selected for trial; reset separately, then confirm only after checking startup.')
         else:
@@ -94,6 +95,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
     build = sub.add_parser('prepare')
+    build.add_argument('--ota', action='store_true', help='build the signed receiver and binary host interface')
     build.add_argument('--idf')
     build.add_argument('--idf-python', default=sys.executable)
     for action in ['status', 'stage', 'reset', 'confirm']:

@@ -29,6 +29,7 @@ pub fn image_storage(flash: esp_hal::peripherals::FLASH<'_>) -> Result<ImageStor
     };
     let mut images = [None; 2];
     let mut ota_data = None;
+    let mut journal = None;
     for (i, entry) in table.iter().enumerate() {
         let end = entry
             .offset()
@@ -43,12 +44,19 @@ pub fn image_storage(flash: esp_hal::peripherals::FLASH<'_>) -> Result<ImageStor
                 return Err(Error::Layout);
             }
         }
-        let destination = match entry.partition_type() {
-            Kind::App(App::Ota0) => &mut images[0],
-            Kind::App(App::Ota1) => &mut images[1],
-            Kind::App(_) => return Err(Error::Layout), // exactly two OTA slots
-            Kind::Data(Data::Ota) => &mut ota_data,
-            _ => continue,
+        let destination = if entry.label_as_str() == "lattice_update" {
+            if entry.raw_type() != 1 || entry.raw_subtype() != 0x40 {
+                return Err(Error::Layout);
+            }
+            &mut journal
+        } else {
+            match entry.partition_type() {
+                Kind::App(App::Ota0) => &mut images[0],
+                Kind::App(App::Ota1) => &mut images[1],
+                Kind::App(_) => return Err(Error::Layout), // exactly two OTA slots
+                Kind::Data(Data::Ota) => &mut ota_data,
+                _ => continue,
+            }
         };
         if destination.is_some() || entry.flags() != 0 {
             return Err(Error::Layout);
@@ -59,6 +67,7 @@ pub fn image_storage(flash: esp_hal::peripherals::FLASH<'_>) -> Result<ImageStor
         });
     }
     let layout = Layout {
+        journal,
         ota_data: ota_data.ok_or(Error::Layout)?,
         images: [
             images[0].ok_or(Error::Layout)?,

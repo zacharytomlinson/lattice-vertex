@@ -45,11 +45,11 @@ impl Description {
         })
     }
 
-    pub(super) fn len(&self) -> u16 {
+    pub(crate) fn len(&self) -> u16 {
         self.length
     }
 
-    pub(super) fn encode_part(&self, offset: u16, output: &mut [u8]) -> usize {
+    pub(crate) fn encode_part(&self, offset: u16, output: &mut [u8]) -> usize {
         if offset >= self.length || output.is_empty() {
             return 0;
         }

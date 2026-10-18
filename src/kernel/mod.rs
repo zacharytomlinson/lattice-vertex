@@ -36,6 +36,8 @@ pub(crate) mod change;
 pub mod event_groups;
 pub mod list;
 pub(crate) mod peer;
+#[cfg(feature = "firmware-update")]
+pub mod update;
 #[cfg(feature = "host-link")]
 pub use peer::host;
 pub mod queue;
@@ -69,4 +71,29 @@ pub fn start<A: Send + 'static, E: 'static>(
     change::bind(appliance);
     radio::start(&context, radio, description, appliance);
     crate::start_scheduler(context)
+}
+
+/// Start normal peer participation with the port's reserved update storage and
+/// a build-provisioned release policy. No update packet handling belongs to the appliance.
+#[cfg(all(
+    feature = "firmware-update",
+    any(
+        all(feature = "port-nrf52840", feature = "nrf52840-update"),
+        all(feature = "port-esp32c6", feature = "esp32c6-update")
+    )
+))]
+pub fn start_with_updates<A: Send + 'static, E: 'static>(
+    context: crate::sync::TaskContext,
+    radio: crate::port::RadioPeripheral,
+    appliance: &'static Appliance<A, E>,
+    storage: update::PlatformStorage,
+    policy: update::package::Policy,
+) -> ! {
+    assert_eq!(
+        policy.surface,
+        update::surface_identity(appliance.surface()),
+        "release policy does not match the exposed surface"
+    );
+    update::runtime::initialize(storage, policy);
+    start(context, radio, appliance)
 }

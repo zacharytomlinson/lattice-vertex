@@ -10,7 +10,8 @@ const LAYOUT: Layout = Layout {
     state_start: 0x2000,
     active_start: 0x3000,
     dfu_start: 0x6000,
-    end: 0xa000,
+    journal_start: 0xa000,
+    end: 0xc000,
 };
 
 #[derive(Clone)]
@@ -114,7 +115,7 @@ fn original(flash: &Flash) -> Vec<u8> {
 #[test]
 fn layout_and_staging_boundaries() {
     assert!(layout::XIAO.valid());
-    assert_eq!(layout::XIAO.image_capacity(), 376 * 1024);
+    assert_eq!(layout::XIAO.image_capacity(), 372 * 1024);
     for (valid, crc, length, allowed) in [
         (1u16, 0x1234u16, 2804u32, true),
         (1, 0x1234, 0x8000, true),
@@ -139,7 +140,7 @@ fn layout_and_staging_boundaries() {
             ..LAYOUT
         },
         Layout {
-            end: LAYOUT.dfu_start + LAYOUT.image_capacity(),
+            journal_start: LAYOUT.dfu_start + LAYOUT.image_capacity(),
             ..LAYOUT
         },
     ] {
