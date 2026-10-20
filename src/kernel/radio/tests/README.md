@@ -9,7 +9,10 @@ This crate owns the diagnostic workload used by both board fixtures:
   no workload, radio settings, or packet handling.
 - `surface.rs`: initialized switch/dimmer native appliances and passive range/checksum records
   for owner-directed surface reads. It emits no packets and retains no foreign
-  mathematical surface or complete-transfer state.
+  mathematical surface or complete-transfer state. The dimmer locally installs
+  four level observations and a signed newest-minus-previous result through
+  `Appliance::install_state`; the kernel owns their maintenance and deltas.
+  The native `SetLevel` still reports only its physical power/level changes.
 
 The `runtime` feature is enabled by the board fixtures, which also select a
 kernel port. Without it, the codec tests run on the host without depending on

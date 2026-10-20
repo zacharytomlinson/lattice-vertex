@@ -28,6 +28,24 @@ pub(crate) struct Description {
 }
 
 impl Description {
+    #[cfg(feature = "use-mutexes")]
+    pub(crate) fn with_installed<A: Send + 'static, E: 'static>(
+        appliance: &'static crate::kernel::Appliance<A, E>,
+    ) -> Result<Self, EncodeError> {
+        appliance.seal();
+        let mut writer = Writer {
+            output: &mut [],
+            offset: 0,
+            position: 0,
+            copied: 0,
+            counting: true,
+        };
+        appliance.encode(&mut writer)?;
+        Ok(Self {
+            source: appliance,
+            length: writer.position as u16,
+        })
+    }
     pub(crate) fn new<A: 'static, E: 'static>(
         surface: &'static Surface<'static, A, E>,
     ) -> Result<Self, EncodeError> {
@@ -259,39 +277,69 @@ fn binary_tag(op: Binary) -> u8 {
 
 impl<A: 'static, E> Encode for Surface<'_, A, E> {
     fn encode(&self, writer: &mut Writer<'_>) -> Result<(), EncodeError> {
-        writer.bytes(b"LSF\x01")?;
-        writer.byte(usize::BITS as u8)?;
-        for count in [
-            self.states.len(),
-            self.transformers.len(),
-            self.axioms.len(),
-            self.invariants.len(),
-        ] {
-            writer.count(count)?;
-        }
-        for state in self.states {
-            writer.attribute(state.definition())?;
-        }
-        for transformer in self.transformers {
-            writer.reference(*transformer)?;
-            let definition = transformer.definition();
-            writer.predicate(&definition.precondition)?;
-            writer.types(definition.effect.arguments)?;
-            writer.attributes(definition.effect.inputs)?;
-            writer.attributes(definition.effect.outputs)?;
-            writer.count(definition.effect.results.len())?;
-            for expression in definition.effect.results {
-                writer.expression(expression, 0)?;
-            }
-        }
-        for predicates in [self.axioms, self.invariants] {
-            for predicate in predicates {
-                writer.reference(*predicate)?;
-                writer.predicate(predicate)?;
-            }
-        }
-        Ok(())
+        encode_surface(self, core::iter::empty(), core::iter::empty(), writer)
     }
+}
+
+#[cfg(feature = "use-mutexes")]
+impl<A: Send + 'static, E: 'static> Encode for crate::kernel::Appliance<A, E> {
+    fn encode(&self, writer: &mut Writer<'_>) -> Result<(), EncodeError> {
+        encode_surface(
+            self.surface(),
+            self.installations().flat_map(|i| i.states()),
+            self.installations().map(|i| i.definition),
+            writer,
+        )
+    }
+}
+
+fn encode_surface<A: 'static, E>(
+    surface: &Surface<'_, A, E>,
+    states: impl Iterator<Item = &'static ir::Attribute<Read<A>>> + Clone,
+    axioms: impl Iterator<Item = &'static crate::surface::Predicate<A>> + Clone,
+    writer: &mut Writer<'_>,
+) -> Result<(), EncodeError> {
+    writer.bytes(b"LSF\x01")?;
+    writer.byte(usize::BITS as u8)?;
+    for count in [
+        surface.states.len() + states.clone().count(),
+        surface.transformers.len(),
+        surface.axioms.len() + axioms.clone().count(),
+        surface.invariants.len(),
+    ] {
+        writer.count(count)?;
+    }
+    for state in surface.states {
+        writer.attribute(state.definition())?;
+    }
+    for state in states {
+        writer.attribute(state)?;
+    }
+    for transformer in surface.transformers {
+        writer.reference(*transformer)?;
+        let definition = transformer.definition();
+        writer.predicate(&definition.precondition)?;
+        writer.types(definition.effect.arguments)?;
+        writer.attributes(definition.effect.inputs)?;
+        writer.attributes(definition.effect.outputs)?;
+        writer.count(definition.effect.results.len())?;
+        for expression in definition.effect.results {
+            writer.expression(expression, 0)?;
+        }
+    }
+    for predicate in surface.axioms {
+        writer.reference(*predicate)?;
+        writer.predicate(predicate)?;
+    }
+    for predicate in axioms {
+        writer.reference(predicate)?;
+        writer.predicate(predicate)?;
+    }
+    for predicate in surface.invariants {
+        writer.reference(*predicate)?;
+        writer.predicate(predicate)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

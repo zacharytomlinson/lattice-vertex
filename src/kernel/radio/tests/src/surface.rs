@@ -4,8 +4,9 @@
 
 use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use lattice_vertex::{
-    ir::{Binary, Effect, Expr, Integer, Value},
+    ir::{Binary, Effect, Expr, Integer, Unary, Value},
     kernel::radio::testing::Event,
+    kernel::state::{History, RetainedState},
     surface::{
         Arguments, Definition, Operation, Predicate, State, StateHandle, StateTransformer, Surface,
         TransformerHandle,
@@ -34,6 +35,41 @@ impl State for Level {
 }
 static POWER: StateHandle<Controls> = StateHandle::new::<Power>();
 static LEVEL: StateHandle<Controls> = StateHandle::new::<Level>();
+// Compiler-like local installation data. Native SetLevel continues to report
+// only power/level; kernel maintenance owns all history and derived updates.
+static LEVEL_HISTORY: RetainedState<Controls, u8, i16, 4> = RetainedState::new(&LEVEL);
+static LEVEL_DIFFERENCE: Definition<Controls> = Definition {
+    body: Expr::Binary(
+        Binary::Equal,
+        &Expr::Read(LEVEL_HISTORY.result()),
+        &Expr::Binary(
+            Binary::Subtract,
+            &Expr::Unary(
+                Unary::Reinterpret(Integer::I16),
+                &Expr::Unary(
+                    Unary::ZeroExtend(Integer::U16),
+                    &Expr::Read(LEVEL_HISTORY.sample(0)),
+                ),
+            ),
+            &Expr::Unary(
+                Unary::Reinterpret(Integer::I16),
+                &Expr::Unary(
+                    Unary::ZeroExtend(Integer::U16),
+                    &Expr::Read(LEVEL_HISTORY.sample(1)),
+                ),
+            ),
+        ),
+    ),
+    arguments: &[],
+    inputs: &[],
+};
+static LEVEL_DIFFERENCE_RULE: Predicate<Controls> = Predicate {
+    definition: &LEVEL_DIFFERENCE,
+    inputs: &[],
+};
+fn level_difference(history: &History<u8, 4>) -> Option<i16> {
+    Some(i16::from(history.value(0)?) - i16::from(history.value(1)?))
+}
 const ZERO: Value = match Value::integer(Integer::U8, 0) {
     Ok(v) => v,
     Err(_) => panic!(),
@@ -167,6 +203,16 @@ pub fn appliance(
             level: 0,
         },
     );
+    if dimmer {
+        appliance
+            .install_state(
+                context,
+                &LEVEL_HISTORY,
+                level_difference,
+                &LEVEL_DIFFERENCE_RULE,
+            )
+            .unwrap();
+    }
     appliance
 }
 

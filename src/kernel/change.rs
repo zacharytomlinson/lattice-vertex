@@ -50,6 +50,7 @@ fn access<R>(f: impl FnOnce(&mut Outgoing) -> R) -> R {
 
 pub(crate) fn bind(native: &'static dyn Native) {
     assert!(native.ready(), "initialize appliance before kernel startup");
+    native.seal();
     access(|out| {
         assert!(out.native.is_none(), "appliance already bound");
         out.native = Some(native);
@@ -112,4 +113,68 @@ pub(crate) fn evicted() -> u32 {
 #[cfg(test)]
 pub(crate) fn reset() {
     access(|out| *out = Outgoing::new());
+}
+
+#[cfg(all(test, feature = "port-test"))]
+mod tests {
+    use super::*;
+    use crate::{
+        kernel::peer::frame::{InvokeStatus, StateReadResult},
+        sync::TaskContext,
+    };
+    static INSTANCE: u8 = 0;
+    struct Owner;
+    impl Native for Owner {
+        fn ready(&self) -> bool {
+            true
+        }
+        fn owns(&self, instance: *const (), attribute: u64) -> bool {
+            instance == core::ptr::from_ref(&INSTANCE).cast() && attribute == 1
+        }
+        fn read(&self, _: &TaskContext, _: u64) -> StateReadResult {
+            unreachable!()
+        }
+        fn invoke(&self, _: &TaskContext, _: u64, _: &[Value]) -> InvokeStatus {
+            unreachable!()
+        }
+    }
+    #[test]
+    fn transport_bounds() {
+        crate::port::test_port_reset();
+        for count in [0, 1, CAPACITY - 1, CAPACITY, CAPACITY + 1, 2 * CAPACITY + 1] {
+            reset();
+            bind(&Owner);
+            for i in 0..count {
+                record(
+                    core::ptr::from_ref(&INSTANCE).cast(),
+                    1,
+                    Some(Value::boolean(i % 2 == 0)),
+                );
+            }
+            assert_eq!(evicted(), count.saturating_sub(CAPACITY) as u32);
+            for i in count.saturating_sub(CAPACITY)..count {
+                let delta = take().unwrap();
+                assert_eq!(
+                    (delta.sequence, delta.value),
+                    (i as u32 + 1, Some(Value::boolean(i % 2 == 0)))
+                );
+            }
+            assert!(take().is_none());
+        }
+        reset();
+        bind(&Owner);
+        for (instance, attribute) in [
+            (core::ptr::null(), 1),
+            (core::ptr::from_ref(&INSTANCE).cast(), 2),
+        ] {
+            record(instance, attribute, None);
+        }
+        assert_eq!((sequence(), pending(), evicted()), (0, false, 0));
+        access(|out| out.sequence = u32::MAX - 1);
+        for expected in [u32::MAX, 0] {
+            record(core::ptr::from_ref(&INSTANCE).cast(), 1, None);
+            assert_eq!(take().unwrap().sequence, expected);
+        }
+        reset();
+    }
 }

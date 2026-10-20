@@ -1671,278 +1671,412 @@ mod tests {
     extern crate std;
     use self::std::vec::Vec;
     use super::*;
-    use crate::{
-        kernel::radio::MAX_FRAME_SIZE,
-        surface::{State, StateHandle, Surface},
-    };
-
+    use lattice_peer_wire::update::Progress;
     const NET: Network = Network {
         founder: 1,
         channel: 15,
     };
-
-    #[test]
-    #[cfg(feature = "host-link")]
-    fn update_ranges_use_read_paths_and_correlate_package_replies() {
-        use lattice_peer_wire::update::{Phase, Progress, Request, Status, REQUEST_BYTES};
-        let mut origin = Forwarder::new(1, NET);
-        let mut relay = Forwarder::new(2, NET);
-        let mut owner = Forwarder::new(3, NET);
-        let read = UpdateRead {
-            reader: 1,
-            owner: 3,
-            request: 42,
-            package: [9; 16],
-        };
-        let mut payload = [0; REQUEST_BYTES];
-        let data = [0x55; 48];
-        let n = Request::Data {
-            package: read.package,
-            offset: 4096,
-            data: &data,
+    const CALL: Invocation = Invocation {
+        caller: 1,
+        owner: 4,
+        request: 1,
+        transformer: 42,
+    };
+    const STATUS: [u8; 17] = {
+        let mut b = [9; 17];
+        b[0] = 4;
+        b
+    };
+    fn reads(reader: u64, owner: u64, request: u16) -> [ReadRequest; 4] {
+        [
+            ReadRequest::Surface(SurfaceRead {
+                reader,
+                owner,
+                request,
+                offset: 0,
+            }),
+            ReadRequest::State(StateRead {
+                reader,
+                owner,
+                request,
+                attribute: 42,
+            }),
+            ReadRequest::Links(LinkRead {
+                reader,
+                owner,
+                request,
+                after: 0,
+                via: 0,
+            }),
+            ReadRequest::Update(UpdateRead {
+                reader,
+                owner,
+                request,
+                package: [9; 16],
+            }),
+        ]
+    }
+    fn envelope(content: Content<'static>, source: u64) -> Message<'static> {
+        Message {
+            path_cost: TimePerByte::UNKNOWN,
+            source,
+            destination: Some(2),
+            content,
         }
-        .encode(&mut payload);
-        let message = origin.originate_update(read, &payload[..n], 0).unwrap();
-        let mut wire = [0; MAX_FRAME_SIZE];
-        let n = message.encode(1, &mut wire);
-        assert!(n <= MAX_FRAME_SIZE);
-        let incoming = Message::decode(&wire[..n], 2, NET.channel).unwrap();
-        let message = relay
-            .receive_update(incoming, 1, |_| panic!("relay executed update"))
-            .unwrap();
-        let mut second = [0; MAX_FRAME_SIZE];
-        let n = message.encode(2, &mut second);
-        let incoming = Message::decode(&second[..n], 3, NET.channel).unwrap();
-        let message = owner
-            .receive_update(incoming, 2, |request| {
-                assert_eq!(
-                    request,
-                    Request::Data {
-                        package: read.package,
-                        offset: 4096,
-                        data: &data
-                    }
-                );
-                Progress {
-                    package: read.package,
-                    phase: Phase::Receiving,
-                    status: Status::Ok,
-                    accepted: 4144,
-                    committed: 4096,
-                    prepared: 0,
-                }
-            })
-            .unwrap();
-        assert!(owner
-            .receive_update(incoming, 3, |_| panic!("duplicate path dispatched"))
-            .is_none());
-        let mut third = [0; MAX_FRAME_SIZE];
-        let n = message.encode(3, &mut third);
-        let incoming = Message::decode(&third[..n], 2, NET.channel).unwrap();
-        let message = relay
-            .receive_update(incoming, 4, |_| panic!("reply dispatched update"))
-            .unwrap();
-        let n = message.encode(4, &mut wire);
-        let incoming = Message::decode(&wire[..n], 1, NET.channel).unwrap();
-        let mut unrelated = incoming;
-        if let Content::Updated {
-            ref mut read,
-            ref mut progress,
-            ..
-        } = unrelated.content
-        {
-            read.package = [8; 16];
-            progress.package = read.package;
+    }
+    fn query(read: ReadRequest, network: Network, remaining: u8) -> Message<'static> {
+        envelope(
+            match read {
+                ReadRequest::Surface(read) => Content::ReadSurface {
+                    network,
+                    read,
+                    remaining,
+                },
+                ReadRequest::State(read) => Content::ReadState {
+                    network,
+                    read,
+                    remaining,
+                },
+                ReadRequest::Links(read) => Content::ReadLinks {
+                    network,
+                    read,
+                    remaining,
+                },
+                ReadRequest::Update(read) => Content::Update {
+                    network,
+                    read,
+                    remaining,
+                    bytes: &STATUS,
+                },
+            },
+            1,
+        )
+    }
+    fn answer(read: ReadRequest, hops: u8) -> Message<'static> {
+        envelope(
+            match read {
+                ReadRequest::Surface(read) => Content::SurfacePart {
+                    network: NET,
+                    read,
+                    total: 13,
+                    bytes: &[0; 13],
+                    hops,
+                },
+                ReadRequest::State(read) => Content::StateValue {
+                    network: NET,
+                    read,
+                    result: StateReadResult::Value {
+                        sequence: 7,
+                        value: Some(crate::ir::Value::boolean(false)),
+                    },
+                    hops,
+                },
+                ReadRequest::Links(read) => Content::LinkEntry {
+                    network: NET,
+                    read,
+                    revision: 7,
+                    link: None,
+                    hops,
+                },
+                ReadRequest::Update(read) => Content::Updated {
+                    network: NET,
+                    read,
+                    progress: Progress::unsupported(read.package),
+                    hops,
+                },
+            },
+            3,
+        )
+    }
+    // One handler call, no simulated peers, packet scheduler, or codec round trip.
+    fn receive<'a>(
+        node: &mut Forwarder,
+        input: Message<'static>,
+        part: &'a mut [u8; SURFACE_BYTES],
+        now: u32,
+    ) -> Option<Message<'a>> {
+        let local = node.local;
+        match input.content {
+            Content::ReadSurface { .. } | Content::SurfacePart { .. } => node.receive_surface(
+                input,
+                &Description::new(&crate::surface::EMPTY).unwrap(),
+                part,
+                now,
+            ),
+            Content::ReadState { .. } | Content::StateValue { .. } => {
+                node.receive_state(input, now, |_| {
+                    assert_eq!(local, 4);
+                    StateReadResult::Busy
+                })
+            }
+            Content::ReadLinks { .. } | Content::LinkEntry { .. } => node.receive_links(input, now),
+            Content::Update { .. } | Content::Updated { .. } => {
+                node.receive_update(input, now, |r| {
+                    assert_eq!(local, 4);
+                    Progress::unsupported(r.package())
+                })
+            }
+            _ => unreachable!(),
         }
-        assert!(origin.complete_read(unrelated, 5).is_none());
-        let result = origin.complete_read(incoming, 5).unwrap();
-        assert!(
-            matches!(result.content,Content::Updated{read:r,progress,..} if r==read && progress.committed==4096)
+    }
+    fn link(node: &mut Forwarder, peer: u64) {
+        node.links.receive(peer, LinkPhase::Offer, 1, 0);
+        node.links.receive(peer, LinkPhase::Confirm, 1, 1);
+        assert!(node.links.contains(peer));
+    }
+    fn cost(node: &mut Forwarder, peer: u64, unit: u32) {
+        node.record_transmission(
+            Transmission {
+                peer,
+                elapsed_us: unit * 100,
+                acknowledged_bytes: 100,
+            },
+            0,
         );
     }
-    struct On;
-    impl State for On {
-        type Appliance = ();
-        type Value = bool;
-        fn read(_: &()) -> Option<bool> {
-            panic!("a surface read must not read appliance state")
-        }
-    }
-    static ON: StateHandle<()> = StateHandle::new::<On>();
-    // A description spanning multiple radio frames; no native reader is called.
-    static SURFACE: Surface<'static, (), ()> = Surface {
-        states: &[&ON; 16],
-        transformers: &[],
-        axioms: &[],
-        invariants: &[],
-    };
 
-    fn query(request: u16, offset: u16) -> Message<'static> {
-        Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 1,
-            destination: None,
-            content: Content::ReadSurface {
-                network: NET,
-                read: SurfaceRead {
-                    reader: 1,
-                    owner: 4,
-                    request,
-                    offset,
-                },
-                remaining: MAX_HOPS,
-            },
-        }
-    }
-
-    fn reply(request: u16, offset: u16) -> Message<'static> {
-        Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 3,
-            destination: Some(2),
-            content: Content::SurfacePart {
-                network: NET,
-                read: SurfaceRead {
-                    reader: 1,
-                    owner: 4,
-                    request,
-                    offset,
-                },
-                total: 13,
-                hops: 2,
-                bytes: &[0; 13],
-            },
-        }
-    }
-
-    /// Exercise real encoded frames through local forwarding state. Links only
-    /// determine who hears a transmission; no RF model or scheduler is simulated.
-    fn exchange(
-        nodes: &mut [Forwarder],
-        links: &[(u64, u64)],
-        initial: Message<'_>,
-        now: u32,
-    ) -> (Vec<u8>, Vec<(u64, Option<u64>)>, Vec<(u64, SurfaceOwner)>) {
-        let description = Description::new(&SURFACE).unwrap();
-        let mut bytes = [0; MAX_FRAME_SIZE];
-        let length = initial.encode(0, &mut bytes);
-        let mut pending = self::std::vec![(initial.source, initial.destination, bytes, length)];
-        let mut reads = Vec::new();
-        let mut answer = Vec::new();
-        let mut owners = Vec::new();
-        let mut cursor = 0;
-        while cursor < pending.len() {
-            assert!(pending.len() < 64, "duplicate forwarding did not terminate");
-            let (sender, destination, wire, length) = pending[cursor];
-            cursor += 1;
-            if destination == Some(1)
-                && links
-                    .iter()
-                    .any(|&(a, b)| (a, b) == (sender, 1) || (a, b) == (1, sender))
-            {
-                if let Content::SurfacePart { read, bytes, .. } =
-                    Message::decode(&wire[..length], 1, 15).unwrap().content
-                {
-                    assert_eq!((read.reader, read.owner), (1, 4));
-                    assert!(answer.is_empty(), "one request produced duplicate delivery");
-                    answer.extend_from_slice(bytes);
-                }
-            }
-            for node in nodes.iter_mut() {
-                let local = node.local;
-                if local == sender
-                    || destination.is_some_and(|d| d != local)
-                    || !links
-                        .iter()
-                        .any(|&(a, b)| (a, b) == (sender, local) || (a, b) == (local, sender))
-                {
-                    continue;
-                }
-                let incoming = Message::decode(&wire[..length], local, 15).unwrap();
-                let mut piece = [0; SURFACE_BYTES];
-                let mut transmit = |out: Message<'_>| {
-                    if matches!(out.content, Content::ReadSurface { .. }) {
-                        reads.push((local, out.destination));
+    #[test]
+    fn read_admission() {
+        for reader in [1, 2] {
+            for owner in [2, 4] {
+                for remaining in [1, 2, MAX_HOPS] {
+                    for read in reads(reader, owner, 7) {
+                        let mut node = Forwarder::new(2, NET);
+                        let allowed = reader != 2 && (owner == 2 || remaining > 1);
+                        assert_eq!(node.begin_read(read, 1, remaining, 0).is_some(), allowed);
+                        if allowed {
+                            for duplicate in reads(reader, owner, 7) {
+                                assert!(node.begin_read(duplicate, 3, MAX_HOPS, 1).is_none());
+                            }
+                            assert_eq!(
+                                node.reads
+                                    .iter()
+                                    .find(|r| r.read.reader() != 0)
+                                    .unwrap()
+                                    .previous,
+                                1
+                            );
+                        }
                     }
-                    let mut wire = [0; MAX_FRAME_SIZE];
-                    let n = out.encode(cursor as u8, &mut wire);
-                    pending.push((local, out.destination, wire, n));
-                };
-                if let Some(owner) =
-                    node.receive_discovery(incoming, description.len(), now, &mut transmit)
-                {
-                    owners.push((local, owner));
-                }
-                if let Some(out) = node.receive_surface(incoming, &description, &mut piece, now) {
-                    transmit(out);
                 }
             }
-        }
-        (answer, reads, owners)
-    }
-
-    fn connect(nodes: &mut [Forwarder], a: usize, b: usize, now: u32) {
-        let peer = nodes[b].local;
-        nodes[a].record_presence(peer, now);
-        let offer = nodes[a].maintain_links(now).unwrap();
-        assert_eq!(offer.destination, Some(peer));
-        let mut wire = [0; MAX_FRAME_SIZE];
-        let n = offer.encode(0, &mut wire);
-        let accept = nodes[b]
-            .receive_link(Message::decode(&wire[..n], peer, 15).unwrap(), now + 1)
-            .unwrap();
-        let n = accept.encode(1, &mut wire);
-        let local = nodes[a].local;
-        let confirm = nodes[a]
-            .receive_link(Message::decode(&wire[..n], local, 15).unwrap(), now + 2)
-            .unwrap();
-        let n = confirm.encode(2, &mut wire);
-        assert!(nodes[b]
-            .receive_link(Message::decode(&wire[..n], peer, 15).unwrap(), now + 3)
-            .is_none());
-    }
-
-    /// A physical chain 1--2--3--4--5. The tablet at 1 only contacts 2 directly.
-    fn walk(nodes: &mut [Forwarder], query: Message<'static>, now: u32) -> Message<'static> {
-        let mut message = query;
-        let mut wire = [0; MAX_FRAME_SIZE];
-        let mut count = 0;
-        loop {
-            count += 1;
-            assert!(count <= 8, "walk did not terminate");
-            let target = message
-                .destination
-                .expect("guided walk unexpectedly flooded");
-            assert_eq!(
-                message.source.abs_diff(target),
-                1,
-                "walk skipped a physical link"
-            );
-            let n = message.encode(count, &mut wire);
-            let incoming = Message::decode(&wire[..n], target, 15).unwrap();
-            if target == 1 {
-                assert_eq!(incoming, message);
-                return message;
-            }
-            let node = nodes.iter_mut().find(|p| p.local == target).unwrap();
-            message = node.receive_links(incoming, now).unwrap();
         }
     }
 
     #[test]
-    fn alternate_directions_rank_marginal_cost_and_fail_independently() {
+    fn read_correlation() {
+        for read in reads(1, 4, 7) {
+            let mut wrong = Vec::from(reads(1, 4, 7));
+            wrong.extend(reads(9, 4, 7));
+            wrong.extend(reads(1, 9, 7));
+            wrong.extend(reads(1, 4, 8));
+            wrong.extend([
+                ReadRequest::Surface(SurfaceRead {
+                    reader: 1,
+                    owner: 4,
+                    request: 7,
+                    offset: 1,
+                }),
+                ReadRequest::State(StateRead {
+                    reader: 1,
+                    owner: 4,
+                    request: 7,
+                    attribute: 43,
+                }),
+                ReadRequest::Links(LinkRead {
+                    reader: 1,
+                    owner: 4,
+                    request: 7,
+                    after: 1,
+                    via: 0,
+                }),
+                ReadRequest::Links(LinkRead {
+                    reader: 1,
+                    owner: 4,
+                    request: 7,
+                    after: 0,
+                    via: 3,
+                }),
+                ReadRequest::Update(UpdateRead {
+                    reader: 1,
+                    owner: 4,
+                    request: 7,
+                    package: [8; 16],
+                }),
+            ]);
+            for candidate in wrong.into_iter().filter(|r| *r != read) {
+                let mut node = Forwarder::new(2, NET);
+                node.begin_read(read, 1, MAX_HOPS, 0).unwrap();
+                assert_eq!(
+                    node.return_read(candidate, 3, 2, 1, TimePerByte::UNKNOWN),
+                    None
+                );
+                assert!(node.routes.iter().all(|r| r.owner == 0));
+            }
+            for (onward, source, hops, allowed) in [
+                (0, 1, 2, false),
+                (0, 3, MAX_HOPS, false),
+                (0, 3, MAX_HOPS - 1, true),
+                (3, 5, 2, false),
+                (3, 3, 2, true),
+            ] {
+                let mut node = Forwarder::new(2, NET);
+                node.remember_read(read, 1, onward, false, 0);
+                assert_eq!(
+                    node.return_read(read, source, hops, 1, TimePerByte::UNKNOWN),
+                    allowed.then_some(1)
+                );
+                if allowed {
+                    assert_eq!(
+                        node.return_read(read, source, hops, 2, TimePerByte::UNKNOWN),
+                        None
+                    );
+                }
+                assert_eq!(node.routes.iter().any(|r| r.owner == 4), allowed);
+            }
+        }
+    }
+
+    #[test]
+    fn read_envelopes() {
+        for read in reads(1, 4, 7) {
+            for network in [NET, Network { founder: 99, ..NET }] {
+                for local in [2, 4] {
+                    for remaining in [1, 2] {
+                        let mut node = Forwarder::new(local, NET);
+                        let mut part = [0; SURFACE_BYTES];
+                        let input = Message {
+                            destination: Some(local),
+                            ..query(read, network, remaining)
+                        };
+                        let out = receive(&mut node, input, &mut part, 0);
+                        let allowed = network == NET && (local == 4 || remaining > 1);
+                        assert_eq!(out.is_some(), allowed);
+                        if let Some(out) = out {
+                            assert_eq!(out.destination, (local == 4).then_some(1));
+                        }
+                        assert!(receive(&mut node, input, &mut part, 1).is_none());
+                    }
+                }
+            }
+            let mut node = Forwarder::new(2, NET);
+            let mut part = [0; SURFACE_BYTES];
+            cost(&mut node, 3, 10);
+            receive(&mut node, query(read, NET, 8), &mut part, 0).unwrap();
+            let incoming = Message {
+                path_cost: TimePerByte::measured(20, 1),
+                ..answer(read, 2)
+            };
+            let out = receive(&mut node, incoming, &mut part, 1).unwrap();
+            assert_eq!(out.destination, Some(1));
+            assert_eq!(out.content, answer(read, 3).content);
+            assert_eq!(out.path_cost, TimePerByte::measured(30, 1));
+            assert_eq!(node.cost_to(4), out.path_cost);
+            cost(&mut node, 3, 5);
+            assert_eq!(node.cost_to(4), TimePerByte::measured(55, 2));
+        }
+        let description = Description::new(&crate::surface::EMPTY).unwrap();
+        for offset in [
+            description.len() - 1,
+            description.len(),
+            description.len() + 1,
+        ] {
+            let mut node = Forwarder::new(4, NET);
+            let mut part = [0; SURFACE_BYTES];
+            let input = query(
+                ReadRequest::Surface(SurfaceRead {
+                    reader: 1,
+                    owner: 4,
+                    request: 7,
+                    offset,
+                }),
+                NET,
+                1,
+            );
+            let out = receive(&mut node, input, &mut part, 0);
+            assert_eq!(out.is_some(), offset <= description.len());
+            if let Some(Message {
+                content: Content::SurfacePart { bytes, .. },
+                ..
+            }) = out
+            {
+                assert_eq!(bytes.len(), usize::from(description.len() - offset));
+            }
+        }
+    }
+
+    #[test]
+    fn guided_links() {
+        for linked in [false, true] {
+            for via in [0, 2, 3] {
+                let mut node = Forwarder::new(2, NET);
+                if linked {
+                    link(&mut node, 4);
+                }
+                node.learn(3, 5, 2, 1, TimePerByte::UNKNOWN);
+                let read = ReadRequest::Links(LinkRead {
+                    reader: 1,
+                    owner: 4,
+                    request: 1,
+                    via,
+                    after: 0,
+                });
+                let out = node.receive_links(query(read, NET, 8), 2);
+                assert_eq!(out.is_some(), via != 2 || linked);
+                if let Some(out) = out {
+                    assert_eq!(
+                        out.destination,
+                        if via == 3 {
+                            Some(5)
+                        } else {
+                            linked.then_some(4)
+                        }
+                    );
+                    if via == 3 {
+                        node.transmit_failed(&out);
+                        assert!(node.routes.iter().all(|r| r.owner != 3));
+                    }
+                }
+                node.expire(60_002);
+                let stale = ReadRequest::Links(LinkRead {
+                    reader: 1,
+                    owner: 4,
+                    request: 2,
+                    via: 2,
+                    after: 0,
+                });
+                assert!(node.receive_links(query(stale, NET, 8), 60_003).is_none());
+            }
+        }
+        for (network, destination, source) in [
+            (NET, None, 3),
+            (NET, Some(2), 2),
+            (Network { founder: 9, ..NET }, Some(2), 3),
+        ] {
+            let mut node = Forwarder::new(2, NET);
+            let offer = Message {
+                destination,
+                ..envelope(
+                    Content::LinkExchange {
+                        network,
+                        phase: LinkPhase::Offer,
+                        token: 1,
+                    },
+                    source,
+                )
+            };
+            assert!(node.receive_link(offer, 0).is_none());
+            assert!(!node.links.contains(source));
+        }
+    }
+
+    #[test]
+    fn route_ranking() {
         let mut node = Forwarder::new(2, NET);
         for peer in 3..=6 {
-            node.record_transmission(
-                Transmission {
-                    peer,
-                    elapsed_us: 1000,
-                    acknowledged_bytes: 1000,
-                },
-                0,
-            );
+            cost(&mut node, peer, 1);
         }
-        for (next, hops, unit_us, expected) in [
+        for (next, hops, unit, expected) in [
             (3, 3, 41, [3, 0]),
             (4, 2, 40, [4, 3]),
             (5, 4, 10, [5, 4]),
@@ -1950,1309 +2084,458 @@ mod tests {
             (4, 2, 5, [4, 5]),
             (4, 2, 80, [5, 4]),
         ] {
-            node.learn(9, next, hops, 0, TimePerByte::measured(unit_us, 1));
+            node.learn(9, next, hops, 0, TimePerByte::measured(unit, 1));
             assert_eq!(node.next_hops(9, 1, 8), expected);
         }
-        assert_eq!(node.next_hops(9, 5, 8), [4, 0]);
-        assert_eq!(node.next_hops(9, 1, 2), [0, 0]);
-        let failed = Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 2,
-            destination: Some(5),
-            content: Content::ReadState {
+        for (previous, remaining, expected) in [(5, 8, [4, 0]), (1, 2, [0, 0]), (1, 3, [4, 0])] {
+            assert_eq!(node.next_hops(9, previous, remaining), expected);
+        }
+        link(&mut node, 9);
+        cost(&mut node, 9, 90);
+        node.learn(9, 3, 2, 2, TimePerByte::measured(2, 1));
+        assert_eq!(node.next_hops(9, 1, 8), [3, 5]);
+        for tail in [TimePerByte::UNKNOWN, TimePerByte::measured(100, 1)] {
+            let mut node = Forwarder::new(2, NET);
+            link(&mut node, 9);
+            cost(&mut node, 9, 10);
+            cost(&mut node, 3, 1);
+            node.learn(9, 3, 2, 2, tail);
+            assert_eq!(node.next_hops(9, 1, 8), [9, 3]);
+        }
+        assert_eq!(node.cost_to(2), TimePerByte::ZERO);
+        assert_eq!(node.cost_to(99), TimePerByte::UNKNOWN);
+    }
+
+    #[test]
+    fn call_fanout() {
+        for directions in 0..=2 {
+            for copies in [1, 2] {
+                for remaining in [1, 8] {
+                    let mut node = Forwarder::new(2, NET);
+                    for next in 3..3 + directions {
+                        node.learn(4, next, 2, 0, TimePerByte::UNKNOWN);
+                    }
+                    let request = envelope(
+                        Content::Invoke {
+                            network: NET,
+                            call: CALL,
+                            remaining,
+                            copies,
+                            arguments: &[0],
+                        },
+                        1,
+                    );
+                    let out = node
+                        .receive_control(request, 1, |_, _| panic!("relay invoked native work"));
+                    let count = if remaining == 1 {
+                        0
+                    } else {
+                        directions.max(1).min(u64::from(copies)) as usize
+                    };
+                    assert_eq!(out.iter().flatten().count(), count);
+                    for out in out.into_iter().flatten() {
+                        let budget = if directions == 0 || count == 2 {
+                            1
+                        } else {
+                            copies
+                        };
+                        assert!(
+                            matches!(out.content, Content::Invoke { call, remaining: r, copies: c, arguments: &[0], .. } if call == CALL && r == remaining - 1 && c == budget)
+                        );
+                    }
+                    assert_eq!(node.receive_control(request, 2, |_, _| panic!()), [None; 2]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn call_correlation() {
+        let request = envelope(
+            Content::Invoke {
                 network: NET,
-                read: StateRead {
-                    reader: 1,
-                    owner: 9,
-                    request: 1,
-                    attribute: 42,
-                },
-                remaining: 7,
-            },
-        };
-        node.transmit_failed(&failed);
-        assert_eq!(node.next_hops(9, 1, 8), [4, 0]);
-        node.learn(9, 5, 2, 100, TimePerByte::measured(10, 1));
-        node.expire(ROUTE_MS);
-        assert_eq!(
-            node.next_hops(9, 1, 8),
-            [5, 0],
-            "expiry erased a newer alternate"
-        );
-        // Owner capacity stays bounded independently of candidates per owner.
-        node.learn(10, 3, 2, ROUTE_MS + 1, TimePerByte::measured(3, 1));
-        node.learn(11, 3, 2, ROUTE_MS + 2, TimePerByte::measured(3, 1));
-        node.learn(12, 3, 2, ROUTE_MS + 3, TimePerByte::measured(3, 1));
-        assert_eq!(node.next_hops(9, 1, 8), [0, 0]);
-        assert_eq!(node.next_hops(12, 1, 8), [3, 0]);
-    }
-
-    #[test]
-    #[cfg(feature = "host-link")]
-    fn directional_cost_crosses_encoded_replies_and_drives_quantity_estimates() {
-        let mut a = Forwarder::new(1, NET);
-        let mut b = Forwarder::new(2, NET);
-        let mut c = Forwarder::new(3, NET);
-        a.record_transmission(
-            Transmission {
-                peer: 2,
-                elapsed_us: 1000,
-                acknowledged_bytes: 100,
-            },
-            0,
-        );
-        b.record_transmission(
-            Transmission {
-                peer: 3,
-                elapsed_us: 2000,
-                acknowledged_bytes: 100,
-            },
-            0,
-        );
-        // The expensive reverse direction must not become the forward path price.
-        b.record_transmission(
-            Transmission {
-                peer: 1,
-                elapsed_us: 90000,
-                acknowledged_bytes: 100,
-            },
-            0,
-        );
-        c.record_transmission(
-            Transmission {
-                peer: 2,
-                elapsed_us: 80000,
-                acknowledged_bytes: 100,
-            },
-            0,
-        );
-        let read = ReadRequest::State(StateRead {
-            reader: 1,
-            owner: 3,
-            request: 7,
-            attribute: 42,
-        });
-        let request = a.originate_read(read, 1).unwrap();
-        let onward = b.receive_state(request, 2, |_| panic!()).unwrap();
-        let reply = c
-            .receive_state(onward, 3, |_| StateReadResult::Busy)
-            .unwrap();
-        assert_eq!(reply.path_cost, TimePerByte::ZERO);
-        let mut wire = [0; MAX_FRAME_SIZE];
-        let size = reply.encode(1, &mut wire);
-        let reply = b
-            .receive_state(
-                Message::decode(&wire[..size], 2, 15).unwrap(),
-                4,
-                |_| panic!(),
-            )
-            .unwrap();
-        assert_eq!(reply.path_cost, TimePerByte::measured(2000, 100));
-        let size = reply.encode(2, &mut wire);
-        assert!(a
-            .complete_read(Message::decode(&wire[..size], 1, 15).unwrap(), 5)
-            .is_some());
-        let cost = a.cost_to(3);
-        assert_eq!(cost.estimate_us(10), Some(300));
-        assert_eq!(cost.estimate_us(10_000), Some(300_000));
-        assert_eq!(a.cost_to(1), TimePerByte::ZERO);
-        assert_eq!(a.cost_to(99), TimePerByte::UNKNOWN);
-        // Update only the first-hop measurement; retained downstream cost stays 20.
-        a.record_transmission(
-            Transmission {
-                peer: 2,
-                elapsed_us: 3000,
-                acknowledged_bytes: 100,
-            },
-            6,
-        );
-        assert_eq!(a.cost_to(3).estimate_us(100), Some(4000));
-        a.expire(ROUTE_MS + 10);
-        assert_eq!(a.cost_to(3), TimePerByte::UNKNOWN);
-    }
-
-    #[test]
-    fn measured_indirect_path_can_beat_a_maintained_direct_neighbor() {
-        let mut nodes = [Forwarder::new(1, NET), Forwarder::new(9, NET)];
-        connect(&mut nodes, 0, 1, 0);
-        let node = &mut nodes[0];
-        node.record_transmission(
-            Transmission {
-                peer: 9,
-                elapsed_us: 9000,
-                acknowledged_bytes: 100,
-            },
-            4,
-        );
-        node.record_transmission(
-            Transmission {
-                peer: 2,
-                elapsed_us: 1000,
-                acknowledged_bytes: 100,
-            },
-            4,
-        );
-        node.learn(9, 2, 3, 5, TimePerByte::measured(2000, 100));
-        assert_eq!(node.next_hops(9, 1, 8), [2, 9]);
-        assert_eq!(node.cost_to(9).estimate_us(100), Some(3000));
-        // A known direct link still wins against an unmeasured suffix.
-        node.learn(9, 2, 3, 6, TimePerByte::UNKNOWN);
-        assert_eq!(node.next_hops(9, 1, 8), [9, 2]);
-        // Same route ranking at either quantity: no special transfer class.
-        let direct = node.cost_to(9);
-        assert_eq!(
-            direct.estimate_us(10_000).unwrap(),
-            direct.estimate_us(10).unwrap() * 1000
-        );
-    }
-
-    #[test]
-    fn invocation_split_budget_and_partial_success_keep_the_surviving_direction() {
-        let mut node = Forwarder::new(2, NET);
-        node.learn(9, 3, 2, 0, TimePerByte::measured(4, 1));
-        node.learn(9, 4, 2, 0, TimePerByte::measured(6, 1));
-        let call = Invocation {
-            caller: 1,
-            owner: 9,
-            request: 1,
-            transformer: 42,
-        };
-        let request = Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 1,
-            destination: Some(2),
-            content: Content::Invoke {
-                network: NET,
-                call,
+                call: CALL,
                 remaining: 8,
                 copies: 2,
                 arguments: &[0],
-            },
-        };
-        let sent = node.receive_control(request, 1, |_, _| panic!());
-        assert_eq!(
-            sent.map(|m| m.map(|m| m.destination)),
-            [Some(Some(3)), Some(Some(4))]
-        );
-        for copy in sent.into_iter().flatten() {
-            assert!(
-                matches!(copy.content,Content::Invoke {call:c,copies:1,remaining:7,arguments:&[0],..} if c==call)
-            );
-        }
-        let result = Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 4,
-            destination: Some(2),
-            content: Content::InvocationResult {
-                network: NET,
-                call,
-                status: InvokeStatus::Invoked,
-                hops: 2,
-            },
-        };
-        assert!(node.receive_control(result, 10, |_, _| panic!())[0].is_some());
-        assert!(node
-            .receive_control(result, 11, |_, _| panic!())
-            .iter()
-            .all(Option::is_none));
-        node.expire(READ_MS + 1);
-        assert_eq!(
-            node.next_hops(9, 1, 8),
-            [4, 0],
-            "one successful copy masked the unanswered direction"
-        );
-        let mut downstream = Forwarder::new(4, NET);
-        downstream.learn(9, 6, 2, 0, TimePerByte::measured(1, 1));
-        downstream.learn(9, 7, 2, 0, TimePerByte::measured(2, 1));
-        let one = downstream.receive_control(sent[1].unwrap(), 2, |_, _| panic!());
-        assert!(
-            one[0].is_some() && one[1].is_none(),
-            "a descendant split again"
-        );
-        let mut empty = Forwarder::new(2, NET);
-        let exploration = empty.receive_control(request, 0, |_, _| panic!());
-        assert!(exploration[1].is_none());
-        assert!(matches!(
-            exploration[0].unwrap(),
-            Message {
-                destination: None,
-                content: Content::Invoke { copies: 1, .. },
-                ..
-            }
-        ));
-        // No split is consumed while there is only one known direction.
-        empty.learn(9, 3, 2, 0, TimePerByte::measured(4, 1));
-        let next = Message {
-            content: Content::Invoke {
-                network: NET,
-                call: Invocation { request: 2, ..call },
-                remaining: 8,
-                copies: 2,
-                arguments: &[0],
-            },
-            ..request
-        };
-        assert!(matches!(
-            empty.receive_control(next, 1, |_, _| panic!())[0]
-                .unwrap()
-                .content,
-            Content::Invoke { copies: 2, .. }
-        ));
-    }
-
-    #[test]
-    fn link_walk_discovers_beyond_radio_range_and_teaches_surface_read_directions() {
-        let mut nodes = [
-            Forwarder::new(2, NET),
-            Forwarder::new(3, NET),
-            Forwarder::new(4, NET),
-            Forwarder::new(5, NET),
-        ];
-        connect(&mut nodes, 0, 1, 0);
-        connect(&mut nodes, 1, 2, 10);
-        connect(&mut nodes, 2, 3, 20);
-        let mut token = 1;
-        for (owner, via, after, expected, hops) in [
-            (2, 0, 0, Some(3), 1),
-            (3, 2, 2, Some(4), 2),
-            (4, 3, 3, Some(5), 3),
-            (5, 4, 4, None, 4),
-        ] {
-            let read = LinkRead {
-                reader: 1,
-                owner,
-                request: token,
-                after,
-                via,
-            };
-            token += 1;
-            let query = Message {
-                path_cost: TimePerByte::UNKNOWN,
-                source: 1,
-                destination: Some(2),
-                content: Content::ReadLinks {
-                    network: NET,
-                    read,
-                    remaining: 8,
-                },
-            };
-            let result = walk(&mut nodes, query, 100);
-            let Content::LinkEntry {
-                link,
-                hops: distance,
-                ..
-            } = result.content
-            else {
-                panic!()
-            };
-            assert_eq!(link.map(|l| l.peer), expected);
-            assert_eq!(distance, hops);
-        }
-        // Walking established a path to owner 5 without a FindOwners flood.
-        let description = Description::new(&SURFACE).unwrap();
-        let read = SurfaceRead {
-            reader: 1,
-            owner: 5,
-            request: token,
-            offset: 0,
-        };
-        let query = Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 1,
-            destination: Some(2),
-            content: Content::ReadSurface {
-                network: NET,
-                read,
-                remaining: 8,
-            },
-        };
-        let mut wire = [0; MAX_FRAME_SIZE];
-        let mut n = query.encode(0, &mut wire);
-        for index in [0, 1, 2, 3, 2, 1, 0] {
-            let local = nodes[index].local;
-            let incoming = Message::decode(&wire[..n], local, 15).unwrap();
-            let mut piece = [0; SURFACE_BYTES];
-            let outgoing = nodes[index]
-                .receive_surface(incoming, &description, &mut piece, 101)
-                .unwrap();
-            let target = outgoing
-                .destination
-                .expect("surface read lost learned direction");
-            assert_eq!(target.abs_diff(local), 1);
-            let mut next = [0; MAX_FRAME_SIZE];
-            n = outgoing.encode(0, &mut next);
-            wire = next;
-        }
-        let answer = Message::decode(&wire[..n], 1, 15).unwrap();
-        assert!(matches!(answer.content,Content::SurfacePart {read:r,hops:4,..} if r==read));
-        // A local route-cache replacement cannot erase the maintained neighbor.
-        for owner in 90..95 {
-            nodes[0].learn(owner, 3, 2, 102, TimePerByte::measured(1, 1));
-        }
-        let read = LinkRead {
-            reader: 1,
-            owner: 2,
-            request: 99,
-            after: 0,
-            via: 0,
-        };
-        let reply = walk(
-            &mut nodes,
-            Message {
-                path_cost: TimePerByte::UNKNOWN,
-                source: 1,
-                destination: Some(2),
-                content: Content::ReadLinks {
-                    network: NET,
-                    read,
-                    remaining: 8,
-                },
-            },
-            103,
-        );
-        assert!(matches!(reply.content,Content::LinkEntry {link:Some(link),..} if link.peer==3));
-    }
-
-    #[test]
-    fn guided_reads_reject_stale_links_and_correlate_via_and_cursor() {
-        let mut nodes = [Forwarder::new(2, NET), Forwarder::new(3, NET)];
-        connect(&mut nodes, 0, 1, 0);
-        let read = LinkRead {
-            reader: 1,
-            owner: 3,
-            request: 7,
-            after: 0,
-            via: 2,
-        };
-        let query = Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 1,
-            destination: Some(2),
-            content: Content::ReadLinks {
-                network: NET,
-                read,
-                remaining: 8,
-            },
-        };
-        let forwarded = nodes[0].receive_links(query, 10).unwrap();
-        assert_eq!(forwarded.destination, Some(3));
-        assert!(nodes[0].receive_links(query, 11).is_none());
-        let actual = nodes[1].receive_links(forwarded, 12).unwrap();
-        for wrong in [
-            LinkRead { via: 0, ..read },
-            LinkRead { after: 99, ..read },
-            LinkRead { owner: 4, ..read },
-        ] {
-            let bad = Message {
-                path_cost: TimePerByte::UNKNOWN,
-                source: 3,
-                destination: Some(2),
-                content: Content::LinkEntry {
-                    network: NET,
-                    read: wrong,
-                    revision: 1,
-                    link: None,
-                    hops: 1,
-                },
-            };
-            assert!(nodes[0].receive_links(bad, 13).is_none());
-        }
-        assert!(nodes[0].receive_links(actual, 14).is_some());
-        let foreign = Message {
-            content: Content::ReadLinks {
-                network: Network { founder: 99, ..NET },
-                read,
-                remaining: 8,
-            },
-            ..query
-        };
-        assert!(nodes[0].receive_links(foreign, 15).is_none());
-        let exhausted = Message {
-            content: Content::ReadLinks {
-                network: NET,
-                read: LinkRead { request: 8, ..read },
-                remaining: 1,
-            },
-            ..query
-        };
-        assert!(nodes[0].receive_links(exhausted, 16).is_none());
-        let stale = Message {
-            content: Content::ReadLinks {
-                network: NET,
-                read: LinkRead { request: 9, ..read },
-                remaining: 8,
-            },
-            ..query
-        };
-        assert!(
-            nodes[0].receive_links(stale, 60_003).is_none(),
-            "expired advertised link became a flood"
-        );
-        let local = Message {
-            content: Content::ReadLinks {
-                network: NET,
-                read: LinkRead {
-                    reader: 1,
-                    owner: 2,
-                    request: 10,
-                    after: 0,
-                    via: 0,
-                },
-                remaining: 1,
-            },
-            ..query
-        };
-        assert!(matches!(
-            nodes[0].receive_links(local, 60_004).unwrap().content,
-            Content::LinkEntry {
-                revision: 2,
-                link: None,
-                ..
-            }
-        ));
-        // Failed routing toward a via removes that direction, not a target route
-        // which this request had not yet established.
-        let mut relay = Forwarder::new(2, NET);
-        relay.learn(4, 3, 2, 0, TimePerByte::measured(1, 1));
-        let q = Message {
-            content: Content::ReadLinks {
-                network: NET,
-                read: LinkRead {
-                    owner: 5,
-                    via: 4,
-                    request: 11,
-                    ..read
-                },
-                remaining: 8,
-            },
-            ..query
-        };
-        let sent = relay.receive_links(q, 1).unwrap();
-        assert_eq!(sent.destination, Some(3));
-        relay.transmit_failed(&sent);
-        assert!(relay.routes.iter().all(|r| r.owner != 4));
-        // Discovery content from another network or a relayed/broadcast exchange
-        // cannot establish a maintained link.
-        let offer = Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 3,
-            destination: None,
-            content: Content::LinkExchange {
-                network: NET,
-                phase: LinkPhase::Offer,
-                token: 1,
-            },
-        };
-        assert!(relay.receive_link(offer, 2).is_none());
-    }
-
-    #[test]
-    fn state_and_surface_reads_share_paths_without_accepting_mismatched_replies() {
-        let mut relay = Forwarder::new(2, NET);
-        let read = StateRead {
-            reader: 1,
-            owner: 4,
-            request: 7,
-            attribute: 42,
-        };
-        let query = Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 1,
-            destination: None,
-            content: Content::ReadState {
-                network: NET,
-                read,
-                remaining: 8,
-            },
-        };
-        let reply = Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 3,
-            destination: Some(2),
-            content: Content::StateValue {
-                network: NET,
-                read,
-                result: StateReadResult::Busy,
-                hops: 2,
-            },
-        };
-        assert!(relay.receive_state(reply, 0, |_| panic!()).is_none());
-        assert_eq!(
-            relay
-                .receive_state(query, 0, |_| panic!())
-                .unwrap()
-                .destination,
-            None
-        );
-        assert!(
-            relay
-                .receive_state(Message { source: 3, ..query }, 1, |_| panic!())
-                .is_none(),
-            "cycle forwarded duplicate read"
-        );
-        for wrong in [
-            StateRead {
-                attribute: 43,
-                ..read
-            },
-            StateRead { owner: 5, ..read },
-            StateRead { reader: 6, ..read },
-            StateRead { request: 8, ..read },
-        ] {
-            let bad = Message {
-                content: Content::StateValue {
-                    network: NET,
-                    read: wrong,
-                    result: StateReadResult::Busy,
-                    hops: 2,
-                },
-                ..reply
-            };
-            assert!(relay.receive_state(bad, 2, |_| panic!()).is_none());
-        }
-        let description = Description::new(&SURFACE).unwrap();
-        let mut part = [0; SURFACE_BYTES];
-        let surface_read = SurfaceRead {
-            reader: 1,
-            owner: 4,
-            request: 7,
-            offset: 0,
-        };
-        let surface_query = Message {
-            content: Content::ReadSurface {
-                network: NET,
-                read: surface_read,
-                remaining: 8,
-            },
-            ..query
-        };
-        assert!(
-            relay
-                .receive_surface(surface_query, &description, &mut part, 2)
-                .is_none(),
-            "different read kind reused a live token"
-        );
-        let surface_reply = Message {
-            content: Content::SurfacePart {
-                network: NET,
-                read: surface_read,
-                total: 13,
-                hops: 2,
-                bytes: &[0; 13],
-            },
-            ..reply
-        };
-        assert!(
-            relay
-                .receive_surface(surface_reply, &description, &mut part, 2)
-                .is_none(),
-            "surface bytes answered a state read"
-        );
-        let answer = relay.receive_state(reply, 3, |_| panic!()).unwrap();
-        assert!(matches!(
-            answer.content,
-            Content::StateValue {
-                result: StateReadResult::Busy,
-                hops: 3,
-                ..
-            }
-        ));
-        assert_eq!(answer.destination, Some(1));
-        assert!(relay.receive_state(reply, 4, |_| panic!()).is_none());
-        let next = Message {
-            content: Content::ReadState {
-                network: NET,
-                read: StateRead { request: 8, ..read },
-                remaining: 8,
-            },
-            ..query
-        };
-        let directed = relay.receive_state(next, 5, |_| panic!()).unwrap();
-        assert_eq!(directed.destination, Some(3));
-        let unknown = Message {
-            source: 5,
-            content: Content::StateValue {
-                network: NET,
-                read: StateRead { request: 8, ..read },
-                result: StateReadResult::UnknownAttribute,
-                hops: 2,
-            },
-            ..reply
-        };
-        assert!(
-            relay.receive_state(unknown, 6, |_| panic!()).is_none(),
-            "unrelated neighbor settled directed read"
-        );
-        relay.expire(READ_MS + 5);
-        assert!(
-            relay
-                .receive_state(reply, READ_MS + 6, |_| panic!())
-                .is_none(),
-            "expired result revived its path"
-        );
-        assert_eq!(
-            relay
-                .receive_state(next, READ_MS + 6, |_| panic!())
-                .unwrap()
-                .destination,
-            None,
-            "unanswered direction retained"
-        );
-
-        let mut owner = Forwarder::new(4, NET);
-        let exhausted = Message {
-            content: Content::ReadState {
-                network: NET,
-                read,
-                remaining: 1,
-            },
-            ..query
-        };
-        assert!(Forwarder::new(2, NET)
-            .receive_state(exhausted, 0, |_| panic!())
-            .is_none());
-        assert!(owner
-            .receive_state(exhausted, 0, |attribute| {
-                assert_eq!(attribute, 42);
-                StateReadResult::UnknownAttribute
-            })
-            .is_some());
-        assert!(owner
-            .receive_state(exhausted, 1, |_| panic!("duplicate owner read"))
-            .is_none());
-        let foreign = Message {
-            content: Content::ReadState {
-                network: Network { founder: 77, ..NET },
-                read,
-                remaining: 8,
-            },
-            ..query
-        };
-        assert!(owner.receive_state(foreign, 2, |_| panic!()).is_none());
-        // Surface traffic competes for exactly the same fixed read-path capacity.
-        let mut mixed = Forwarder::new(2, NET);
-        mixed.receive_state(query, 0, |_| panic!()).unwrap();
-        for id in 8..8 + READ_PATHS as u16 {
-            let q = Message {
-                content: Content::ReadSurface {
-                    network: NET,
-                    read: SurfaceRead {
-                        request: id,
-                        ..surface_read
-                    },
-                    remaining: 8,
-                },
-                ..query
-            };
-            mixed
-                .receive_surface(q, &description, &mut part, u32::from(id))
-                .unwrap();
-        }
-        assert!(
-            mixed.receive_state(reply, 20, |_| panic!()).is_none(),
-            "evicted state path retained a shadow entry"
-        );
-    }
-
-    #[test]
-    fn control_paths_and_deltas_have_bounded_scope_and_expiring_history() {
-        let network = Network {
-            founder: 9,
-            channel: 15,
-        };
-        let mut relay = Forwarder::new(2, network);
-        let call = Invocation {
-            caller: 1,
-            owner: 4,
-            request: 1,
-            transformer: 42,
-        };
-        let request = Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 1,
-            destination: Some(2),
-            content: Content::Invoke {
-                copies: 1,
-                network,
-                call,
-                remaining: MAX_HOPS,
-                arguments: &[0],
-            },
-        };
-        let response = Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 3,
-            destination: Some(2),
-            content: Content::InvocationResult {
-                network,
-                call,
-                status: InvokeStatus::Invoked,
-                hops: 2,
-            },
-        };
-        assert!(relay.receive_control(response, 0, |_, _| panic!())[0].is_none());
-        let out = relay.receive_control(request, 0, |_, _| panic!())[0].unwrap();
-        assert_eq!(out.destination, None);
-        assert!(matches!(out.content, Content::Invoke { remaining: 7, .. }));
-        assert!(relay.receive_control(
-            Message {
-                source: 3,
-                content: Content::Invoke {
-                    network,
-                    call,
-                    remaining: 6,
-                    copies: 1,
-                    arguments: &[0]
-                },
-                ..request
             },
             1,
-            |_, _| panic!()
-        )[0]
-        .is_none());
-        assert!(relay.receive_control(
-            Message {
-                source: 1,
-                ..response
-            },
-            2,
-            |_, _| panic!()
-        )[0]
-        .is_none());
-        let reply = relay.receive_control(response, 3, |_, _| panic!())[0].unwrap();
-        assert!(matches!(
-            reply.content,
-            Content::InvocationResult { hops: 3, .. }
-        ));
-        let next = Message {
-            content: Content::Invoke {
-                copies: 1,
-                network,
-                call: Invocation { request: 2, ..call },
-                remaining: MAX_HOPS,
-                arguments: &[0],
-            },
-            ..request
-        };
-        let directed = relay.receive_control(next, 4, |_, _| panic!())[0].unwrap();
-        assert_eq!(directed.destination, Some(3));
-        // A reply from an unrelated neighbor cannot settle a directed request.
-        let wrong = Message {
-            source: 5,
-            content: Content::InvocationResult {
-                network,
-                call: Invocation { request: 2, ..call },
+        );
+        let result = envelope(
+            Content::InvocationResult {
+                network: NET,
+                call: CALL,
                 status: InvokeStatus::Invoked,
                 hops: 2,
             },
-            ..response
-        };
-        assert!(relay.receive_control(wrong, 5, |_, _| panic!())[0].is_none());
-        relay.expire(READ_MS + 4);
-        assert_eq!(
-            relay.receive_control(next, READ_MS + 5, |_, _| panic!())[0]
-                .unwrap()
-                .destination,
-            None
+            3,
         );
-        let exhausted = Message {
-            content: Content::Invoke {
-                copies: 1,
-                network,
-                call: Invocation { request: 3, ..call },
-                remaining: 1,
-                arguments: &[0],
-            },
-            ..request
-        };
-        assert!(relay.receive_control(exhausted, READ_MS + 6, |_, _| panic!())[0].is_none());
-        let other = Network {
-            founder: 10,
-            ..network
-        };
-        assert!(relay.receive_control(
-            Message {
-                content: Content::Invoke {
+        let mut node = Forwarder::new(2, NET);
+        node.learn(4, 3, 2, 0, TimePerByte::UNKNOWN);
+        node.learn(4, 5, 2, 0, TimePerByte::UNKNOWN);
+        node.receive_control(request, 0, |_, _| panic!());
+        for (source, remaining, args, joined) in [
+            (7, 7, &[0][..], false),
+            (3, 8, &[0][..], false),
+            (6, 8, &[1][..], false),
+            (6, 8, &[0][..], true),
+            (7, 8, &[0][..], false),
+        ] {
+            let incoming = envelope(
+                Content::Invoke {
+                    network: NET,
+                    call: CALL,
+                    remaining,
                     copies: 1,
-                    network: other,
-                    call,
-                    remaining: 8,
-                    arguments: &[0]
+                    arguments: args,
                 },
-                ..request
+                source,
+            );
+            assert_eq!(
+                node.receive_control(incoming, 1, |_, _| panic!()),
+                [None; 2]
+            );
+            assert_eq!(node.calls[0].previous.contains(&source), joined);
+        }
+        for bad in [
+            Message {
+                source: 1,
+                ..result
             },
-            READ_MS + 7,
-            |_, _| panic!()
-        )[0]
-        .is_none());
-        let change = Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 4,
-            destination: None,
-            content: Content::StateChanged {
-                network,
-                delta: StateChange {
-                    owner: 4,
-                    attribute: 42,
-                    sequence: 1,
-                    value: None,
-                },
-                hops: MAX_HOPS,
+            Message {
+                source: 7,
+                ..result
             },
-        };
-        assert!(relay
-            .receive_change(change, 0, |_| panic!("hop budget exhausted"))
-            .is_some());
-        assert!(relay.receive_change(change, 1, |_| panic!()).is_none());
-        assert!(relay
-            .receive_change(change, READ_MS, |_| panic!())
-            .is_some());
-        // Sequence identity belongs to the owner, not its value or incoming neighbor.
-        let newer = Message {
-            source: 3,
-            content: Content::StateChanged {
-                network,
-                delta: StateChange {
-                    owner: 4,
-                    attribute: 42,
-                    sequence: 2,
-                    value: None,
+            envelope(
+                Content::InvocationResult {
+                    network: NET,
+                    call: Invocation {
+                        transformer: 43,
+                        ..CALL
+                    },
+                    status: InvokeStatus::Invoked,
+                    hops: 2,
                 },
+                3,
+            ),
+            envelope(
+                Content::InvocationResult {
+                    network: NET,
+                    call: CALL,
+                    status: InvokeStatus::Invoked,
+                    hops: MAX_HOPS,
+                },
+                3,
+            ),
+        ] {
+            assert_eq!(node.receive_control(bad, 2, |_, _| panic!()), [None; 2]);
+        }
+        let returned = node.receive_control(result, 3, |_, _| panic!());
+        assert_eq!(
+            returned.map(|r| r.map(|m| m.destination)),
+            [Some(Some(1)), Some(Some(6))]
+        );
+        assert_eq!(node.receive_control(result, 4, |_, _| panic!()), [None; 2]);
+        assert!(node.receive_control(request, 5, |_, _| panic!())[0].is_some());
+        let conflict = envelope(
+            Content::InvocationResult {
+                network: NET,
+                call: CALL,
+                status: InvokeStatus::Busy,
                 hops: 2,
             },
-            ..change
-        };
-        let mut sent = 0;
-        assert!(relay
-            .receive_change(newer, READ_MS + 1, |_| sent += 1)
-            .is_some());
-        assert_eq!(sent, 1);
-        assert!(relay
-            .receive_change(Message { source: 5, ..newer }, READ_MS + 2, |_| panic!())
-            .is_none());
-    }
-
-    #[test]
-    fn exploration_returns_ranges_and_learns_directions_through_two_relays() {
-        let mut nodes = [
-            Forwarder::new(2, NET),
-            Forwarder::new(3, NET),
-            Forwarder::new(4, NET),
-        ];
-        let links = [(1, 2), (2, 3), (3, 4)];
-        let description = Description::new(&SURFACE).unwrap();
-        let mut expected = self::std::vec![0; description.len() as usize];
-        description.encode_part(0, &mut expected);
-        let mut received = Vec::new();
-        let mut request = 0;
-        while received.len() < expected.len() {
-            let (bytes, reads, _) = exchange(
-                &mut nodes,
-                &links,
-                query(request, received.len() as u16),
-                100 + u32::from(request),
-            );
-            if request == 0 {
-                assert_eq!(reads, [(2, None), (3, None)]);
-            } else {
-                assert_eq!(reads, [(2, Some(3)), (3, Some(4))]);
-            }
-            assert!(!bytes.is_empty());
-            received.extend_from_slice(&bytes);
-            request += 1;
-        }
-        assert_eq!(received, expected);
-        // A lost response can be recovered with a fresh request for the same range.
+            5,
+        );
         assert_eq!(
-            exchange(&mut nodes, &links, query(request, 0), 200).0,
-            expected[..SURFACE_BYTES]
+            node.receive_control(conflict, 6, |_, _| panic!()),
+            [None; 2]
         );
-    }
-
-    #[test]
-    fn duplicate_paths_and_cycles_do_not_amplify_one_read() {
-        let mut nodes = [
-            Forwarder::new(2, NET),
-            Forwarder::new(3, NET),
-            Forwarder::new(4, NET),
-        ];
-        let links = [(1, 2), (1, 3), (2, 3), (2, 4), (3, 4)];
-        let (bytes, reads, _) = exchange(&mut nodes, &links, query(9, 0), 10);
-        assert_eq!(bytes.len(), SURFACE_BYTES);
-        assert_eq!(reads.len(), 2);
-        assert!(exchange(&mut nodes, &links, query(9, 0), 11).0.is_empty());
-        assert_eq!(exchange(&mut nodes, &links, query(10, 0), 12).0, bytes);
-    }
-
-    #[test]
-    fn discovery_finds_multiple_owners_then_reads_beyond_direct_range() {
-        let mut nodes = [
-            Forwarder::new(1, NET),
-            Forwarder::new(2, NET),
-            Forwarder::new(3, NET),
-            Forwarder::new(4, NET),
-        ];
-        let description = Description::new(&SURFACE).unwrap();
-        let links = [(1, 2), (2, 3), (3, 4)];
-        let find = nodes[0].find_owners(42, 100);
-        let (bytes, reads, observed) = exchange(&mut nodes, &links, find, 101);
-        assert!(
-            bytes.is_empty() && reads.is_empty(),
-            "discovery must not publish surfaces"
-        );
-        let mut owners: Vec<_> = observed
-            .iter()
-            .filter(|(local, _)| *local == 1)
-            .map(|(_, o)| *o)
-            .collect();
-        owners.sort_by_key(|o| o.address);
+        node.expire(READ_MS);
         assert_eq!(
-            owners.iter().map(|o| o.address).collect::<Vec<_>>(),
-            [2, 3, 4]
+            node.next_hops(4, 1, 8),
+            [3, 0],
+            "only the unanswered direction expires"
         );
-        assert!(owners.iter().all(|o| o.surface_bytes == description.len()));
-        assert_eq!(nodes[0].next_hop(4, 0, MAX_HOPS).unwrap(), 2);
-        // The known owner and directions came from discovery, not test setup.
-        let mut read = query(43, 0);
-        read.destination = Some(nodes[0].next_hop(4, 0, MAX_HOPS).unwrap());
-        let (bytes, reads, _) = exchange(&mut nodes, &links, read, 102);
-        assert_eq!(bytes.len(), SURFACE_BYTES);
-        assert_eq!(reads, [(2, Some(3)), (3, Some(4))]);
-    }
-
-    #[test]
-    fn arrivals_cross_relays_once_without_triggering_surface_or_discovery_responses() {
-        let mut nodes = [
-            Forwarder::new(1, NET),
-            Forwarder::new(2, NET),
-            Forwarder::new(3, NET),
-            Forwarder::new(4, NET),
-        ];
-        let description = Description::new(&SURFACE).unwrap();
-        let links = [(1, 2), (1, 3), (2, 3), (2, 4), (3, 4)];
-        let arrival = nodes[3].announce(17, description.len(), 100);
-        let (bytes, reads, observed) = exchange(&mut nodes, &links, arrival, 101);
-        assert!(bytes.is_empty() && reads.is_empty());
-        assert_eq!(observed.len(), 3);
-        assert!(observed.iter().all(|(_, o)| o.address == 4));
-        assert!(
-            nodes.iter().all(|n| n.routes.iter().all(|r| r.owner == 0)),
-            "an announcement is not proof of a return path"
-        );
-        assert!(exchange(&mut nodes, &links, arrival, 102).2.is_empty());
-        let fresh = nodes[3].announce(18, description.len(), 103);
-        assert_eq!(exchange(&mut nodes, &links, fresh, 104).2.len(), 3);
-    }
-
-    #[test]
-    fn cyclic_discovery_suppresses_duplicates_per_owner_not_per_query() {
-        let mut nodes = [
-            Forwarder::new(1, NET),
-            Forwarder::new(2, NET),
-            Forwarder::new(3, NET),
-            Forwarder::new(4, NET),
-        ];
-        let links = [(1, 2), (1, 3), (2, 3), (2, 4), (3, 4)];
-        let find = nodes[0].find_owners(7, 1);
-        let owners = exchange(&mut nodes, &links, find, 2).2;
-        assert_eq!(owners.iter().filter(|(local, _)| *local == 1).count(), 3);
-        assert!(exchange(&mut nodes, &links, find, 3).2.is_empty());
-        let find = nodes[0].find_owners(8, 4);
-        assert_eq!(
-            exchange(&mut nodes, &links, find, 5)
-                .2
-                .iter()
-                .filter(|(local, _)| *local == 1)
-                .count(),
-            3
-        );
-    }
-
-    #[test]
-    fn owner_replies_require_a_live_query_and_history_has_bounded_eviction() {
-        let mut node = Forwarder::new(1, NET);
-        let owner = SurfaceOwner {
-            address: 4,
-            surface_bytes: 195,
-        };
-        let found = |request| Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 2,
-            destination: Some(1),
-            content: Content::OwnerFound {
-                network: NET,
-                seeker: 1,
-                request,
-                owner,
-                hops: 3,
-            },
-        };
-        assert!(node
-            .receive_discovery(found(0), 13, 0, |_| panic!())
-            .is_none());
-        for request in 0..=DISCOVERY_PATHS as u16 {
-            node.find_owners(request, 1 + u32::from(request));
-        }
-        assert!(node
-            .receive_discovery(found(0), 13, 10, |_| panic!())
-            .is_none());
-        assert!(node.routes.iter().all(|r| r.owner == 0));
-        assert_eq!(
-            node.receive_discovery(found(DISCOVERY_PATHS as u16), 13, 10, |_| panic!()),
-            Some(owner)
-        );
-        assert!(node
-            .receive_discovery(found(DISCOVERY_PATHS as u16), 13, 11, |_| panic!())
-            .is_none());
-        node.expire(READ_MS + 10);
-        assert!(node
-            .receive_discovery(
-                found(DISCOVERY_PATHS as u16),
-                13,
-                READ_MS + 11,
-                |_| panic!()
-            )
-            .is_none());
-        // Announcement duplicate history is bounded independently of read paths.
-        for i in 0..=OWNER_NOTICES as u16 {
-            assert!(node.notice(10 + u64::from(i), 0, i, 20 + u32::from(i)));
-        }
-        assert!(node.notice(10, 0, 0, 100));
-        assert!(!node.notice(10, 0, 0, 101));
-        let mut wrap = Forwarder::new(1, NET);
-        wrap.find_owners(99, u32::MAX - 100);
-        wrap.expire(READ_MS);
-        assert!(wrap.discovery.iter().all(|p| p.seeker == 0));
-    }
-
-    #[test]
-    fn discovery_scope_and_foreign_networks_do_not_leak_across_boundaries() {
-        let mut node = Forwarder::new(2, NET);
-        let mut sent = Vec::new();
-        let find = Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 1,
-            destination: None,
-            content: Content::FindOwners {
-                network: NET,
-                seeker: 1,
-                request: 1,
-                remaining: 1,
-            },
-        };
-        node.receive_discovery(find, 13, 0, |m| sent.push(m));
-        assert_eq!(sent.len(), 1);
-        assert!(matches!(
-            sent[0].content,
-            Content::OwnerFound {
-                owner: SurfaceOwner { address: 2, .. },
-                ..
-            }
-        ));
-        assert_eq!(sent[0].destination, Some(1));
-        let mut foreign = find;
-        if let Content::FindOwners {
-            ref mut network,
-            ref mut request,
-            ..
-        } = foreign.content
-        {
-            network.founder = 99;
-            *request = 2;
-        }
-        assert!(node
-            .receive_discovery(foreign, 13, 1, |_| panic!())
-            .is_none());
-        let owner = SurfaceOwner {
-            address: 4,
-            surface_bytes: 13,
-        };
-        let arrival = Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 3,
-            destination: None,
-            content: Content::Arrive {
-                network: NET,
-                owner,
-                sequence: 7,
-                hops: MAX_HOPS,
-            },
-        };
-        assert_eq!(
-            node.receive_discovery(arrival, 13, 2, |_| panic!()),
-            Some(owner)
-        );
-        // An owner notice can end at the hop boundary, but cannot be relayed beyond it.
-        let found = Message {
-            path_cost: TimePerByte::UNKNOWN,
-            source: 3,
-            destination: Some(2),
-            content: Content::OwnerFound {
-                network: NET,
-                seeker: 1,
-                request: 1,
-                owner,
-                hops: MAX_HOPS,
-            },
-        };
-        assert!(node.receive_discovery(found, 13, 3, |_| panic!()).is_none());
-        let mut origin = Forwarder::new(1, NET);
-        origin.find_owners(1, 0);
-        assert_eq!(
-            origin.receive_discovery(
-                Message {
-                    destination: Some(1),
-                    ..found
+        for (local, network, caller, allowed) in [
+            (4, NET, 1, true),
+            (2, NET, 2, false),
+            (4, Network { founder: 9, ..NET }, 1, false),
+        ] {
+            let mut owner = Forwarder::new(local, NET);
+            let mut invoked = false;
+            let input = envelope(
+                Content::Invoke {
+                    network,
+                    call: Invocation { caller, ..CALL },
+                    remaining: 1,
+                    copies: 1,
+                    arguments: &[0],
                 },
-                13,
-                3,
-                |_| panic!()
-            ),
-            Some(owner)
-        );
+                1,
+            );
+            owner.receive_control(input, 0, |_, _| {
+                invoked = true;
+                InvokeStatus::Invoked
+            });
+            assert_eq!(invoked, allowed);
+        }
     }
 
     #[test]
-    fn replies_require_the_original_read_and_unmatched_data_cannot_teach_routes() {
-        let description = Description::new(&SURFACE).unwrap();
-        let mut node = Forwarder::new(2, NET);
-        let mut piece = [0; SURFACE_BYTES];
-        assert!(node
-            .receive_surface(reply(1, 0), &description, &mut piece, 0)
-            .is_none());
-        node.receive_surface(query(1, 0), &description, &mut piece, 1)
-            .unwrap();
-        for (request, offset) in [(2, 0), (1, 1)] {
-            assert!(node
-                .receive_surface(reply(request, offset), &description, &mut piece, 2)
-                .is_none());
+    fn notice_scope() {
+        for network in [NET, Network { founder: 9, ..NET }] {
+            for owner in [2, 4] {
+                for hops in [MAX_HOPS - 1, MAX_HOPS] {
+                    let valid = network == NET && owner != 2;
+                    let delta = StateChange {
+                        owner,
+                        attribute: 42,
+                        sequence: 7,
+                        value: None,
+                    };
+                    let arrival = Content::Arrive {
+                        network,
+                        owner: SurfaceOwner {
+                            address: owner,
+                            surface_bytes: 13,
+                        },
+                        sequence: 7,
+                        hops,
+                    };
+                    for content in [
+                        arrival,
+                        Content::StateChanged {
+                            network,
+                            delta,
+                            hops,
+                        },
+                    ] {
+                        let mut node = Forwarder::new(2, NET);
+                        let input = envelope(content, 3);
+                        let mut sent = Vec::new();
+                        for repeated in [false, true] {
+                            let input = Message {
+                                source: if repeated { 5 } else { 3 },
+                                ..input
+                            };
+                            let accepted = match content {
+                                Content::Arrive { .. } => node
+                                    .receive_discovery(input, 13, 0, |m| sent.push(m))
+                                    .is_some(),
+                                _ => node.receive_change(input, 0, |m| sent.push(m)).is_some(),
+                            };
+                            assert_eq!(accepted, valid && !repeated);
+                        }
+                        assert_eq!(sent.len(), usize::from(valid && hops < MAX_HOPS));
+                        assert!(node.routes.iter().all(|r| r.owner == 0));
+                        if let Some(out) = sent.first() {
+                            assert!(
+                                matches!(out.content, Content::Arrive { hops: h, .. } | Content::StateChanged { hops: h, .. } if h == hops + 1)
+                            );
+                            assert_eq!(out.destination, None);
+                        }
+                    }
+                }
+            }
         }
-        assert!(node.routes.iter().all(|r| r.owner == 0));
-        let out = node
-            .receive_surface(reply(1, 0), &description, &mut piece, 3)
-            .unwrap();
-        assert_eq!(out.destination, Some(1));
-        assert!(node
-            .receive_surface(reply(1, 0), &description, &mut piece, 4)
-            .is_none());
-        assert_eq!(node.routes.iter().filter(|r| r.owner != 0).count(), 1);
-        let mut bad = query(3, 0);
-        if let Content::ReadSurface {
-            ref mut network, ..
-        } = bad.content
-        {
-            network.founder = 99;
-        }
-        assert!(node
-            .receive_surface(bad, &description, &mut piece, 5)
-            .is_none());
     }
 
     #[test]
-    fn hop_limits_owner_bounds_and_read_path_eviction_are_local() {
-        assert!(core::mem::size_of::<Forwarder>() <= 2464);
-        let description = Description::new(&SURFACE).unwrap();
-        let mut relay = Forwarder::new(2, NET);
-        let mut owner = Forwarder::new(4, NET);
-        let mut piece = [0; SURFACE_BYTES];
-        let mut last = query(1, 0);
-        if let Content::ReadSurface {
-            ref mut remaining, ..
-        } = last.content
-        {
-            *remaining = 1;
+    fn discovery_scope() {
+        for network in [NET, Network { founder: 9, ..NET }] {
+            for seeker in [1, 2] {
+                for remaining in [1, 2, MAX_HOPS] {
+                    let mut node = Forwarder::new(2, NET);
+                    let mut sent = Vec::new();
+                    let find = envelope(
+                        Content::FindOwners {
+                            network,
+                            seeker,
+                            request: 7,
+                            remaining,
+                        },
+                        1,
+                    );
+                    node.receive_discovery(find, 13, 0, |m| sent.push(m));
+                    node.receive_discovery(find, 13, 1, |_| panic!("duplicate query forwarded"));
+                    let valid = network == NET && seeker != 2;
+                    assert_eq!(
+                        sent.len(),
+                        if valid {
+                            1 + usize::from(remaining > 1)
+                        } else {
+                            0
+                        }
+                    );
+                    if valid {
+                        assert_eq!(sent[0].destination, Some(1));
+                        assert!(matches!(
+                            sent[0].content,
+                            Content::OwnerFound {
+                                owner: SurfaceOwner {
+                                    address: 2,
+                                    surface_bytes: 13
+                                },
+                                ..
+                            }
+                        ));
+                        if sent.len() == 2 {
+                            assert!(
+                                matches!(sent[1].content, Content::FindOwners { remaining: r, .. } if r == remaining - 1)
+                            );
+                        }
+                    }
+                }
+            }
         }
-        assert!(relay
-            .receive_surface(last, &description, &mut piece, 0)
-            .is_none());
-        assert!(owner
-            .receive_surface(last, &description, &mut piece, 0)
-            .is_some());
-        assert!(owner
-            .receive_surface(query(2, description.len() + 1), &description, &mut piece, 0)
-            .is_none());
-        let eof = owner
-            .receive_surface(query(3, description.len()), &description, &mut piece, 0)
-            .unwrap();
-        assert!(matches!(
-            eof.content,
-            Content::SurfacePart { bytes: [], .. }
-        ));
-        for request in 0..=READ_PATHS as u16 {
-            relay.receive_surface(
-                query(request, 0),
-                &description,
-                &mut piece,
-                u32::from(request),
+        for (seeker, request, source, hops, valid) in [
+            (1, 7, 3, 2, true),
+            (1, 8, 3, 2, false),
+            (1, 7, 1, 2, false),
+            (1, 7, 3, MAX_HOPS, false),
+            (2, 7, 3, MAX_HOPS, true),
+        ] {
+            let mut node = Forwarder::new(2, NET);
+            node.remember_discovery(seeker, 7, if seeker == 2 { 2 } else { 1 }, 0);
+            for owner in [4, 5] {
+                let found = envelope(
+                    Content::OwnerFound {
+                        network: NET,
+                        seeker,
+                        request,
+                        owner: SurfaceOwner {
+                            address: owner,
+                            surface_bytes: 13,
+                        },
+                        hops,
+                    },
+                    source,
+                );
+                let mut sent = Vec::new();
+                assert_eq!(
+                    node.receive_discovery(found, 13, 1, |m| sent.push(m))
+                        .is_some(),
+                    valid
+                );
+                assert_eq!(sent.len(), usize::from(valid && seeker != 2));
+                assert!(node.receive_discovery(found, 13, 2, |_| panic!()).is_none());
+            }
+            assert_eq!(
+                node.routes.iter().filter(|r| r.owner != 0).count(),
+                if valid { 2 } else { 0 }
             );
         }
-        assert!(relay
-            .receive_surface(reply(0, 0), &description, &mut piece, 100)
-            .is_none());
-        assert!(relay
-            .receive_surface(reply(READ_PATHS as u16, 0), &description, &mut piece, 100)
-            .is_some());
     }
 
     #[test]
-    fn failure_and_expiry_restore_exploration_without_erasing_new_success() {
-        let description = Description::new(&SURFACE).unwrap();
+    fn storage_bounds() {
         let mut node = Forwarder::new(2, NET);
-        let mut piece = [0; SURFACE_BYTES];
-        node.learn(4, 3, 2, 0, TimePerByte::measured(1, 1));
-        let out = node
-            .receive_surface(query(1, 0), &description, &mut piece, 1)
-            .unwrap();
-        assert_eq!(out.destination, Some(3));
-        node.transmit_failed(&out);
-        assert_eq!(
-            node.receive_surface(query(2, 0), &description, &mut piece, 2)
-                .unwrap()
-                .destination,
-            None
-        );
-        node.receive_surface(reply(2, 0), &description, &mut piece, 3)
-            .unwrap();
-        node.receive_surface(query(3, 0), &description, &mut piece, 4)
-            .unwrap(); // no response
-        node.expire(READ_MS + 4);
-        assert_eq!(
-            node.receive_surface(query(4, 0), &description, &mut piece, READ_MS + 5)
-                .unwrap()
-                .destination,
-            None
-        );
-        node.receive_surface(reply(4, 0), &description, &mut piece, READ_MS + 6)
-            .unwrap();
-        node.receive_surface(query(5, 0), &description, &mut piece, READ_MS + 7)
-            .unwrap();
-        node.receive_surface(query(6, 0), &description, &mut piece, READ_MS + 8)
-            .unwrap();
-        node.receive_surface(reply(6, 0), &description, &mut piece, READ_MS + 9)
-            .unwrap();
-        node.expire(2 * READ_MS + 7);
-        assert_eq!(
-            node.receive_surface(query(7, 0), &description, &mut piece, 2 * READ_MS + 8)
-                .unwrap()
-                .destination,
-            Some(3)
-        );
-        let mut wrap = Forwarder::new(2, NET);
-        wrap.learn(4, 3, 2, u32::MAX - 100, TimePerByte::measured(1, 1));
-        wrap.receive_surface(query(1, 0), &description, &mut piece, u32::MAX - 99)
-            .unwrap();
-        wrap.expire(READ_MS);
-        assert_eq!(
-            wrap.receive_surface(query(2, 0), &description, &mut piece, READ_MS + 1)
-                .unwrap()
-                .destination,
-            None
-        );
-        for (i, owner) in (4..8).enumerate() {
-            node.learn(owner, 3, 2, 100 + i as u32, TimePerByte::measured(1, 1));
+        for i in 1..=READ_PATHS
+            .max(CALL_PATHS)
+            .max(OWNER_NOTICES)
+            .max(CHANGE_NOTICES)
+            .max(DISCOVERY_PATHS)
+            .max(ROUTES)
+            + 1
+        {
+            let owner = i as u64 + 10;
+            let now = i as u32;
+            node.remember_read(reads(1, owner, i as u16)[i % 4], 1, 0, false, now);
+            node.remember_call(
+                Invocation {
+                    request: i as u32,
+                    ..CALL
+                },
+                &[0],
+                1,
+                [0; 2],
+                8,
+                now,
+            );
+            node.remember_discovery(1, i as u16, 1, now);
+            node.notice(owner, 1, 1, now);
+            node.change_seen(owner, 1, now);
+            node.learn(owner, 3, 2, now, TimePerByte::UNKNOWN);
+            for (count, capacity) in [
+                (
+                    node.reads.iter().filter(|r| r.read.reader() != 0).count(),
+                    READ_PATHS,
+                ),
+                (
+                    node.calls.iter().filter(|r| r.call.caller != 0).count(),
+                    CALL_PATHS,
+                ),
+                (
+                    node.discovery.iter().filter(|r| r.seeker != 0).count(),
+                    DISCOVERY_PATHS,
+                ),
+                (
+                    node.notices.iter().filter(|r| r.owner != 0).count(),
+                    OWNER_NOTICES,
+                ),
+                (
+                    node.changes.iter().filter(|r| r.owner != 0).count(),
+                    CHANGE_NOTICES,
+                ),
+                (node.routes.iter().filter(|r| r.owner != 0).count(), ROUTES),
+            ] {
+                assert_eq!(count, i.min(capacity));
+            }
+            assert_eq!(
+                node.reads.iter().any(|r| r.read.request() == 1),
+                i <= READ_PATHS
+            );
+            assert_eq!(
+                node.calls.iter().any(|r| r.call.request == 1),
+                i <= CALL_PATHS
+            );
+            assert_eq!(
+                node.discovery.iter().any(|r| r.request == 1),
+                i <= DISCOVERY_PATHS
+            );
+            assert_eq!(
+                node.notices.iter().any(|r| r.owner == 11),
+                i <= OWNER_NOTICES
+            );
+            assert_eq!(
+                node.changes.iter().any(|r| r.owner == 11),
+                i <= CHANGE_NOTICES
+            );
+            assert_eq!(node.routes.iter().any(|r| r.owner == 11), i <= ROUTES);
         }
-        assert!(node.routes.iter().all(|r| r.owner != 4));
-        node.expire(ROUTE_MS + 104);
-        assert!(node.routes.iter().all(|r| r.owner == 0));
+    }
+
+    #[test]
+    fn expiry_bounds() {
+        for start in [0, u32::MAX - 5] {
+            for elapsed in [READ_MS - 1, READ_MS, ROUTE_MS - 1, ROUTE_MS] {
+                let mut node = Forwarder::new(2, NET);
+                node.remember_read(reads(1, 4, 7)[0], 1, 0, false, start);
+                node.remember_call(CALL, &[0], 1, [0; 2], 8, start);
+                node.remember_discovery(1, 7, 1, start);
+                node.notice(4, 1, 7, start);
+                node.change_seen(4, 7, start);
+                node.learn(4, 3, 2, start, TimePerByte::UNKNOWN);
+                node.expire(start.wrapping_add(elapsed));
+                for live in [
+                    node.reads.iter().any(|r| r.read.reader() != 0),
+                    node.calls.iter().any(|r| r.call.caller != 0),
+                    node.discovery.iter().any(|r| r.seeker != 0),
+                    node.notices.iter().any(|r| r.owner != 0),
+                    node.changes.iter().any(|r| r.owner != 0),
+                ] {
+                    assert_eq!(live, elapsed < READ_MS);
+                }
+                assert_eq!(node.routes.iter().any(|r| r.owner != 0), elapsed < ROUTE_MS);
+            }
+        }
+        // An older unanswered path cannot erase a newer confirmation.
+        for confirmed in [0, 1, 2] {
+            let mut node = Forwarder::new(2, NET);
+            node.learn(4, 3, 2, confirmed, TimePerByte::UNKNOWN);
+            node.remember_read(reads(1, 4, 7)[0], 1, 3, false, 1);
+            node.expire(READ_MS + 1);
+            assert_eq!(node.next_hop(4, 1, 8), (confirmed > 1).then_some(3));
+        }
     }
 }

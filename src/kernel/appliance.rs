@@ -27,6 +27,7 @@ pub struct Appliance<A: 'static, E: 'static> {
     native: UnsafeCell<MaybeUninit<Mutex<A>>>,
     instance: AtomicPtr<()>,
     ready: AtomicU8,
+    installed: AtomicPtr<super::state::Installation<A>>,
 }
 
 // Initialization is once-only and published with release/acquire. After that,
@@ -42,6 +43,7 @@ impl<A: Send, E> Appliance<A, E> {
             native: UnsafeCell::new(MaybeUninit::uninit()),
             instance: AtomicPtr::new(ptr::null_mut()),
             ready: AtomicU8::new(0),
+            installed: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
@@ -77,7 +79,7 @@ impl<A: Send, E> Appliance<A, E> {
 
     fn native(&self) -> &Mutex<A> {
         assert_eq!(
-            self.ready.load(Ordering::Acquire),
+            self.ready.load(Ordering::Acquire) & 2,
             2,
             "initialize appliance before use"
         );
@@ -111,10 +113,109 @@ impl<A: Send, E> Appliance<A, E> {
     pub(crate) fn surface(&self) -> &'static Surface<'static, A, E> {
         self.surface
     }
+
+    /// Bind permanently resident history and an already-compiled updater before
+    /// kernel startup/publication. The predicate describes the computed result
+    /// mathematically; the kernel never interprets it. History starts empty.
+    pub fn install_state<
+        T: crate::surface::Scalar + Send,
+        U: crate::surface::Scalar + Send,
+        const N: usize,
+    >(
+        &'static self,
+        context: &TaskContext,
+        state: &'static super::state::RetainedState<A, T, U, N>,
+        update: fn(&super::state::History<T, N>) -> Option<U>,
+        definition: &'static crate::surface::Predicate<A>,
+    ) -> Result<(), super::state::InstallError> {
+        use super::state::InstallError;
+        if tasks::xTaskGetSchedulerState() != tasks::taskSCHEDULER_NOT_STARTED {
+            return Err(InstallError::Closed);
+        }
+        self.ready
+            .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|s| match s {
+                0 => InstallError::NotInitialized,
+                3 => InstallError::Closed,
+                _ => InstallError::Busy,
+            })?;
+        struct Finish<'a>(&'a AtomicU8);
+        impl Drop for Finish<'_> {
+            fn drop(&mut self) {
+                self.0.store(2, Ordering::Release);
+            }
+        }
+        let _finish = Finish(&self.ready);
+        if !self
+            .surface
+            .states
+            .iter()
+            .any(|s| ptr::eq(*s, state.source()))
+        {
+            return Err(InstallError::UnknownSource);
+        }
+        let mutex = unsafe { (*self.native.get()).assume_init_ref() };
+        let Some(guard) = mutex.try_lock(context) else {
+            return Err(InstallError::Busy);
+        };
+        let next = unsafe { self.installed.load(Ordering::Acquire).as_ref() };
+        let node = state.install(ptr::from_ref(&*guard).cast_mut(), update, definition, next)?;
+        self.installed
+            .store(ptr::from_ref(node).cast_mut(), Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn seal(&self) {
+        match self
+            .ready
+            .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) | Err(3) => {}
+            _ => panic!("initialize appliance and finish local installation before publication"),
+        }
+    }
+    pub(crate) fn installations(
+        &self,
+    ) -> impl Iterator<Item = &'static super::state::Installation<A>> + Clone {
+        let first = unsafe { self.installed.load(Ordering::Acquire).as_ref() };
+        core::iter::successors(first, |node| node.next_appliance)
+    }
+    fn state_definitions(
+        &self,
+    ) -> impl Iterator<Item = &'static crate::ir::Attribute<crate::surface::Read<A>>> {
+        self.surface
+            .states
+            .iter()
+            .copied()
+            .map(crate::surface::StateHandle::definition)
+            .chain(self.installations().flat_map(|node| node.states()))
+    }
+}
+
+impl<A: Send + 'static, E: 'static> crate::ir::Surface for Appliance<A, E> {
+    type Location = crate::surface::Read<A>;
+    fn states<'s>(&'s self) -> impl Iterator<Item = &'s crate::ir::Attribute<Self::Location>> {
+        self.state_definitions()
+            .map(|state| -> &'s crate::ir::Attribute<Self::Location> { state })
+    }
+    fn transformers(&self) -> impl Iterator<Item = &crate::ir::Operation<'_, '_, Self::Location>> {
+        self.surface.transformers.iter().map(|t| t.definition())
+    }
+    fn axioms(&self) -> impl Iterator<Item = &crate::ir::Predicate<'_, '_, Self::Location>> {
+        self.surface
+            .axioms
+            .iter()
+            .copied()
+            .chain(self.installations().map(|i| i.definition))
+    }
+    fn invariants(&self) -> impl Iterator<Item = &crate::ir::Predicate<'_, '_, Self::Location>> {
+        self.surface.invariants.iter().copied()
+    }
 }
 
 pub(crate) trait Native: Sync {
     fn ready(&self) -> bool;
+    fn seal(&self) {}
     fn owns(&self, instance: *const (), attribute: u64) -> bool;
     fn read(&self, context: &TaskContext, attribute: u64) -> StateReadResult;
     fn invoke(&self, context: &TaskContext, transformer: u64, arguments: &[Value]) -> InvokeStatus;
@@ -122,22 +223,21 @@ pub(crate) trait Native: Sync {
 
 impl<A: Send, E> Native for Appliance<A, E> {
     fn ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire) == 2
+        self.ready.load(Ordering::Acquire) & 2 == 2
+    }
+    fn seal(&self) {
+        Appliance::seal(self);
     }
     fn owns(&self, instance: *const (), attribute: u64) -> bool {
         self.instance.load(Ordering::Acquire).cast_const() == instance
             && self
-                .surface
-                .states
-                .iter()
-                .any(|s| ptr::from_ref(s.definition()) as usize as u64 == attribute)
+                .state_definitions()
+                .any(|s| ptr::from_ref(s) as usize as u64 == attribute)
     }
     fn read(&self, context: &TaskContext, attribute: u64) -> StateReadResult {
         let Some(state) = self
-            .surface
-            .states
-            .iter()
-            .find(|s| ptr::from_ref(s.definition()) as usize as u64 == attribute)
+            .state_definitions()
+            .find(|s| ptr::from_ref(*s) as usize as u64 == attribute)
         else {
             return StateReadResult::UnknownAttribute;
         };
@@ -146,7 +246,7 @@ impl<A: Send, E> Native for Appliance<A, E> {
         };
         // Hold the same mutex used for observation updates while reading the
         // value and its change watermark. A read neither registers nor drains deltas.
-        let value = state.read(&guard);
+        let value = state.location.read(&guard);
         let sequence = super::change::sequence();
         StateReadResult::Value { sequence, value }
     }
@@ -172,5 +272,173 @@ impl<A: Send, E> Native for Appliance<A, E> {
             Err(InvokeError::Arguments(_)) => InvokeStatus::Arguments,
             Err(InvokeError::Appliance(_)) => InvokeStatus::ApplianceError,
         }
+    }
+}
+
+#[cfg(all(test, feature = "port-test"))]
+mod tests {
+    extern crate std;
+    use super::*;
+    use crate::{
+        ir::{Effect, Expr},
+        observation::{self, Dependent},
+        surface::{
+            Arguments, Definition, Operation, Predicate, State, StateHandle, StateTransformer,
+            TransformerHandle,
+        },
+    };
+    type Device = [Option<bool>; 2];
+    struct Slot<const I: usize>;
+    impl<const I: usize> State for Slot<I> {
+        type Appliance = Device;
+        type Value = bool;
+        fn read(a: &Device) -> Option<bool> {
+            a[I]
+        }
+    }
+    static FIRST: StateHandle<Device> = StateHandle::new::<Slot<0>>();
+    static SECOND: StateHandle<Device> = StateHandle::new::<Slot<1>>();
+    static TRUE: Definition<Device> = Definition {
+        body: Expr::Constant(Value::boolean(true)),
+        arguments: &[],
+        inputs: &[],
+    };
+    struct Apply;
+    impl StateTransformer for Apply {
+        type Appliance = Device;
+        type Arguments = (bool,);
+        type Error = ();
+        const DEFINITION: Operation<Device> = Operation {
+            precondition: Predicate {
+                definition: &TRUE,
+                inputs: &[],
+            },
+            effect: Effect {
+                inputs: &[],
+                outputs: &[FIRST.definition()],
+                results: &[Expr::Argument(0)],
+                arguments: Self::Arguments::TYPES,
+            },
+        };
+        fn invoke(a: &mut Device, (v,): (bool,)) -> Result<(), ()> {
+            if v {
+                return Ok(());
+            } // Accepted request without an observation.
+            FIRST.update(a, |a| a[0] = Some(false));
+            Err(()) // An error must not suppress a partial physical update.
+        }
+    }
+    static APPLY: TransformerHandle<Device, ()> = TransformerHandle::new::<Apply>();
+    static SURFACE: Surface<Device, ()> = Surface {
+        states: &[&FIRST, &SECOND],
+        transformers: &[&APPLY],
+        axioms: &[],
+        invariants: &[],
+    };
+    fn reference<T>(v: &T) -> u64 {
+        ptr::from_ref(v) as usize as u64
+    }
+    fn initialize() -> (TaskContext, &'static Appliance<Device, ()>) {
+        crate::port::test_port_reset();
+        super::super::change::reset();
+        FIRST.set_dependents(None);
+        let context = unsafe { TaskContext::assume() };
+        let owner = std::boxed::Box::leak(std::boxed::Box::new(Appliance::new(&SURFACE)));
+        owner.initialize(&context, [None; 2]);
+        super::super::change::bind(owner);
+        (context, owner)
+    }
+
+    #[test]
+    fn native_admission() {
+        let (context, owner) = initialize();
+        let handle = reference(&APPLY);
+        for (target, args, expected) in [
+            (
+                0,
+                &[Value::boolean(true)][..],
+                InvokeStatus::UnknownTransformer,
+            ),
+            (handle, &[][..], InvokeStatus::Arguments),
+            (
+                handle,
+                &[Value::integer(crate::ir::Integer::U8, 1).unwrap()][..],
+                InvokeStatus::Arguments,
+            ),
+            (handle, &[Value::boolean(true)][..], InvokeStatus::Invoked),
+        ] {
+            assert_eq!(owner.invoke(&context, target, args), expected);
+            assert!(!super::super::change::pending());
+            assert_eq!(
+                owner.read(&context, reference(FIRST.definition())),
+                StateReadResult::Value {
+                    sequence: 0,
+                    value: None
+                }
+            );
+        }
+        owner.with(&context, |_| {
+            assert_eq!(
+                owner.invoke(&context, handle, &[Value::boolean(true)]),
+                InvokeStatus::Busy
+            );
+            assert_eq!(
+                owner.read(&context, reference(FIRST.definition())),
+                StateReadResult::Busy
+            );
+        });
+        for target in [0, handle, reference(&Slot::<0>)] {
+            assert_eq!(
+                owner.read(&context, target),
+                StateReadResult::UnknownAttribute
+            );
+        }
+        assert_eq!(
+            owner.invoke(&context, handle, &[Value::boolean(false)]),
+            InvokeStatus::ApplianceError
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                owner.read(&context, reference(FIRST.definition())),
+                StateReadResult::Value {
+                    sequence: 1,
+                    value: Some(Value::boolean(false))
+                }
+            );
+        }
+        let delta = super::super::change::take().unwrap();
+        assert_eq!(
+            (delta.sequence, delta.value),
+            (1, Some(Value::boolean(false)))
+        );
+        assert!(!super::super::change::pending());
+        super::super::change::reset();
+    }
+
+    #[test]
+    fn report_order() {
+        let (context, owner) = initialize();
+        static NEXT: Dependent<Device> = Dependent {
+            activate: |a, _, _| SECOND.update(a, |a| a[1] = Some(false)),
+            next: None,
+        };
+        FIRST.set_dependents(Some(&NEXT));
+        owner.with(&context, |a| {
+            observation::update(a, &[&FIRST, &SECOND], |a| *a = [Some(true); 2])
+        });
+        for (sequence, attribute, value) in [
+            (1, FIRST.definition(), true),
+            (2, SECOND.definition(), true),
+            (3, SECOND.definition(), false),
+        ] {
+            let delta = super::super::change::take().unwrap();
+            assert_eq!(
+                (delta.sequence, delta.attribute, delta.value),
+                (sequence, reference(attribute), Some(Value::boolean(value)))
+            );
+        }
+        assert!(!super::super::change::pending());
+        FIRST.set_dependents(None);
+        super::super::change::reset();
     }
 }

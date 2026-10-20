@@ -208,15 +208,19 @@ records, four call paths with two-way branch bookkeeping, and eight delta duplic
 invocation history has a 768-byte ceiling. Appliance and transport storage are
 static; argument decoding uses bounded stack storage. No allocator is enabled.
 
-Host checks cover native signature/reference rejection, mutex contention, exact
-command replay, changed-token content rejection, delayed observations, errors
-after physical changes, grouped-report ordering, instance filtering, unavailable
-values, hard eviction, relayed results/deltas, scope/expiry, and numeric wire bounds.
-State-read checks also cover unavailable/busy/unknown results, delayed replies versus newer deltas, two-relay delivery, shared-path
-correlation/eviction, and preserving pending changes. Multipath checks cover
-normalized-cost ordering, independent failure/expiry, split-budget conservation, reconvergence,
-a late second copy, and a lost branch using encoded frames and the native fixture.
-They prove single invocation while its result remains retained; they do not extend
-that guarantee across owner-history eviction or reboot.
+Component checks are owned by the code whose properties they constrain:
+
+| Owner | Boundaries checked |
+| --- | --- |
+| `peer::invocation` | Exact replay key/payload, argument admission, retained result and oldest eviction |
+| `appliance` | Native signature/reference admission, mutex contention, reads without delta consumption, partial mutations and grouped report order |
+| `change` | Instance/reference filtering, FIFO capacity, sequence wrap and hard eviction |
+| `peer::forwarding` | Read correlation, hop and copy budgets, incoming direction limits, normalized route ranking, expiry and bounded duplicate history |
+| `peer::host` | Session correlation, timeout without retry, result preservation, reply/event separation and bounded event loss |
+| `frame` and `wire` | Numeric encoding and frame-size/field bounds |
+
+Tables partition these local boundaries without simulating several peers or
+reimplementing appliance behavior. Replay checks apply while the result remains
+retained; they do not extend that guarantee across history eviction or reboot.
 Ordinary and observer C6/nRF images build. These are host/build checks: this new
 path has not been exercised on boards, and RF investigation remains paused.

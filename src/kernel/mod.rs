@@ -42,6 +42,8 @@ pub mod update;
 pub use peer::host;
 pub mod queue;
 pub mod radio;
+#[cfg(feature = "use-mutexes")]
+pub mod state;
 #[cfg(feature = "stream-buffers")]
 pub mod stream_buffer;
 pub mod tasks;
@@ -53,6 +55,8 @@ pub mod timers;
 /// The resident radio enters common peer discovery. Appliance code supplies no
 /// channel, PAN, discovery loop, or diagnostic workload.
 /// `appliance` owns the initialized native instance and borrows its static surface.
+/// Complete local retained-state installation first; startup seals and exposes
+/// the combined native and installed definitions.
 /// The resident task serves definitions, invokes exposed native transformers,
 /// and sends registered observation deltas. Relays retain bounded directions and
 /// duplicate history, never foreign surfaces or an appliance-state mirror.
@@ -66,7 +70,7 @@ pub fn start<A: Send + 'static, E: 'static>(
     radio: crate::port::RadioPeripheral,
     appliance: &'static Appliance<A, E>,
 ) -> ! {
-    let description = peer::exposure::Description::new(appliance.surface())
+    let description = peer::exposure::Description::with_installed(appliance)
         .expect("surface exceeds description limits");
     change::bind(appliance);
     radio::start(&context, radio, description, appliance);
@@ -91,7 +95,7 @@ pub fn start_with_updates<A: Send + 'static, E: 'static>(
 ) -> ! {
     assert_eq!(
         policy.surface,
-        update::surface_identity(appliance.surface()),
+        update::appliance_surface_identity(appliance),
         "release policy does not match the exposed surface"
     );
     update::runtime::initialize(storage, policy);

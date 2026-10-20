@@ -50,14 +50,33 @@ pub trait Storage {
 /// expanding this shared format to other page sizes requires an explicit revision.
 pub const PAGE_BYTES: u32 = 4096;
 
-/// Fingerprint the actual exposed definitions, including their local handles.
+/// Fingerprint the supplied firmware definitions, including their local handles.
 /// Packaging must preserve this surface in the candidate for this initial ABI.
+/// Appliances with installed state must use `appliance_surface_identity` to
+/// include that state in the fingerprint checked at startup.
 pub fn surface_identity<A: 'static, E: 'static>(
     surface: &'static crate::surface::Surface<'static, A, E>,
 ) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
     let description =
         crate::kernel::peer::exposure::Description::new(surface).expect("invalid update surface");
+    description_identity(description)
+}
+
+/// Fingerprint the complete appliance surface, including locally installed state.
+/// This seals installation, just like starting publication. Use after all local
+/// installations when preparing a release policy for that appliance.
+#[cfg(feature = "use-mutexes")]
+pub fn appliance_surface_identity<A: Send + 'static, E: 'static>(
+    appliance: &'static super::Appliance<A, E>,
+) -> [u8; 32] {
+    description_identity(
+        crate::kernel::peer::exposure::Description::with_installed(appliance)
+            .expect("invalid update surface"),
+    )
+}
+
+fn description_identity(description: crate::kernel::peer::exposure::Description) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     let mut part = [0; 64];
     let mut offset = 0;

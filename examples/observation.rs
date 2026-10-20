@@ -3,7 +3,7 @@
 
 use lattice_vertex::{
     ir::{Effect, Expr, Value},
-    observation::Dependent,
+    observation::{Dependent, Transition},
     surface::{
         Arguments, Definition, Operation, Predicate, State, StateHandle, StateTransformer,
         TransformerHandle,
@@ -68,13 +68,13 @@ static SET_OUTPUT: TransformerHandle<Panel, core::convert::Infallible> =
 
 // These native callbacks stand in for installed, target-compiled activation
 // fragments. There is no IR interpretation, synthesized code, or transport here.
-fn contact_activation(a: &mut Panel, _: &StateHandle<Panel>) {
-    if let Some(value) = CONTACT.read(a) {
+fn contact_activation(a: &mut Panel, _: &StateHandle<Panel>, transition: Transition) {
+    if let Some(value) = transition.after {
         SET_OUTPUT.invoke(a, &[value]).unwrap();
     }
 }
-fn output_activation(a: &mut Panel, state: &StateHandle<Panel>) {
-    println!("Output observation changed: {:?}", state.read(a));
+fn output_activation(_: &mut Panel, _: &StateHandle<Panel>, transition: Transition) {
+    println!("Output observation changed: {:?}", transition.after);
 }
 static CONTACT_HEAD: Dependent<Panel> = Dependent {
     activate: contact_activation,

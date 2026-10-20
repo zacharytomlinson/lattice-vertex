@@ -56,6 +56,29 @@ Memory efficiency and readability are both requirements.
   Keep only the hooks used by maintained kernel checks. Generic tests/examples must
   not require unrelated appliance firmware repositories.
 
+## Kernel tests
+
+- Enforce component properties and prescribed bounds: capacity, valid domains,
+  ownership, ordering, encoding, and state-transition constraints. Name the
+  property being checked, not a story about using the component.
+- Express equivalent input partitions and boundary values as tables under one
+  focused assertion path. Add a case to its owner instead of a new scenario test.
+- Keep setup smaller than the property being checked. Do not recreate an
+  appliance, peer network, or application workflow to test a local invariant.
+  A table of scripts is still a scenario harness.
+- Give each invariant one test owner. Remove redundant checks and cross-component
+  test-fixture dependencies; hardware integration checks stay beside their ports.
+- Review tests for abstraction, duplication and scope with the same standards as
+  runtime code. Test count and line count are not evidence of useful coverage.
+- A test-to-operational-code ratio above **2:1 requires explicit substantiation**
+  of the distinct properties and boundary partitions that need that volume.
+  Approaching **3:1 triggers a structural review**; assume duplication or misplaced
+  responsibility until the evidence shows otherwise. Measure within the owning
+  component, include test helpers/fixtures, and use consistently formatted source
+  lines on both sides. Do not dilute the ratio with unrelated kernel code or
+  move helpers elsewhere to hide their cost. A ratio below 2:1 does not excuse
+  weak test design.
+
 ## Review after each meaningful change
 
 Use the [implementation map](docs/KERNEL_DIRECTION.md#implementation-map) as a

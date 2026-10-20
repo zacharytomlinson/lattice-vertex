@@ -1,10 +1,11 @@
 //! Register local observation changes and activate their resident dependents.
 //!
 //! Dependency links live with the state they depend on. Activation is immediate
-//! in the caller's context; there is no graph work queue, polling task, retained
-//! observation cache, or IR interpreter. A callback represents a compiled local
-//! activation entrypoint. Bound appliance changes also enter the kernel's fixed
-//! outgoing delta ring. Loadable fragment installation remains separate work;
+//! in the caller's context; there is no graph work queue, polling task, or IR
+//! interpreter. The kernel updates installed history and computed state before
+//! running native dependents, using this report's captured values. A callback
+//! represents a compiled local activation entrypoint. Bound appliance changes
+//! also enter the kernel's fixed outgoing delta ring. Loadable fragment installation remains separate work;
 //! this local list is not its wire format or final executable ABI.
 //! The resident pointer is only local fanout-list linkage. It is not a DAG entry
 //! reference, an upstream peer reference, or a distributed continuation.
@@ -16,16 +17,35 @@ use core::{
     sync::atomic::{AtomicPtr, Ordering},
 };
 
-use crate::surface::StateHandle;
+use crate::{ir::Value, surface::StateHandle};
+
+/// Whether the report captured the value before its update. An unavailable
+/// captured value is different from a report with no before-value at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Previous {
+    /// The caller explicitly reported a change without a before-value.
+    Unknown,
+    /// Value captured before applying the report, possibly unavailable.
+    Captured(Option<Value>),
+}
+
+/// The values belonging to one registered change, preserved across callbacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Transition {
+    /// Captured pre-update value, or an explicit absence of that information.
+    pub before: Previous,
+    /// Captured post-update value, possibly unavailable.
+    pub after: Option<Value>,
+}
 
 /// One resident local activation binding for a state, with its next sibling link.
 ///
 /// Links are immutable and statically resident. Installation code supplies an
-/// acyclic list in dispatch order. The callback reads current appliance state
-/// when reached; it receives the originating state handle, not cached values.
+/// acyclic list in dispatch order. Each callback receives the captured transition
+/// even if an earlier callback has already changed the appliance again.
 pub struct Dependent<Appliance: 'static> {
     /// Compiled/native activation entrypoint. It returns without a graph result.
-    pub activate: fn(&mut Appliance, &StateHandle<Appliance>),
+    pub activate: fn(&mut Appliance, &StateHandle<Appliance>, Transition),
     /// The next local dependent of this state, not the next edge of a DAG traversal.
     pub next: Option<&'static Self>,
 }
@@ -47,7 +67,12 @@ impl<Appliance: 'static> Dependents<Appliance> {
         self.first.store(first, Ordering::Release);
     }
 
-    pub(crate) fn dispatch(&self, appliance: &mut Appliance, source: &StateHandle<Appliance>) {
+    pub(crate) fn dispatch(
+        &self,
+        appliance: &mut Appliance,
+        source: &StateHandle<Appliance>,
+        transition: Transition,
+    ) {
         let first = self.first.load(Ordering::Acquire);
         // SAFETY: the private atomic is either null or was installed from an
         // immutable 'static reference by set(). Replacement never frees a link.
@@ -55,7 +80,7 @@ impl<Appliance: 'static> Dependents<Appliance> {
         // every callback even if a callback installs another list for future deltas.
         let mut next = unsafe { first.as_ref() };
         while let Some(dependent) = next {
-            (dependent.activate)(appliance, source);
+            (dependent.activate)(appliance, source, transition);
             next = dependent.next;
         }
     }
@@ -68,13 +93,15 @@ impl<Appliance: 'static> Dependents<Appliance> {
 /// instance and synchronous local notification.
 ///
 /// The array length is inferred from the supplied group: no fixed slot capacity
-/// is imposed. Include each affected state once, including derived states. Before/after
-/// values exist on this call's stack; only changed post-values enter transport records.
+/// is imposed. Include each affected native state once, including any native
+/// derived states. Installed histories/results are maintained automatically.
+/// Before/after values exist on this call's stack; only changed post-values enter
+/// transport records.
 /// This group covers one hardware report, not a snapshot of the distributed graph.
 ///
 /// All updates and comparisons complete before callbacks run. Once detected,
 /// a delta is delivered even if an earlier callback changes that state again.
-/// Callbacks obtain fresh values themselves; none receive a captured old value.
+/// Callbacks receive this report's captured values rather than rereading them.
 /// `None` becoming available or unavailable also counts as a change.
 ///
 /// The update's return value is preserved, including an error after a partial
@@ -96,9 +123,30 @@ pub fn update<Appliance: 'static, R, const N: usize>(
             state.record_change(appliance, after[index]);
         }
     }
+    // Maintenance cannot invoke appliance callbacks. Complete every history and
+    // derived value before a callback can register a newer, nested observation.
+    #[cfg(feature = "use-mutexes")]
     for (index, state) in states.iter().enumerate() {
         if before[index] != after[index] {
-            state.dispatch_dependents(appliance);
+            crate::kernel::state::maintain(
+                state,
+                appliance,
+                Transition {
+                    before: Previous::Captured(before[index]),
+                    after: after[index],
+                },
+            );
+        }
+    }
+    for (index, state) in states.iter().enumerate() {
+        if before[index] != after[index] {
+            state.dispatch_dependents(
+                appliance,
+                Transition {
+                    before: Previous::Captured(before[index]),
+                    after: after[index],
+                },
+            );
         }
     }
     result

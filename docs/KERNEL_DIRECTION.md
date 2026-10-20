@@ -120,8 +120,9 @@ not a replacement for state-change messaging.
 
 ### Installed history and derived state
 
-Planned fragment installation includes bounded retained observations and computed
-state. A computation may need earlier values or a maintained result, beyond the
+Fragment installation includes bounded retained observations and computed
+state. The first local installation path is implemented; receiving installations
+over the network remains planned. A computation may need earlier values or a maintained result, beyond the
 current appliance value. Its inputs remain grounded in the states the hardware
 actually exposes and explicitly supplied commissioning data. Storing or calculating from observations does not supply a
 missing physical observation; richer automation may require additional hardware.
@@ -141,22 +142,41 @@ number of accepted observations with explicit eviction; a computed value can use
 one register or a small fixed record. Both are resident state, separate from
 transport buffering and graph execution. There is no mandatory 24-hour archive.
 
-The state updater receives the captured change and any declared prior retained values.
-Calculations use their specified pre-transition inputs before replacing retained
-state; dependent computations see the completed result. Reading a state updater's own
-previous output does not implicitly subscribe it to that output as a new trigger.
-Only operands required by downstream work need to accompany a continuation.
-Each activation remains finite and change-driven.
+`kernel::state::RetainedState` supplies a concrete first slice: one native source,
+a statically sized ring of its scalar values, and one compiled function from that
+history to a computed scalar. `Appliance::install_state` binds the record once to
+an initialized appliance before startup. It checks source ownership and scalar
+types; the supplied IR predicate describes the calculation. The compiler owns
+the correspondence between that predicate and native code, as with native
+transformers. The kernel does not execute or prove the predicate.
 
-Installed retained/derived states must be enumerable in the shared mathematical
-surface. Current `Surface` and `peer::exposure::Description` only borrow immutable
-firmware definitions; extending that representation and its read consistency is
-part of this work, not behavior already implemented. Likewise, `observation::update`
-currently captures before/after values but passes only the source handle to local
-dependents. Its captured transition must become available to installed state updaters.
+History starts empty. A qualified change appends its captured post-value, evicts
+the oldest value when full, then computes the result from the updated history.
+Age zero is newest. Missing or unavailable observations read as `None`, so the
+demonstrated difference of two observations remains unavailable until both exist.
+An unchanged `update` adds nothing; an explicit `changed` report adds an observation
+without claiming a captured before-value. All histories in a grouped observation
+are maintained before native dependent callbacks run. Those callbacks receive
+the original before/after transition even if an earlier callback changes the
+appliance again.
 
-The same installation mechanism accepts definitions from nucleus/FSPS or the
-tablet's simpler compiler. A basic installation does not acquire an FSPS dependency
+`Appliance` enumerates both native definitions and installed history/result
+attributes with their mathematical predicates. `peer::exposure::Description`
+encodes that combined surface through the existing LSF v1 format, borrowing the
+resident definitions without copying their values. Publication seals installation
+so encoded ranges and references remain stable. Normal owner-directed reads use
+the same appliance lock; changed history views and results use ordinary deltas.
+OTA compatibility fingerprints include the installed definitions.
+
+The current updater receives read-only history, not mutable appliance access or
+its own previous output. Multi-source calculations, retained accumulators,
+conditional maintenance, local activation from installed states, and hot
+installation/replacement remain later extensions. Only operands required by
+downstream work need to accompany a continuation. Each activation remains finite
+and change-driven.
+
+The eventual network installation mechanism will accept definitions from nucleus/FSPS
+or the tablet's simpler compiler. A basic installation does not acquire an FSPS dependency
 merely because an automation needs memory. The installed executable encoding
 remains open: native state updaters require target compilation; a bounded portable
 operation form requires its corresponding execution mechanism. Neither requires
@@ -592,8 +612,9 @@ storage evicts its oldest record; the adjacent-peer records reject new admission
 when full and expire unconfirmed/unrefreshed entries rather than evict healthy links. Eviction can lose a response or shorten duplicate
 suppression; hop limits remain necessary. Neither these paths nor a TX completion prove native execution. The limits are explicit starting capacities.
 
-Host checks cover arrival propagation, cyclic/duplicate paths, several owners
-replying to one query, and discovering then reading an owner through two relays.
+Host checks enforce local hop limits, duplicate keys, multiple owner replies per
+query, read correlation, and storage/expiry bounds. They exercise one forwarder
+at its input boundary; network walkers are not part of the component tests.
 Discovery remains best-effort and scoped: no response proves complete network
 membership, and a missing response does not prove absence. Startup tokens use
 local ticks, not durable boot identities; rapid restart or token reuse can collide
@@ -703,8 +724,10 @@ results can return through both. Owner dispatch uses the existing bounded result
 history. This adds transport redundancy, not an automatic retry of native work;
 it does not extend duplicate guarantees past history eviction or reboot.
 
-This is implemented in the common forwarder and validated with encoded host
-exchanges, including a lost branch and reconvergence before/after a result.
+This is implemented in the common forwarder. Its component checks enforce the
+copy budget, two incoming directions, exact result correlation, cached replay,
+and independent expiry of unanswered directions. Wire encoding is checked by
+the frame owner; native result replay is checked by the invocation owner.
 Reconverging copies join return paths only when their remaining scope is at least
 that of the first copy; this prevents downstream echoes becoming upstream paths.
 Later longer branches are not retained at the convergence point. Delta/arrival
@@ -755,7 +778,7 @@ implementation choice, not a reason to introduce an ECS, copied world model,
 global object registry, auto-incremented entity IDs, or relational edge tables.
 
 Use static task/control storage and bounded communication buffers. Existing frame
-and outgoing-delta rings are transport storage. Planned history rings retain
+and outgoing-delta rings are transport storage. Installed history rings retain
 observations as installed state; neither represents pending graph jobs. Choose packing,
 layout, and hardware offload against the target's actual memory and latency needs.
 The radio task has a fixed 12 KiB stack (24 KiB with signed updates) and a static
@@ -776,6 +799,14 @@ precede an older sibling delta. Notifications wake the resident radio task witho
 merging those records; receive waits become interruptible after formation. Owner
 invocation history has a 768-byte compile-time ceiling. No allocator is enabled
 by either MCU port. Loss, eviction, and reboot do not imply automatic recovery.
+
+Installed histories use native-width `Option<T>` samples and static attribute
+metadata. Updating a ring does not copy its contents onto the stack. Every
+history position is currently an enumerable scalar view; shifting those views
+can produce several deltas from one native report. The existing outgoing ring's
+hard eviction still applies, independently of retained history. Larger histories
+therefore have both metadata and transport costs; this first representation is
+not a packed history-transfer format.
 
 ## Firmware updates
 
@@ -829,7 +860,7 @@ flowchart TB
     state["kernel::change: bounded outgoing deltas"]
     invocation["peer::invocation: native dispatch and bounded result replay"]
     peers["Authorization and installed compiled-fragment dispatch: to build"]
-    retained["Installed history and derived state with per-delta computation: to build"]
+    retained["kernel::state: locally installed scalar history and compiled per-delta result"]
     solar["Commissioned location/time and local solar calculation: to build"]
     discovery["kernel::peer: channel survey, computed rendezvous, arrival and message dispatch"]
     exposure["peer::exposure: borrowed local IR and bounded range encoding"]
@@ -851,7 +882,7 @@ flowchart TB
     c6boot["ESP-IDF second-stage loader: trial and rollback"]
     mac["radio::mac: ACK matching, four attempts, backoff, eight recent senders"]
     rxbuffer["radio::receive: four owned frames captured before peer dispatch"]
-    probe["src/kernel/radio/tests: transport probe, discovery counters and surface-range observer"]
+    probe["src/kernel/radio/tests: transport probe, discovery counters, appliance/state fixtures and surface-range observer"]
     testentry["test-support only: scoped transport access and event hooks"]
     tasks["Existing RTOS tasks, notifications, synchronization, static storage"]
     cpu["CPU ports: Nordic nRF52840, ESP32-C6, and generic targets"]
@@ -884,6 +915,7 @@ flowchart TB
     smoke -->|initializes selected chip resources| cpu
     smoke -->|creates static tasks and starts scheduler| tasks
     smoke -->|radio-probe or peer-observer feature includes| probe
+    probe -->|dimmer installs bounded history and difference| retained
     smoke -->|optional USB console feature| usbconsole
     smoke -->|update fixture input decoding| updatecommands
     updateconsole <-->|local USB test commands and reports| smoke
@@ -978,8 +1010,12 @@ flowchart TB
     peers -.->|runs in kernel execution contexts| tasks
     peers -.->|configures and exchanges frames| transport
     peers -.->|installs definitions, bounded storage and state updaters| retained
-    observation -.->|qualified changes and captured transitions| retained
-    retained -.->|enumerates installed mathematical state| exposure
+    binding -->|binds static records to the native instance before startup| retained
+    observation -->|maintains captured changes before native callbacks| retained
+    retained -->|enumerates installed mathematical state| exposure
+    retained -->|publishes changed history views and result| state
+    binding -->|normal synchronized reads of installed values| retained
+    exposure -->|includes installed definitions in compatibility fingerprint| update
     retained -.->|retained values and computed operands| peers
     hostpeer -.->|commissioning data through ordinary peer messaging| solar
     cpu -.->|elapsed counter and reserved configuration storage| solar
@@ -987,7 +1023,7 @@ flowchart TB
     radio -->|IRQ waker notifies resident task| tasks
 
     classDef planned stroke-dasharray: 5 5;
-    class peers,retained,solar planned;
+    class peers,solar planned;
 ```
 
 ## Current baseline
@@ -1019,6 +1055,13 @@ owner-directed invocation/results, current-state reads, and registered observati
 deltas. Tests cover argument/reference rejection, retained command replay, actual observation timing,
 and grouped-delta ordering. Kernel task/protocol behavior remains in common source;
 portable codecs, fixture counters, and hardware logging live in separate test crates.
+
+Local retained-state installation has host checks and both MCU fixture builds.
+The maintained dimmer installs four level observations and a signed difference
+of its newest two observations; its native transformer still reports only power
+and level. Checks cover empty/unavailable history, oldest-value eviction, grouped
+and reentrant observations, combined surface definitions, exact delta registration, and
+OTA fingerprint coverage. This slice has not been flashed or hardware-validated.
 
 Authentication, tablet UI integration, installed compiled fragments, and
 their distributed activation remain open. Nordic local staging and boot recovery
@@ -1100,8 +1143,10 @@ activation, and their forwarding semantics. Native transformer invocation is now
 available independently of fragment installation. Keep upstream state
 activation distinct from downstream execution. Nucleus supplies compiled work;
 its full implementation is not a prerequisite to building the node's common
-mechanics. Start the retained-state slice with an existing exposed state, bounded
-history and a compiled state updater that maintains an enumerable derived value. This
+mechanics. Local retained history and a compiled updater now maintain an enumerable
+derived value from an existing exposed state. Next connect captured changes and
+maintained operands to a bounded conditional activation and its continuation.
+Remote installation still needs its own encoding and ownership mechanics. This
 does not depend on a hypothetical sensor or shared clock. Relay optimization and
 storage tuning follow concrete implementation
 needs rather than displacing these first runtime steps.
@@ -1109,10 +1154,27 @@ needs rather than displacing these first runtime steps.
 ## Development approach
 
 Build in useful increments, compile as we go, and learn from concrete failures.
-Use focused checks for actual invariants: frame encoding, static-storage bounds,
-interrupt-to-task handoff, and the end-to-end behavior just added. Reuse existing
-kernel tests. QEMU and physical boards are tools for specific questions, not
+Kernel tests enforce prescribed component properties: valid input domains,
+capacity and eviction bounds, reference ownership, ordering and encoding.
+Use tables for boundary partitions under one focused assertion path, and extend
+the existing property owner when a new case belongs there. Do not grow a second
+implementation or a collection of application narratives inside test fixtures.
+Review their structure and abstractions with the same standards as runtime code;
+neither test count nor blanket coverage is the objective. Reproducible hardware
+integration remains beside the ports. Test code exceeding twice its owning
+component's operational code requires explicit justification of its distinct
+properties and partitions, including fixture/helper costs. Approaching three
+times is a signal to review the structure before extending the suite. Apply the
+same source-line measure to both sides, without hiding helpers or borrowing the
+rest of the kernel as a denominator. QEMU and physical boards are tools for specific questions, not
 prerequisites to every small change or grounds for an exhaustive simulation gate.
+
+Test ownership follows the implementation map: `peer::invocation` owns bounded
+result replay; `appliance` owns native admission and synchronized reads;
+`change` owns delta capacity, ordering and eviction; `peer::forwarding` owns local
+message scope, correlation and route budgets; `peer::host` owns host admission,
+session boundaries, result delivery and event buffering. Tests at these boundaries
+do not reconstruct a network or duplicate the wire codec's checks.
 
 Keep compile success, scheduler execution, packet exchange, and physical appliance
 behavior as separate evidence. A radio probe or host test does not prove the full

@@ -20,11 +20,45 @@ pub use value::{ArgumentError, Arguments, Scalar};
 
 use crate::{
     ir::{self, Type, Value},
-    observation::{self, Dependent, Dependents},
+    observation::{self, Dependent, Dependents, Previous, Transition},
 };
 
-/// A scalar observation function used as the IR's native state location.
-pub type Read<Appliance> = fn(&Appliance) -> Option<Value>;
+/// A scalar state location: a native reader or an installed retained value.
+/// Reading never evaluates IR or triggers state maintenance.
+pub struct Read<Appliance: 'static> {
+    source: Reader<Appliance>,
+}
+enum Reader<Appliance: 'static> {
+    Native(fn(&Appliance) -> Option<Value>),
+    #[cfg(feature = "use-mutexes")]
+    Retained(crate::kernel::state::Reader<Appliance>),
+}
+impl<Appliance: 'static> Read<Appliance> {
+    #[cfg(feature = "use-mutexes")]
+    pub(crate) const fn retained(
+        index: usize,
+        read: unsafe fn(*const (), &Appliance, usize) -> Option<Value>,
+    ) -> Self {
+        Self {
+            source: Reader::Retained(crate::kernel::state::Reader::new(index, read)),
+        }
+    }
+    #[cfg(feature = "use-mutexes")]
+    pub(crate) fn bind_retained(&self, storage: *mut ()) {
+        let Reader::Retained(reader) = &self.source else {
+            unreachable!()
+        };
+        reader.bind(storage);
+    }
+    /// Read the original state source; this does not execute its IR definition.
+    pub fn read(&self, appliance: &Appliance) -> Option<Value> {
+        match &self.source {
+            Reader::Native(read) => read(appliance),
+            #[cfg(feature = "use-mutexes")]
+            Reader::Retained(reader) => reader.read(appliance),
+        }
+    }
+}
 
 /// A firmware-resident mathematical definition over this appliance's state.
 pub type Definition<Appliance> = ir::Definition<'static, 'static, Read<Appliance>>;
@@ -57,6 +91,9 @@ pub trait State {
 pub struct StateHandle<Appliance: 'static> {
     definition: ir::Attribute<Read<Appliance>>,
     dependents: Dependents<Appliance>,
+    #[cfg(feature = "use-mutexes")]
+    pub(crate) maintained:
+        core::sync::atomic::AtomicPtr<crate::kernel::state::Installation<Appliance>>,
 }
 
 impl<Appliance: 'static> StateHandle<Appliance> {
@@ -65,9 +102,13 @@ impl<Appliance: 'static> StateHandle<Appliance> {
         Self {
             definition: ir::Attribute {
                 ty: S::Value::TYPE,
-                location: read_state::<S>,
+                location: Read {
+                    source: Reader::Native(read_state::<S>),
+                },
             },
             dependents: Dependents::new(),
+            #[cfg(feature = "use-mutexes")]
+            maintained: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
@@ -78,7 +119,7 @@ impl<Appliance: 'static> StateHandle<Appliance> {
 
     /// Read live state. Unavailable observations remain distinct from false or zero.
     pub fn read(&self, appliance: &Appliance) -> Option<Value> {
-        (self.definition.location)(appliance)
+        self.definition.location.read(appliance)
     }
 
     /// Install this state's resident local dependency list, or remove it with `None`.
@@ -92,11 +133,26 @@ impl<Appliance: 'static> StateHandle<Appliance> {
     ///
     /// Use this when hardware already identifies a change and its previous value
     /// is unavailable. Every call is a distinct delta, including unavailable state.
-    /// Dependents execute synchronously in the caller's context and read fresh state.
+    /// Dependents receive the captured post-value and an unknown before-value.
     pub fn changed(&self, appliance: &mut Appliance) {
         let value = self.read(appliance);
         self.record_change(appliance, value);
-        self.dispatch_dependents(appliance);
+        #[cfg(feature = "use-mutexes")]
+        crate::kernel::state::maintain(
+            self,
+            appliance,
+            Transition {
+                before: Previous::Unknown,
+                after: value,
+            },
+        );
+        self.dispatch_dependents(
+            appliance,
+            Transition {
+                before: Previous::Unknown,
+                after: value,
+            },
+        );
     }
 
     pub(crate) fn record_change(&self, appliance: &Appliance, value: Option<Value>) {
@@ -116,8 +172,8 @@ impl<Appliance: 'static> StateHandle<Appliance> {
         let _ = (appliance, value);
     }
 
-    pub(crate) fn dispatch_dependents(&self, appliance: &mut Appliance) {
-        self.dependents.dispatch(appliance, self);
+    pub(crate) fn dispatch_dependents(&self, appliance: &mut Appliance, transition: Transition) {
+        self.dependents.dispatch(appliance, self, transition);
     }
 
     /// Apply an observation update and notify dependents only if this state changed.

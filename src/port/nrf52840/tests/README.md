@@ -36,6 +36,11 @@ registers both actual fixture changes through the kernel. Use it with
 `xiao-bootloader,usb-console` to exercise surface reads, native argument/range
 validation, and state reads from the tablet's attached radio. `peer-observer` can
 be added for passive kernel-event diagnostics; it supplies no networking behavior.
+The fixture now also installs four retained level observations and a signed
+newest-minus-previous result before startup. All seven scalar states appear in
+the ordinary surface and state-read path. The history starts empty; two level
+changes make the difference available. This addition has host/build validation;
+the hardware run described below predates retained-state installation.
 This verifies native dispatch and registered state, not a physical dimmer output.
 The final two-board run consumed the full surface, invoked the native operation,
 and read registered changes. A read after closing the diagnostic console also
