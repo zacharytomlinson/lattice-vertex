@@ -37,7 +37,8 @@ impl Measurement {
 }
 
 /// Temporary handoff only. The peer drains before dispatch and at each loop:
-/// at most host + delta + maintenance sends, or two split replies, lie between.
+/// at most continuation + host + delta + maintenance sends, or two split replies
+/// plus an update-absence notice, lie between drains.
 pub(crate) struct Samples([Option<Transmission>; 4]);
 impl Samples {
     pub(crate) const fn new() -> Self {

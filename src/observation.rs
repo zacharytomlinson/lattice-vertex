@@ -3,7 +3,8 @@
 //! Dependency links live with the state they depend on. Activation is immediate
 //! in the caller's context; there is no graph work queue, polling task, or IR
 //! interpreter. The kernel updates installed history and computed state before
-//! running native dependents, using this report's captured values. A callback
+//! evaluating installed fragments and running native dependents, using this
+//! report's captured values. A callback
 //! represents a compiled local activation entrypoint. Bound appliance changes
 //! also enter the kernel's fixed outgoing delta ring. Loadable fragment installation remains separate work;
 //! this local list is not its wire format or final executable ABI.
@@ -103,6 +104,8 @@ impl<Appliance: 'static> Dependents<Appliance> {
 /// a delta is delivered even if an earlier callback changes that state again.
 /// Callbacks receive this report's captured values rather than rereading them.
 /// `None` becoming available or unavailable also counts as a change.
+/// For each changed source, installed fragments run before its native callbacks.
+/// Their non-trigger operands are sampled when each fragment is reached.
 ///
 /// The update's return value is preserved, including an error after a partial
 /// update: actual observed changes still produce notifications. Call separately

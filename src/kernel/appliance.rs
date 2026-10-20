@@ -17,6 +17,33 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicU8, Ordering},
 };
 
+/// Local installation failure. No new binding is published on these failures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallError {
+    /// Initialize the owning appliance first.
+    NotInitialized,
+    /// Installation or native access is already in progress.
+    Busy,
+    /// Surface publication/startup closed installation.
+    Closed,
+    /// The supplied storage has already been bound to an instance.
+    AlreadyInstalled,
+    /// The source is not an exposed native state of this appliance.
+    UnknownSource,
+    /// A declared operand is not part of this appliance's exposed state.
+    UnknownInput,
+    /// The continuation is not an exposed transformer of this appliance.
+    UnknownTransformer,
+    /// A peer target has a reserved/invalid address or transformer reference.
+    InvalidTarget,
+    /// The fragment's argument count disagrees with its target.
+    Arguments,
+    /// The history's native scalar type disagrees with its source.
+    Type,
+    /// The supplied mathematical predicate has an invalid input signature.
+    Definition,
+}
+
 /// Static storage for an appliance's native state and mathematical surface.
 /// Initialize once before scheduler startup, then pass it to `kernel::start`.
 /// Hardware tasks use `with` to apply established observations through the
@@ -127,8 +154,100 @@ impl<A: Send, E> Appliance<A, E> {
         state: &'static super::state::RetainedState<A, T, U, N>,
         update: fn(&super::state::History<T, N>) -> Option<U>,
         definition: &'static crate::surface::Predicate<A>,
-    ) -> Result<(), super::state::InstallError> {
-        use super::state::InstallError;
+    ) -> Result<(), InstallError> {
+        self.with_installation(context, |appliance| {
+            if !self
+                .surface
+                .states
+                .iter()
+                .any(|s| ptr::eq(*s, state.source()))
+            {
+                return Err(InstallError::UnknownSource);
+            }
+            let next = unsafe { self.installed.load(Ordering::Acquire).as_ref() };
+            let node = state.install(
+                ptr::from_ref(appliance).cast_mut(),
+                update,
+                definition,
+                next,
+            )?;
+            self.installed
+                .store(ptr::from_ref(node).cast_mut(), Ordering::Release);
+            Ok(())
+        })
+    }
+
+    /// Bind one compiled condition and its local or peer transformer continuation.
+    /// Trigger/operands and any local target must belong to this appliance. Peer
+    /// targets require valid references and a signature fitting one frame; their
+    /// availability and native limits are checked by the destination. Install
+    /// retained operands first and finish installations before publication.
+    pub fn install_fragment<const I: usize, const O: usize>(
+        &'static self,
+        context: &TaskContext,
+        fragment: &'static super::fragment::Fragment<A, E, I, O>,
+    ) -> Result<(), InstallError> {
+        self.with_installation(context, |appliance| {
+            if !self
+                .surface
+                .states
+                .iter()
+                .any(|s| ptr::eq(*s, fragment.source))
+            {
+                return Err(InstallError::UnknownSource);
+            }
+            if !fragment
+                .inputs
+                .iter()
+                .all(|input| self.state_definitions().any(|s| ptr::eq(s, *input)))
+            {
+                return Err(InstallError::UnknownInput);
+            }
+            match &fragment.target {
+                super::fragment::Continuation::Local(target) => {
+                    if !self
+                        .surface
+                        .transformers
+                        .iter()
+                        .any(|t| ptr::eq(*t, *target))
+                    {
+                        return Err(InstallError::UnknownTransformer);
+                    }
+                    if target.definition().effect.arguments.len() != O {
+                        return Err(InstallError::Arguments);
+                    }
+                }
+                super::fragment::Continuation::Peer(target) => {
+                    if [target.owner, target.transformer]
+                        .iter()
+                        .any(|&v| v == 0 || v == u64::MAX)
+                    {
+                        return Err(InstallError::InvalidTarget);
+                    }
+                    let bytes: usize = 1 + target
+                        .arguments
+                        .iter()
+                        .map(|ty| match ty {
+                            crate::ir::Type::Bool => 2,
+                            crate::ir::Type::Integer(ty) => 1 + ty.width() as usize / 8,
+                        })
+                        .sum::<usize>();
+                    if O > lattice_peer_wire::MAX_CALL_ARGUMENTS
+                        || bytes > lattice_peer_wire::CALL_ARGUMENT_BYTES
+                    {
+                        return Err(InstallError::Arguments);
+                    }
+                }
+            }
+            fragment.install(appliance)
+        })
+    }
+
+    fn with_installation<R>(
+        &'static self,
+        context: &TaskContext,
+        install: impl FnOnce(&A) -> Result<R, InstallError>,
+    ) -> Result<R, InstallError> {
         if tasks::xTaskGetSchedulerState() != tasks::taskSCHEDULER_NOT_STARTED {
             return Err(InstallError::Closed);
         }
@@ -146,23 +265,11 @@ impl<A: Send, E> Appliance<A, E> {
             }
         }
         let _finish = Finish(&self.ready);
-        if !self
-            .surface
-            .states
-            .iter()
-            .any(|s| ptr::eq(*s, state.source()))
-        {
-            return Err(InstallError::UnknownSource);
-        }
         let mutex = unsafe { (*self.native.get()).assume_init_ref() };
         let Some(guard) = mutex.try_lock(context) else {
             return Err(InstallError::Busy);
         };
-        let next = unsafe { self.installed.load(Ordering::Acquire).as_ref() };
-        let node = state.install(ptr::from_ref(&*guard).cast_mut(), update, definition, next)?;
-        self.installed
-            .store(ptr::from_ref(node).cast_mut(), Ordering::Release);
-        Ok(())
+        install(&guard)
     }
 
     pub(crate) fn seal(&self) {

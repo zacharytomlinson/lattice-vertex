@@ -188,6 +188,60 @@ evaluation. Local elapsed time can be an explicit input when a computation needs
 it. Local solar calculation uses the commissioned context below; future
 observational nodes can supply additional environmental timing cues.
 
+### Conditional fragments and continuations
+
+`kernel::fragment::Fragment` now binds a native trigger, a fixed array of declared
+state operands, an already-compiled condition/argument function, and a local or
+peer transformer continuation. `Appliance::install_fragment` checks source/input
+ownership and local target ownership/arity. Peer targets supply an owner address,
+owner-local reference and declared argument types; reserved references and
+signatures exceeding one invocation frame are rejected. Retained operands must already
+be installed. Both installation paths share the appliance's pre-start gate and
+the common `kernel::InstallError`; publication closes both paths.
+
+A registered change first maintains the entire report's retained state. Each
+source then evaluates its installed fragments in registration order before its
+native callbacks. The kernel captures that fragment's declared operands; an
+unavailable operand stops evaluation, and a compiled `None` stops continuation.
+A local argument array is type-checked by the existing transformer adapter
+and invoked once under the already-held appliance lock. The transformer remains
+responsible for reporting actual observations. Acceptance does not manufacture a
+delta, and failure does not cause retry. Each fragment retains one last-completed
+outcome for local inspection, not an execution log.
+
+The trigger operand uses the originating report's captured post-value. Other
+operands are read when that fragment is reached, including completed retained
+values. Earlier continuations or callbacks may therefore affect a later
+fragment's non-trigger inputs; this is sequential execution, not an atomic
+snapshot across every activation. Operand and argument extents are compile-time
+constants. The compiler supplies terminating code and finite continuation
+relationships; the kernel does not interpret IR or prove arbitrary native code.
+
+`Fragment::to_peer` submits the computed arguments to the existing LVT v7 native
+invocation path. The destination performs its existing signature/reference checks
+and bounded result replay. The sender evaluates once; its resident radio task
+drains four fixed encoded-packet records in FIFO order. Overflow evicts the oldest
+packet and increments `fragment::evicted_continuations()`. `Submitted` means only
+that transport accepted the encoded packet, and is not upgraded to `Invoked` by
+transmission or a later response. RF failure, eviction and a missing result do
+not re-evaluate or retry the program. Existing bounded MAC retries still apply.
+An invocation result terminates at its actual local origin; it cannot satisfy an
+unrelated tablet request. Pending packets wake the radio and defer update work.
+
+The handoff uses at most 61 argument bytes, within one 125-byte MAC frame, with
+no new wire format or fragment reassembly. Optional host calls share the kernel's
+monotonic invocation-ID allocator. Eight host-token mappings preserve recent
+identities across USB reconnects; evicted tokens must not be reused as retries.
+Within a boot, fresh IDs never wrap/recycle. Startup uses clock/address
+decorrelation, or client-token entropy when USB supplies the first call; this
+does not establish unique identity across autonomous reboots. The transport plus
+optional host mappings has a 640-byte compile-time ceiling and allocates no heap.
+
+Installation is still local before startup. This adds no appliance surface
+declarations. Remote code installation, continuation to another conditional
+fragment, activation directly from a retained attribute, and hot replacement
+remain open.
+
 ### Commissioned solar context
 
 Planned commissioning accepts approximate installation latitude/longitude and a
@@ -605,7 +659,7 @@ eight recent paths
 shared by surface, current-state, and link reads, four owner-query return paths,
 eight recent owner notices, four call paths, and eight delta duplicate keys. Eight
 adjacent-peer records are maintained separately from destination paths, inside a
-combined compile-time 2,304-byte ceiling. All return
+combined compile-time 2,464-byte ceiling. All return
 paths and duplicate keys expire after 10 seconds;
 confirmed routes after 60 seconds without another matching response. Path/history
 storage evicts its oldest record; the adjacent-peer records reject new admissions
@@ -756,8 +810,11 @@ Local read and call origins share the existing return-path budgets and route
 learning. Local native requests use the same appliance binding and result replay
 as radio requests; success is not a physical observation. Typed scalar encoding is
 shared in `peer/wire`, with no radio-wire or IR-language change.
-Disconnect invalidates host completions while peer participation continues. Radio read tokens persist across host reconnects. Native call identities use the
-host token sequence seeded from OS entropy, with bounded/volatile replay protection.
+Disconnect invalidates host completions while peer participation continues. Radio
+read tokens persist across host reconnects. Native calls share the kernel's ID
+allocator with compiled continuations; eight retained host-token mappings preserve
+recent identities across USB reconnects. Replay protection remains bounded and
+volatile. USB disconnect does not clear the kernel's continuation packets.
 A timeout produces a failure without retransmitting; for a mutation, its outcome
 remains unconfirmed until observed. Periodic maintenance now sends either a link
 exchange or discovery in one iteration, leaving reception available for the reply
@@ -859,7 +916,9 @@ flowchart TB
     observation["StateHandle / observation: register actual changes, dispatch local dependents"]
     state["kernel::change: bounded outgoing deltas"]
     invocation["peer::invocation: native dispatch and bounded result replay"]
-    peers["Authorization and installed compiled-fragment dispatch: to build"]
+    peers["Authorization, remote installation and inter-fragment continuation: to build"]
+    fragments["kernel::fragment: compiled condition, captured operands and local/peer transformer target"]
+    continuations["peer::continuation: four encoded packets and shared invocation IDs"]
     retained["kernel::state: locally installed scalar history and compiled per-delta result"]
     solar["Commissioned location/time and local solar calculation: to build"]
     discovery["kernel::peer: channel survey, computed rendezvous, arrival and message dispatch"]
@@ -1011,7 +1070,15 @@ flowchart TB
     peers -.->|configures and exchanges frames| transport
     peers -.->|installs definitions, bounded storage and state updaters| retained
     binding -->|binds static records to the native instance before startup| retained
+    binding -->|checks and binds local fragments before startup| fragments
     observation -->|maintains captured changes before native callbacks| retained
+    observation -->|activates each changed source after report maintenance| fragments
+    retained -->|declared local scalar operands| fragments
+    fragments -->|checked arguments to existing transformer adapter| surface
+    fragments -->|typed arguments encoded once for peer target| continuations
+    continuations -->|ordinary invocation through learned/relay directions| forwarding
+    transport -->|wake and drain already-evaluated packets| continuations
+    hostlink -->|shares radio ID allocator, preserves host tokens| continuations
     retained -->|enumerates installed mathematical state| exposure
     retained -->|publishes changed history views and result| state
     binding -->|normal synchronized reads of installed values| retained
@@ -1063,8 +1130,26 @@ and level. Checks cover empty/unavailable history, oldest-value eviction, groupe
 and reentrant observations, combined surface definitions, exact delta registration, and
 OTA fingerprint coverage. This slice has not been flashed or hardware-validated.
 
-Authentication, tablet UI integration, installed compiled fragments, and
-their distributed activation remain open. Nordic local staging and boot recovery
+Conditional fragments now have host boundary checks: reference admission,
+argument rejection, one invocation per qualifying delta, captured trigger values,
+completed grouped maintenance, registration order and instance isolation.
+Peer-transformer continuations use the existing radio invocation path without
+`host-link`. Checks cover single-frame bounds, FIFO eviction, argument preservation,
+ID exhaustion and host/result isolation.
+
+On 2026-10-20, a C6 and XIAO nRF52840 ran the current kernel with a small external
+lab appliance. In each direction, reports `10, 14, 14, 11, 18` maintained a
+two-observation history and sent only positive differences. The receiver's native
+transformer applied `4` and `7`, exactly once each; initial unavailable history,
+an unchanged report, and the negative difference produced no invocation. Both
+nodes reported zero continuation evictions. Receiver USB reads and ordinary
+remote state reads agreed. The fixtures/images/captures remain outside the kernel
+repository, and factory recovery paths were preserved. This is direct radio
+validation of software appliance state, not physical-actuator, range, multi-hop,
+reboot-identity or general RF-reliability validation.
+
+Authentication, tablet UI integration, remote fragment installation, and
+inter-fragment continuation remain open. Nordic local staging and boot recovery
 have host and XIAO hardware validation. C6 local staging/metadata has host/build
 and hardware validation. OTA transport and activation policy remain planned in
 [the updater design](FIRMWARE_UPDATES.md). Local dependents are immediate native
@@ -1144,9 +1229,11 @@ available independently of fragment installation. Keep upstream state
 activation distinct from downstream execution. Nucleus supplies compiled work;
 its full implementation is not a prerequisite to building the node's common
 mechanics. Local retained history and a compiled updater now maintain an enumerable
-derived value from an existing exposed state. Next connect captured changes and
-maintained operands to a bounded conditional activation and its continuation.
-Remote installation still needs its own encoding and ownership mechanics. This
+derived value from an existing exposed state. Local fragments consume declared
+operands on registered changes and conditionally invoke local or peer transformers.
+The direct peer handoff now has C6 ↔ nRF52840 hardware evidence. Next extend
+continuation to another conditional fragment. Remote installation still needs its own encoding and
+ownership mechanics. This
 does not depend on a hypothetical sensor or shared clock. Relay optimization and
 storage tuning follow concrete implementation
 needs rather than displacing these first runtime steps.

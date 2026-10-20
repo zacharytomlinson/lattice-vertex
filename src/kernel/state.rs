@@ -11,6 +11,7 @@
 //! changes use normal delta transport; local cascading installations and remote
 //! code loading are separate work.
 
+use super::InstallError;
 use crate::{
     ir::{self, Value},
     observation::Transition,
@@ -89,25 +90,6 @@ impl<T: Scalar, const N: usize> History<T, N> {
         self.next = (self.next + 1) % N;
         self.len = (self.len + 1).min(N);
     }
-}
-
-/// Local installation failure. No new binding is published on these failures.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InstallError {
-    /// Initialize the owning appliance first.
-    NotInitialized,
-    /// Installation or native access is already in progress.
-    Busy,
-    /// Surface publication/startup closed installation.
-    Closed,
-    /// The supplied storage has already been bound to an instance.
-    AlreadyInstalled,
-    /// The source is not an exposed native state of this appliance.
-    UnknownSource,
-    /// The history's native scalar type disagrees with its source.
-    Type,
-    /// The supplied mathematical predicate has an invalid input signature.
-    Definition,
 }
 
 struct Values<T: Scalar, U: Scalar, const N: usize> {

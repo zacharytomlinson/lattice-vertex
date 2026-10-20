@@ -304,12 +304,22 @@ impl Host {
             ..
         } = request
         {
-            // Host tokens for calls are invocation identities. The Linux client
-            // seeds them from OS entropy on open; reconnect is never a retry.
+            // Keep host correlation separate from the radio namespace shared
+            // with compiled continuations. A retained token keeps its radio ID.
+            let Some(request) = super::continuation::host_request(token) else {
+                deliver(
+                    generation,
+                    Packet::Error {
+                        token,
+                        failure: Failure::Busy,
+                    },
+                );
+                return None;
+            };
             let call = Invocation {
                 caller: local,
                 owner,
-                request: token,
+                request,
                 transformer,
             };
             if owner == local {
@@ -352,7 +362,7 @@ impl Host {
             if owner == local {
                 let progress = crate::kernel::peer::handle_update(
                     operation,
-                    forwarder.ordinary_work_pending(),
+                    forwarder.ordinary_work_pending() || super::continuation::pending(),
                 );
                 deliver(
                     generation,
@@ -496,6 +506,12 @@ impl Host {
             );
         }
     }
+    pub(super) fn owns_call(&self, call: Invocation) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|p| p.operation == Operation::Call(call))
+    }
+
     pub(super) fn complete(&mut self, forwarder: &mut Forwarder, incoming: Message<'_>, now: u32) {
         let Some(pending) = &self.pending else {
             return;

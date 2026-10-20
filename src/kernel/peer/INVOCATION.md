@@ -10,6 +10,15 @@ accepted remote deltas also stream to an attached host without state polling.
 The host event buffer is bounded and reports oldest-event eviction separately
 from command results; it does not guarantee RF delivery or retain state history.
 
+Installed `Fragment::to_peer` continuations originate the same invocation frames
+without a host. A fixed four-packet handoff carries already-computed arguments to
+the resident radio task, with oldest eviction and no program retry. Calls share
+one per-boot radio-ID allocator; host tokens are mapped separately for correlation.
+`Submitted` is the fragment's handoff outcome, not a claim of native execution.
+Results terminate at their actual origin; a fragment result cannot satisfy a
+host request. See [conditional fragments](../../../docs/KERNEL_DIRECTION.md#conditional-fragments-and-continuations)
+for packet bounds and identity limitations.
+
 ## Appliance ownership
 
 Firmware declares its existing `State`, `StateTransformer`, and static `Surface`,
@@ -202,7 +211,7 @@ ordering across reboot, compensate for packet loss, or prove physical convergenc
 
 ## Storage and validation
 
-The common forwarder retains its 2,304-byte compile-time ceiling, including three
+The common forwarder retains its 2,464-byte compile-time ceiling, including three
 owners with two candidate directions each, maintained adjacent links, read/discovery
 records, four call paths with two-way branch bookkeeping, and eight delta duplicate keys. Owner
 invocation history has a 768-byte ceiling. Appliance and transport storage are

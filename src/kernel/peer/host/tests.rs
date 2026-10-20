@@ -39,6 +39,8 @@ const NATIVE: NativeResult = NativeResult {
 };
 fn reset() -> TaskContext {
     crate::port::test_port_reset();
+    super::super::continuation::reset();
+    super::super::continuation::start(1, 100);
     access(|m| *m = Mailbox::new());
     unsafe { TaskContext::assume() }
 }
@@ -516,4 +518,73 @@ fn address_admission() {
             })
         );
     }
+}
+
+#[test]
+fn origin_isolation() {
+    use super::super::{complete_local_invocation, continuation};
+    let context = reset();
+    let mut host = Host::new();
+    let mut node = Forwarder::new(1, NET);
+    submit(
+        &context,
+        Packet::Invoke {
+            token: 7,
+            owner: 2,
+            transformer: 11,
+            arguments: Arguments::new(&[]).unwrap(),
+        },
+    )
+    .unwrap();
+    let Content::Invoke {
+        call: host_call, ..
+    } = poll(&mut host, &mut node, 0).unwrap().content
+    else {
+        panic!()
+    };
+    continuation::submit(2, 11, &[]).unwrap();
+    let packet = continuation::take().unwrap();
+    let peer_call = packet.call(1);
+    node.originate_call(peer_call, packet.arguments(), 0)
+        .unwrap();
+    assert_ne!(host_call.request, peer_call.request);
+    let result = |call| Message {
+        source: 2,
+        destination: Some(1),
+        path_cost: TimePerByte::UNKNOWN,
+        content: Content::InvocationResult {
+            network: NET,
+            call,
+            hops: 1,
+            status: InvokeStatus::Invoked,
+        },
+    };
+    assert!(complete_local_invocation(
+        &mut node,
+        result(peer_call),
+        1,
+        &mut host
+    ));
+    assert_eq!(receive(&context), None);
+    assert!(host.owns_call(host_call));
+    assert!(complete_local_invocation(
+        &mut node,
+        result(host_call),
+        2,
+        &mut host
+    ));
+    assert_eq!(
+        receive(&context),
+        Some(Packet::Invoked {
+            token: 7,
+            owner: 2,
+            transformer: 11,
+            status: InvokeStatus::Invoked
+        })
+    );
+    continuation::submit(2, 11, &[]).unwrap();
+    disconnect(&context);
+    assert!(continuation::pending());
+    assert_eq!(continuation::host_request(7), Some(host_call.request));
+    continuation::take().unwrap();
 }
