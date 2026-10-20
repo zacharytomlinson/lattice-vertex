@@ -1,6 +1,7 @@
 //! Build-only helper for OTA fixtures; accepts only a supplied public key.
 pub fn policy(out: &std::path::Path) {
     println!("cargo:rerun-if-env-changed=LATTICE_UPDATE_PUBLIC_KEY");
+    println!("cargo:rerun-if-env-changed=LATTICE_UPDATE_RELEASE");
     if std::env::var_os("CARGO_FEATURE_OTA_TEST").is_none() {
         return;
     }
@@ -15,4 +16,16 @@ pub fn policy(out: &std::path::Path) {
         })
         .collect();
     std::fs::write(out.join("update-public-key.bin"), bytes).unwrap();
+    // Repeated OTA checks can advance a real running release without reprovisioning
+    // its bootloader or lying about the candidate's compiled release identity.
+    let default = if std::env::var_os("CARGO_FEATURE_OTA_IMAGE_B").is_some() {
+        2
+    } else {
+        1
+    };
+    let release = std::env::var("LATTICE_UPDATE_RELEASE")
+        .map(|s| s.parse::<u64>().expect("invalid LATTICE_UPDATE_RELEASE"))
+        .unwrap_or(default);
+    assert!(release > 0, "release must be positive");
+    std::fs::write(out.join("update-release.bin"), release.to_le_bytes()).unwrap();
 }

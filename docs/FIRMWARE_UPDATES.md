@@ -35,6 +35,35 @@ each appliance author does not implement an updater, flash protocol, or radio
 configuration. Trust in an image comes from a provisioned release key, independently
 of which peer carries its bytes. Node-admission authentication remains separate.
 
+The first maintenance interface is a user's computer with a USB radio companion.
+They participate as one ordinary peer, discover reachable vertices, and let the
+user select a destination and drop a signed package into a local application.
+Existing forwarding carries the transfer beyond direct radio range. No router,
+Internet connection, tablet, or permanent maintenance server is required. Release
+files can be obtained separately from the local transfer.
+
+The local `lattice-tools` checkout implements this interface with a reusable Rust
+host peer and a loopback-only drag-and-drop window. It consumes the shared host-v4
+codec, walks resident links and supplies one selected package. The current remote
+reply establishes verified staging, not the running release after activation; the
+window keeps that distinction visible. The host repository is published; the
+tablet now consumes its pinned peer library and CLI instead of a copied client.
+
+On 2026-10-18, that browser interface completed both directions: C6 USB peer to
+Nordic receiver (132,228 image bytes), then Nordic USB peer to C6 receiver
+(292,208 image bytes). Each receiving vertex activated release 3 autonomously and
+retained it after another reset without a host Confirm command. Reversing the roles
+required no driver, protocol or client changes. Boot results were checked through
+diagnostic USB; the browser reported only verified staging. These one-hop
+empty-appliance checks do not establish multi-hop hardware delivery or physical
+appliance behavior.
+
+Each release contains the kernel and appliance implementation together. A canned
+appliance release can apply to several compatible vertices; custom implementations
+can require distinct packages. Platform, layout, appliance, and surface checks
+remain at each receiver. Propagating a retained release between compatible peers
+is later work: current receivers do not yet expose their flash as a package source.
+
 ## Package and timing
 
 A fixed-format numeric package header binds the image length and digest to its
@@ -216,9 +245,10 @@ inside that layout and never rewrite its recovery loader or partition map.
    explicit limits are described below.
 3. **Autonomous activation.** Measured local-cost deferral, appliance holds, and
    neighbor notices are implemented. Local health confirmation and watchdog-backed trial recovery are implemented.
-   Cost-based staging admission and incremental verification are implemented. Integrate the small
-   package-serving operation with the tablet peer; the MCU receiver owns its
-   lifecycle. Add compatible-release packaging checks before unattended rollout.
+   Cost-based staging admission and incremental verification are implemented. A
+   standalone computer peer now supplies packages through the same receiver. Remote
+   running-release reporting and compatible-release packaging beyond unchanged
+   surfaces remain subsequent work; the MCU receiver owns its lifecycle.
 
 Host checks cover the common state transitions and bounds. Hardware checks answer
 the flash and boot questions on both ports. RF capture experiments remain in the
@@ -342,7 +372,7 @@ surface dumps and the matching candidate release; the packager does not extract
 or prove those properties from arbitrary machine code.
 
 Remaining work: shorter port-level indivisible flash pauses, stale-handle/rebind support,
-and tablet package-serving integration. Page erases remain indivisible; image
+and remote running-release reporting. Page erases remain indivisible; image
 verification is incremental. Each synchronous step can pause radio service. A completed transfer is
 not evidence of uninterrupted background operation. Physical power cuts during an
 individual flash write or swap remain distinct from reset/resume and host fault
@@ -694,6 +724,13 @@ then completes bounded verification, selects the image and checks retained B aft
 reset without host confirmation. This is a maintained local receiver/flash check;
 it does not replace the earlier radio-transfer checks or prove physical appliance
 latency during an erase.
+
+For a subsequent candidate without reprovisioning a running fixture, set
+`LATTICE_UPDATE_RELEASE=N` when building its `ota` binary. The build embeds that
+release identity, and packaging must use the same value. Without the override,
+the maintained A/B fixtures remain releases 1 and 2. This override is for a single
+candidate build; assigning the same override to both A/B builds would defeat a
+version-advancing test.
 
 ### Staging validation, 2026-10-18
 

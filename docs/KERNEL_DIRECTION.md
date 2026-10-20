@@ -118,6 +118,94 @@ endpoint, never a Boolean-condition dependency. Changes produced by its hardware
 operation propagate through the affected states. A transformer's return value is
 not a replacement for state-change messaging.
 
+### Installed history and derived state
+
+Planned fragment installation includes bounded retained observations and computed
+state. A computation may need earlier values or a maintained result, beyond the
+current appliance value. Its inputs remain grounded in the states the hardware
+actually exposes and explicitly supplied commissioning data. Storing or calculating from observations does not supply a
+missing physical observation; richer automation may require additional hardware.
+
+An installed state definition supplies its input references, copy/computation
+operation, triggering deltas or predicate, and storage/retention bound. Its IR
+definition also supplies the value type and mathematical meaning; initialization,
+reset behavior and update ordering belong to the installed definition. The kernel
+owns the reserved structured memory and invokes the compiled state updater when its
+declared trigger occurs. The appliance author does not implement each automation's
+history buffer or add a Rust state type for every installed definition.
+
+Firmware qualifies its own hardware observations through appropriate sampling,
+filtering, debouncing, hysteresis and quantization. The kernel retains registered
+changes, not every hardware sample or scheduler tick. A history retains a bounded
+number of accepted observations with explicit eviction; a computed value can use
+one register or a small fixed record. Both are resident state, separate from
+transport buffering and graph execution. There is no mandatory 24-hour archive.
+
+The state updater receives the captured change and any declared prior retained values.
+Calculations use their specified pre-transition inputs before replacing retained
+state; dependent computations see the completed result. Reading a state updater's own
+previous output does not implicitly subscribe it to that output as a new trigger.
+Only operands required by downstream work need to accompany a continuation.
+Each activation remains finite and change-driven.
+
+Installed retained/derived states must be enumerable in the shared mathematical
+surface. Current `Surface` and `peer::exposure::Description` only borrow immutable
+firmware definitions; extending that representation and its read consistency is
+part of this work, not behavior already implemented. Likewise, `observation::update`
+currently captures before/after values but passes only the source handle to local
+dependents. Its captured transition must become available to installed state updaters.
+
+The same installation mechanism accepts definitions from nucleus/FSPS or the
+tablet's simpler compiler. A basic installation does not acquire an FSPS dependency
+merely because an automation needs memory. The installed executable encoding
+remains open: native state updaters require target compilation; a bounded portable
+operation form requires its corresponding execution mechanism. Neither requires
+embedding the mathematical IR interpreter or a general-purpose VM.
+
+Shared cycle/clock consensus and synchronization from solar observations are deferred. Historical
+storage does not require a common cycle, universal timestamps, or periodic graph
+evaluation. Local elapsed time can be an explicit input when a computation needs
+it. Local solar calculation uses the commissioned context below; future
+observational nodes can supply additional environmental timing cues.
+
+### Commissioned solar context
+
+Planned commissioning accepts approximate installation latitude/longitude and a
+current UTC time reference from an ordinary commissioning peer. The computer and
+USB radio used for firmware maintenance can supply these values; the tablet can
+use the same operation. Neither becomes a permanent clock authority or execution
+coordinator. This configuration is independent of the appliance firmware package.
+
+The vertex owns a small rewritable nonvolatile configuration record in a
+port-reserved region outside application/rollback images and disposable transfer
+journals. Its reservation and commissioning messages still need implementation;
+the current OTA journal is not a commissioning store. Firmware replacement must
+preserve the configuration.
+
+While its counter remains continuous, the vertex derives current time from the
+supplied UTC reference and local elapsed ticks. A saved timestamp alone cannot
+measure time spent without power. Location survives a restart; usable current time
+requires a continuing backed RTC or a refreshed peer reference when counter
+continuity is lost. Preserve the distinction between stored last-known time and
+a valid current-time estimate. A connected commissioning client can refresh it
+without requiring an NTP service in the vertex network.
+
+When time must be reacquired, prefer a reachable peer with a valid current-time
+reference. That peer can be an ordinary vertex whose elapsed counter remained
+continuous; it need not be a dedicated RTC node. The receiver anchors its own
+counter to the supplied reference and continues independently. An unanchored peer
+cannot seed another. If no reachable peer retains valid time, a commissioning
+client or a surviving backed RTC supplies the new reference. This bootstrap does
+not designate a permanent clock master or implement ongoing clock consensus.
+
+Common solar calculation can derive predicted sunrise, solar noon and sunset from
+that context and register ordinary deltas at their boundaries. Jarvis's solar
+calculation core is a reuse candidate; its current sunrise/sunset API needs a noon
+calculation. Predicted solar phase and observed illumination remain distinct
+states. An outdoor light/RTC vertex can improve available observations without
+being required for basic calculated solar context. No periodic graph evaluation
+or general-purpose VM follows from this facility.
+
 ## One kernel runtime
 
 The kernel's public startup path accepts the appliance definitions and the selected
@@ -629,8 +717,9 @@ byte and rejects older wire versions.
 The tablet and its attached nRF use one resident network identity. The new optional
 `host-link` feature adds one fixed local request/response exchange and eight
 pending change records, without USB code in the common kernel or a new radio
-configuration API. The Linux client and
-maintained XIAO attachment firmware live in `lattice-tablet`. Ordinary appliance
+configuration API. The Linux client lives in `lattice-tools`; `lattice-tablet`
+depends on that published crate and packages its matching CLI. The maintained
+XIAO attachment firmware stays in `lattice-tablet`. Ordinary appliance
 builds do not include this feature. Its operations now include status, link/surface/state reads, and native calls.
 The Linux client can inspect a complete LSF description and consume its exposed
 references. Registered local changes and accepted, deduplicated remote deltas
@@ -665,8 +754,9 @@ remote addresses are never dereferenced as local memory. The wire encoding is an
 implementation choice, not a reason to introduce an ECS, copied world model,
 global object registry, auto-incremented entity IDs, or relational edge tables.
 
-Use static task/control storage and bounded communication buffers. Fixed rings
-with explicit eviction are transport storage, not a graph-job queue. Choose packing,
+Use static task/control storage and bounded communication buffers. Existing frame
+and outgoing-delta rings are transport storage. Planned history rings retain
+observations as installed state; neither represents pending graph jobs. Choose packing,
 layout, and hardware offload against the target's actual memory and latency needs.
 The radio task has a fixed 12 KiB stack (24 KiB with signed updates) and a static
 task control block. Nordic
@@ -695,6 +785,14 @@ work and activation downtime. The receiver stages and verifies an inactive image
 then chooses a local activation opportunity. The port and bootloader own trial,
 confirmation, and recovery. Any capable peer can supply the package; neither the
 tablet nor nucleus is a required update coordinator.
+
+Maintenance uses a computer and USB radio companion as an ordinary peer. A local
+application discovers reachable vertices and supplies a user-selected signed
+image through existing forwarding. The image contains kernel and appliance code
+together. Canned releases may serve multiple compatible vertices; custom firmware
+can require a distinct release. A router, Internet connection, tablet, and permanent
+update coordinator are not prerequisites. Retained-image propagation is planned
+separately from the implemented receiving path.
 
 The Nordic local storage/boot slice is implemented with host checks and a passing
 XIAO USB/RTOS staging, trial, confirmation, and reversion check. Its port and separately
@@ -731,6 +829,8 @@ flowchart TB
     state["kernel::change: bounded outgoing deltas"]
     invocation["peer::invocation: native dispatch and bounded result replay"]
     peers["Authorization and installed compiled-fragment dispatch: to build"]
+    retained["Installed history and derived state with per-delta computation: to build"]
+    solar["Commissioned location/time and local solar calculation: to build"]
     discovery["kernel::peer: channel survey, computed rendezvous, arrival and message dispatch"]
     exposure["peer::exposure: borrowed local IR and bounded range encoding"]
     links["peer::links: maintained adjacent peers, confirmation, refresh and cursor enumeration"]
@@ -767,7 +867,9 @@ flowchart TB
     hostlink["Optional kernel::host: fixed exchange, read/call origins, bounded change delivery"]
     hostwire["peer/wire: shared scalar codec and optional host records"]
     tabletradio["lattice-tablet firmware: XIAO USB and host task"]
-    tabletpeer["lattice-tablet peer: Linux serial client"]
+    tabletpeer["lattice-tablet: shared peer dependency and CLI packaging"]
+    maintenance["lattice-tools maintenance: local discovery and drag-and-drop firmware supply"]
+    hostpeer["lattice-tools peer: reusable Linux serial client, discovery and update transfer"]
     sync["Existing safe synchronization API"]
 
     surface -->|native access| appliance
@@ -793,8 +895,10 @@ flowchart TB
     usbconsole -->|USB peripheral driver| nordic
     tabletradio <-->|requests, completions and pushed changes| hostlink
     tabletradio -->|USB peripheral driver| nordic
-    tabletpeer <-->|USB stream| tabletradio
-    tabletpeer -->|codec| hostwire
+    tabletpeer -->|published library and same-revision CLI| hostpeer
+    maintenance -->|selected destination and immutable package| hostpeer
+    hostpeer -->|shared numeric codec| hostwire
+    hostpeer <-->|USB through an ordinary companion| hostlink
     hostlink -->|codec and records| hostwire
     discovery -->|shared scalar/status encoding| hostwire
     exposure -->|shared typed literals| hostwire
@@ -873,10 +977,17 @@ flowchart TB
     peers -.->|invokes reached transformer| binding
     peers -.->|runs in kernel execution contexts| tasks
     peers -.->|configures and exchanges frames| transport
+    peers -.->|installs definitions, bounded storage and state updaters| retained
+    observation -.->|qualified changes and captured transitions| retained
+    retained -.->|enumerates installed mathematical state| exposure
+    retained -.->|retained values and computed operands| peers
+    hostpeer -.->|commissioning data through ordinary peer messaging| solar
+    cpu -.->|elapsed counter and reserved configuration storage| solar
+    solar -.->|calculated solar state and boundary changes| observation
     radio -->|IRQ waker notifies resident task| tasks
 
     classDef planned stroke-dasharray: 5 5;
-    class peers planned;
+    class peers,retained,solar planned;
 ```
 
 ## Current baseline
@@ -989,7 +1100,10 @@ activation, and their forwarding semantics. Native transformer invocation is now
 available independently of fragment installation. Keep upstream state
 activation distinct from downstream execution. Nucleus supplies compiled work;
 its full implementation is not a prerequisite to building the node's common
-mechanics. Relay optimization and storage tuning follow concrete implementation
+mechanics. Start the retained-state slice with an existing exposed state, bounded
+history and a compiled state updater that maintains an enumerable derived value. This
+does not depend on a hypothetical sensor or shared clock. Relay optimization and
+storage tuning follow concrete implementation
 needs rather than displacing these first runtime steps.
 
 ## Development approach

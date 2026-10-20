@@ -8,6 +8,6 @@ pub fn policy(platform: u16) -> lattice_vertex::kernel::update::package::Policy 
         layout: 2,
         appliance: [1; 16],
         surface: lattice_vertex::kernel::update::surface_identity(&lattice_vertex::surface::EMPTY),
-        release: if cfg!(feature = "ota-image-b") { 2 } else { 1 },
+        release: u64::from_le_bytes(*include_bytes!(concat!(env!("OUT_DIR"), "/update-release.bin"))),
     }
 }
