@@ -17,7 +17,7 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicU8, Ordering},
 };
 
-/// Local installation failure. No new binding is published on these failures.
+/// Local retained-state installation failure. No new binding is published on failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstallError {
     /// Initialize the owning appliance first.
@@ -30,14 +30,6 @@ pub enum InstallError {
     AlreadyInstalled,
     /// The source is not an exposed native state of this appliance.
     UnknownSource,
-    /// A declared operand is not part of this appliance's exposed state.
-    UnknownInput,
-    /// The continuation is not an exposed transformer of this appliance.
-    UnknownTransformer,
-    /// A peer target has a reserved/invalid address or transformer reference.
-    InvalidTarget,
-    /// The fragment's argument count disagrees with its target.
-    Arguments,
     /// The history's native scalar type disagrees with its source.
     Type,
     /// The supplied mathematical predicate has an invalid input signature.
@@ -174,72 +166,6 @@ impl<A: Send, E> Appliance<A, E> {
             self.installed
                 .store(ptr::from_ref(node).cast_mut(), Ordering::Release);
             Ok(())
-        })
-    }
-
-    /// Bind one compiled condition and its local or peer transformer continuation.
-    /// Trigger/operands and any local target must belong to this appliance. Peer
-    /// targets require valid references and a signature fitting one frame; their
-    /// availability and native limits are checked by the destination. Install
-    /// retained operands first and finish installations before publication.
-    pub fn install_fragment<const I: usize, const O: usize>(
-        &'static self,
-        context: &TaskContext,
-        fragment: &'static super::fragment::Fragment<A, E, I, O>,
-    ) -> Result<(), InstallError> {
-        self.with_installation(context, |appliance| {
-            if !self
-                .surface
-                .states
-                .iter()
-                .any(|s| ptr::eq(*s, fragment.source))
-            {
-                return Err(InstallError::UnknownSource);
-            }
-            if !fragment
-                .inputs
-                .iter()
-                .all(|input| self.state_definitions().any(|s| ptr::eq(s, *input)))
-            {
-                return Err(InstallError::UnknownInput);
-            }
-            match &fragment.target {
-                super::fragment::Continuation::Local(target) => {
-                    if !self
-                        .surface
-                        .transformers
-                        .iter()
-                        .any(|t| ptr::eq(*t, *target))
-                    {
-                        return Err(InstallError::UnknownTransformer);
-                    }
-                    if target.definition().effect.arguments.len() != O {
-                        return Err(InstallError::Arguments);
-                    }
-                }
-                super::fragment::Continuation::Peer(target) => {
-                    if [target.owner, target.transformer]
-                        .iter()
-                        .any(|&v| v == 0 || v == u64::MAX)
-                    {
-                        return Err(InstallError::InvalidTarget);
-                    }
-                    let bytes: usize = 1 + target
-                        .arguments
-                        .iter()
-                        .map(|ty| match ty {
-                            crate::ir::Type::Bool => 2,
-                            crate::ir::Type::Integer(ty) => 1 + ty.width() as usize / 8,
-                        })
-                        .sum::<usize>();
-                    if O > lattice_peer_wire::MAX_CALL_ARGUMENTS
-                        || bytes > lattice_peer_wire::CALL_ARGUMENT_BYTES
-                    {
-                        return Err(InstallError::Arguments);
-                    }
-                }
-            }
-            fragment.install(appliance)
         })
     }
 

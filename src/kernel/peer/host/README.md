@@ -21,16 +21,14 @@ terminate at the local caller. Host tokens are not radio neighbors or credential
 Reads seed their 16-bit radio counter once from the first host read token, then
 advance it across kinds and USB reconnects. This avoids deliberately reusing
 read 1 after an MCU reboot, while retaining probabilistic collision limits. Calls
-use the common kernel invocation-ID allocator shared with compiled continuations.
-The most recent eight host tokens retain their radio IDs across USB disconnects;
-host replies still carry the original full 32-bit host token. Eviction of that
-mapping makes reuse of an old host token a new radio invocation, so clients must
-not replay sent-but-unconfirmed commands. If the first call comes from USB, the
-allocator uses the client's token entropy; otherwise it starts from the peer's
-clock/address seed. Within a boot IDs advance without wrapping; exhaustion rejects
-new calls. This is bounded, volatile identity, not durable exactly-once execution
-across reboot. Fragment results cannot satisfy a host request, and disconnect
-does not remove compiled-continuation packets.
+use a monotonic call-ID counter and eight token mappings owned by the resident
+host component. The host survives USB disconnects, so recent tokens retain their
+radio IDs; replies carry the original full 32-bit host token. Mapping eviction
+makes reuse of that token a new radio invocation, so clients must not replay
+sent-but-unconfirmed commands. The first host token seeds the counter. Within a
+boot IDs advance without wrapping; exhaustion rejects new calls while retained
+mappings remain usable. This is bounded, volatile identity, not durable exactly-once
+execution across reboot. No ordinary appliance carries this optional host state.
 Requests time out after eight seconds without automatic retry. A call timeout,
 USB loss, or failed transmission does not prove the native operation did not run.
 

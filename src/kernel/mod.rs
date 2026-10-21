@@ -34,8 +34,6 @@ pub use appliance::{Appliance, InstallError};
 #[cfg(feature = "use-mutexes")]
 pub(crate) mod change;
 pub mod event_groups;
-#[cfg(feature = "use-mutexes")]
-pub mod fragment;
 pub mod list;
 pub(crate) mod peer;
 #[cfg(feature = "firmware-update")]
@@ -57,7 +55,7 @@ pub mod timers;
 /// The resident radio enters common peer discovery. Appliance code supplies no
 /// channel, PAN, discovery loop, or diagnostic workload.
 /// `appliance` owns the initialized native instance and borrows its static surface.
-/// Complete local retained-state and fragment installation first; startup seals
+/// Complete local retained-state installation first; startup seals
 /// those bindings and exposes the combined native and installed state definitions.
 /// The resident task serves definitions, invokes exposed native transformers,
 /// and sends registered observation deltas. Relays retain bounded directions and

@@ -107,7 +107,7 @@ fn local_pending() -> bool {
     if crate::kernel::peer::host::pending() {
         return true;
     }
-    crate::kernel::change::pending() || crate::kernel::peer::continuation::pending()
+    crate::kernel::change::pending()
 }
 
 #[derive(Clone, Copy)]

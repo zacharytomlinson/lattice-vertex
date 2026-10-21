@@ -10,14 +10,13 @@ accepted remote deltas also stream to an attached host without state polling.
 The host event buffer is bounded and reports oldest-event eviction separately
 from command results; it does not guarantee RF delivery or retain state history.
 
-Installed `Fragment::to_peer` continuations originate the same invocation frames
-without a host. A fixed four-packet handoff carries already-computed arguments to
-the resident radio task, with oldest eviction and no program retry. Calls share
-one per-boot radio-ID allocator; host tokens are mapped separately for correlation.
-`Submitted` is the fragment's handoff outcome, not a claim of native execution.
-Results terminate at their actual origin; a fragment result cannot satisfy a
-host request. See [conditional fragments](../../../docs/KERNEL_DIRECTION.md#conditional-fragments-and-continuations)
-for packet bounds and identity limitations.
+This is native control, not distributed program installation. The callback-based
+fragment prototype and its transport buffer have been removed. The compiler's
+resident predicates, upstream/conditional edges and per-traversal storage remain
+[design work](../../../docs/KERNEL_DIRECTION.md#program-installation-and-current-boundary).
+Experimental LVT v7 opcodes 19/20 and result statuses 6/7 are retired and rejected;
+do not reuse them for different semantics within this wire version. Native
+invocation opcodes 8/9, statuses 0–5, and host-v4 encoding are unchanged.
 
 ## Appliance ownership
 
@@ -121,7 +120,7 @@ withdrawn unless newer evidence confirmed it; success through the other branch
 does not preserve a silent direction. Candidates expire independently after 60
 seconds without confirmation. No route record or radio completion proves execution.
 
-At the owner, eight recent invocation records retain caller/request, transformer,
+At the owner, eight recent invocation records retain caller/request, transformer reference,
 exact arguments, and returned status. An identical duplicate returns that status.
 Reusing caller/request for different content returns `ConflictingRequest`.
 These records are replaced in insertion order, and do not survive reboot.
@@ -164,8 +163,7 @@ their ordinary completion/cancellation rules. Coalesced wakeups do not coalesce 
 
 Each accepted delta can cross eight links. Relays retain eight recent owner/sequence
 keys for 10 seconds, suppressing duplicate transport copies without merging distinct
-changes. A received remote delta never overwrites local appliance state. Installed
-conditional activation remains later work. State sequence numbers restart on reboot;
+changes. A received remote delta never overwrites local appliance state. Resident upstream activation and forward program traversal remain unimplemented. State sequence numbers restart on reboot;
 rapid restart can collide with retained history. Missing frames, ring eviction, or
 history eviction are not recovered by a retry engine or a current-state cache.
 
@@ -231,5 +229,7 @@ Component checks are owned by the code whose properties they constrain:
 Tables partition these local boundaries without simulating several peers or
 reimplementing appliance behavior. Replay checks apply while the result remains
 retained; they do not extend that guarantee across history eviction or reboot.
-Ordinary and observer C6/nRF images build. These are host/build checks: this new
-path has not been exercised on boards, and RF investigation remains paused.
+Ordinary C6/nRF images build. Earlier callback-chain hardware captures remain in
+the external lab as evidence of native calls, retained-state maintenance and
+operand transport. They do not validate an externally installable distributed
+program. RF investigation remains paused.

@@ -6,6 +6,11 @@ come from `lattice-ir`; protocol status values live here so the host need not in
 a second interpretation of native dispatch or state-read failures. The registered
 `StateChange` record is also shared by RF deltas and host events.
 
+Native invocation messages use the existing scalar argument bounds and statuses
+0–5. Experimental LVT v7 opcodes 19/20 and statuses 6/7 belonged to the removed
+callback-fragment prototype; they are now rejected and reserved against semantic
+reuse in this wire version. The distributed program/head encoding remains open.
+
 The optional `host` feature adds the bounded local packet records and COBS stream
 codec described in [the host interface](../host/README.md). This replaces the former
 `lattice-host-link` crate under `host/wire`: scalar encoding now has both radio and

@@ -23,7 +23,10 @@ Read this plan alongside the
 [architecture white paper](Lattice-DRTOS-Architecture-White-Paper.docx). This file
 defines repository ownership and the implementation sequence. Existing interfaces
 are provisional and must be brought into alignment with it. The
-[current baseline](#current-baseline) identifies what is implemented today.
+[current baseline](#current-baseline) identifies what is implemented today. The
+read/write-head capacity, local time/solar placement and independent traversal
+rules below record the latest decisions; corresponding white-paper passages are
+updated with them. The storage/installation ABI still needs a concrete design.
 
 ## Division of responsibility
 
@@ -65,220 +68,198 @@ requirements for this basic installation.
 
 ## Local participation produces the distributed kernel
 
-Each vertex encapsulates its appliance, retains its assigned relationships and
-compiled fragments, and responds to local changes or received messages. Those
-local responses collectively produce the distributed operating system.
+Each vertex owns its appliance's state and native mutation functions. Appliance
+firmware does the physical work: a function such as `SetIntensity` encapsulates
+how the device achieves that intensity. The kernel supplies the state interfaces,
+resident program relationships, local execution facilities, and peer plumbing.
+An appliance author must not know or precompile the installation's automations.
 
-A node's common kernel behavior includes:
+The graph embeds the executable. A registered change follows the affected state's
+resident upstream relationships to each relevant program head. At an enabled head,
+forward traversal begins. A visited predicate reads its owner's current state,
+performs its local test and follows its authored true or false continuation.
+A successful path reaches a native mutation handle with the required arguments.
+The actual observations produced by that operation start ordinary dependent
+traversals, including another traversal of the same program if it depends on them.
 
-- Enumerating and exposing states, transformers, axioms, and invariants.
-- Broadcasting state changes and passing activation upstream through its resident
-  state dependencies.
-- Evaluating its assigned compiled conditional and forwarding the continuation.
-- Invoking a reached native state transformer with the supplied arguments.
-- Forwarding peer messages and participating in relay when required.
+Boolean composition belongs in the graph's connections. For `A && B`, A's true
+edge reaches B and its false edge terminates the path. For `(A || B) && C`, A's
+true edge reaches C and its false edge reaches B; B's true edge reaches C and its
+false edge terminates. B does not need A's Boolean result or an `AND`/`OR`
+instruction. A local false result can also take another explicitly authored branch.
+An unavailable input is not silently converted to false to select an alternative.
 
-No individual node conducts a walk over the entire distributed graph. Nucleus is
-an installation and compilation peer; ordinary execution does not require it to
-relay or approve each operation. Communication is peer to peer, without a required
-router role or permanent central runtime coordinator.
+This remains state reconciliation through authored mutation paths. It does not
+require a second, globally replicated target-state machine, an arbitration service
+assigning actuators, or a central executor conducting the walk. State ownership
+already identifies who can observe and mutate it. Semantic edges identify the
+required state/function owners; radio paths can add relays without adding tests,
+changing operands, or bypassing a semantic dependency.
 
-Change is the unit of execution. Handle changes and messages as they arrive.
-Separately registered deltas remain distinct; a later change does not silently
-withdraw earlier work. There is no graph work queue, periodic graph evaluation
-cycle, or extra graph scheduler. Existing RTOS tasks and synchronization provide
-local execution facilities, including overlapping work where needed. Local timers
-remain available for hardware and communication needs.
+Each registered change is a new cause. Traversals may overlap, including traversals
+of the same program. A later change neither cancels nor supersedes an earlier
+traversal and cannot overwrite its carried values. Predicates already passed are
+not revisited; predicates not yet visited read their owner's state when reached.
+There is no global state snapshot, program-wide execution lock, or requirement to
+wait for all previous physical effects before admitting another change. Ordinary
+local synchronization protects native state and hardware where required.
 
-Task notifications signal that work or transport data is available. They do not
-replace the data describing distinct changes. Notification coalescing must not
-silently become coalescing of graph activations. Transport buffering and delivery
-mechanics must preserve the distinction between transmission, peer receipt, and
-execution; the kernel must not invent repeated transformer invocations.
+FreeRTOS-derived tasks and synchronization remain the local execution facilities.
+There is no additional graph scheduler, pending-tail execution queue, or polling
+cycle over all programs. Native command acceptance, message receipt, and observed
+physical completion are distinct facts. Continuation requiring a physical outcome
+must depend on that observation, not infer it from a function return or radio ACK.
+
+Task notifications signal available work; they do not hold or coalesce the data
+of distinct changes. Communication buffering and bounded duplicate handling must
+not become program retries, supersession, or a global execution barrier.
+
+The traversal behavior above is the intended model. Current state registration,
+native dispatch, and routing are working components; resident distributed-program
+bindings and their installation are still to be implemented.
 
 ## Mathematical definitions and native execution
 
 `lattice-ir` defines mathematical state, transformations, constraints, and the
-information nucleus needs for reasoning. Firmware can retain those definitions
-as static data and expose them through the common kernel.
+information needed for synthesis and validation. The shared IR describes what the
+appliance's states and operations mean. It is not a bytecode interpreter hosted by
+the vertex. Axioms and invariants remain part of the exposed surface.
 
-Nucleus solves and compiles programs, then delegates their fragments. For the
-basic installation, the tablet can compile the user's graph directly without an
-FSPS. The initial program is a finite DAG of state references, predicates/basic
-arithmetic, native transformer handles and arguments, and continuation references.
-Compilation binds those steps to participating vertices; it need not emit new
-machine code for each architecture. The vertex supplies the small execution
-primitives. Neither the shared IR crate nor the vertex kernel needs an IR
-interpreter, compiler, or solver. Preserve the current one-invocation-per-requirement
-synthesis limit; expanding it does not imply a general-purpose program runtime.
+Nucleus can synthesize a program; the basic tablet installation can author a
+limited graph without an FSPS. Compilation resolves state and function references,
+places local predicates/calculations with their input owners, connects conditional
+edges, and determines storage and argument bindings. The resulting definitions
+must be installable after appliance firmware is built. They must not require a
+Rust evaluator callback authored for each automation or a firmware rebuild.
+
+A resident binding needs its owned input references, local predicate/calculation,
+upstream relationships, authored continuations, and operand locations. Boolean
+composition is represented by those continuations. Arithmetic uses the shared
+IR's declared-width semantics. The concrete record and installation encodings
+remain design work; no replacement public API is being introduced by this cleanup.
 
 State dependencies and transformer invocation have different roles. Upstream
 activation belongs to states used by conditions. A transformer is an invocation
-endpoint, never a Boolean-condition dependency. Changes produced by its hardware
-operation propagate through the affected states. A transformer's return value is
-not a replacement for state-change messaging.
+endpoint, never a Boolean-condition dependency. The firmware establishes actual
+state and reports its changes through the ordinary state interfaces.
 
-### Installed history and derived state
+### Read/write head and greedy computation
 
-Fragment installation includes bounded retained observations and computed
-state. The first local installation path is implemented; receiving installations
-over the network remains planned. A computation may need earlier values or a maintained result, beyond the
-current appliance value. Its inputs remain grounded in the states the hardware
-actually exposes and explicitly supplied commissioning data. Storing or calculating from observations does not supply a
-missing physical observation; richer automation may require additional hardware.
+The head carries only the values still needed downstream. Each vertex contributes
+its local inputs and completes as much calculation as is valid at that point in
+the authored traversal. The last visited owner supplying a required input computes
+the most reduced result possible before forwarding. The mutation owner can pass
+that value directly to its native operation or finish a calculation requiring its
+own local state. This uses the evaluation pass rather than collecting all inputs
+for a second pass or moving all computation to the final node.
 
-An installed state definition supplies its input references, copy/computation
-operation, triggering deltas or predicate, and storage/retention bound. Its IR
-definition also supplies the value type and mathematical meaning; initialization,
-reset behavior and update ordering belong to the installed definition. The kernel
-owns the reserved structured memory and invokes the compiled state updater when its
-declared trigger occurs. The appliance author does not implement each automation's
-history buffer or add a Rust state type for every installed definition.
+The compiler determines the peak simultaneously live carried values and their
+byte requirements for the emitted traversal. It assigns operand locations and
+reuses them after their last use. Capacity is neither one scalar for every program
+nor one slot per predicate. For `(a - b) * c`, with inputs encountered in that
+order and no later use of the intermediates, one carried location can successively
+hold `a`, `a - b`, and `(a - b) * c`. Widths and padding must be included in the
+actual byte bound. Constants or values supplied at the execution owner need not
+occupy carried storage before they are needed.
 
-Firmware qualifies its own hardware observations through appropriate sampling,
-filtering, debouncing, hysteresis and quantization. The kernel retains registered
-changes, not every hardware sample or scheduler tick. A history retains a bounded
-number of accepted observations with explicit eviction; a computed value can use
-one register or a small fixed record. Both are resident state, separate from
-transport buffering and graph execution. There is no mandatory 24-hour archive.
+The layout belongs to the program; its contents belong to one traversal.
+Independent changes require independent working values. The compiler must ensure
+that every path reaching an operation supplies its operands: short-circuiting a
+predicate cannot omit an input still required by a downstream calculation.
 
-`kernel::state::RetainedState` supplies a concrete first slice: one native source,
-a statically sized ring of its scalar values, and one compiled function from that
-history to a computed scalar. `Appliance::install_state` binds the record once to
-an initialized appliance before startup. It checks source ownership and scalar
-types; the supplied IR predicate describes the calculation. The compiler owns
-the correspondence between that predicate and native code, as with native
-transformers. The kernel does not execute or prove the predicate.
+This is compiler-sized structured working memory, not an implicit expression
+stack, dynamic allocation, or a buffer shared by overlapping executions. The
+existing native-call argument codec is not the executable's read/write-head ABI;
+its 61-byte limit describes current native invocation messages only. The actual
+head layout, supported local operations, and installation admission must be worked
+out together against the ports' storage and communication bounds.
 
-History starts empty. A qualified change appends its captured post-value, evicts
-the oldest value when full, then computes the result from the updated history.
-Age zero is newest. Missing or unavailable observations read as `None`, so the
-demonstrated difference of two observations remains unavailable until both exist.
-An unchanged `update` adds nothing; an explicit `changed` report adds an observation
-without claiming a captured before-value. All histories in a grouped observation
-are maintained before native dependent callbacks run. Those callbacks receive
-the original before/after transition even if an earlier callback changes the
-appliance again.
+### Retained history and derived state
 
-`Appliance` enumerates both native definitions and installed history/result
-attributes with their mathematical predicates. `peer::exposure::Description`
-encodes that combined surface through the existing LSF v1 format, borrowing the
-resident definitions without copying their values. Publication seals installation
-so encoded ranges and references remain stable. Normal owner-directed reads use
-the same appliance lock; changed history views and results use ordinary deltas.
-OTA compatibility fingerprints include the installed definitions.
+A program can require bounded observations or computed state that survives one
+traversal. Such storage remains distinct from the head's temporary operands.
+Its inputs come from exposed appliance state or explicitly commissioned context;
+retaining or calculating values does not invent a missing hardware capability.
+The installed definition must identify sources, maintenance operation, triggering
+changes, and capacity. Firmware continues to qualify physical observations through
+its own sampling, debouncing, filtering and quantization. The kernel retains
+registered observations, not every sample or RTOS tick.
 
-The current updater receives read-only history, not mutable appliance access or
-its own previous output. Multi-source calculations, retained accumulators,
-conditional maintenance, local activation from installed states, and hot
-installation/replacement remain later extensions. Only operands required by
-downstream work need to accompany a continuation. Each activation remains finite
-and change-driven.
+The working `kernel::state::History` and `RetainedState` helpers use native-width
+static storage. `Appliance::install_state` currently binds them before startup to
+a native source and a firmware-compiled updater. A qualified report appends its
+captured post-value, evicts the oldest when full, and updates the computed result.
+Missing observations remain unavailable. An unchanged update adds no sample;
+an explicit change report can append an equal value. Grouped reports finish
+retained maintenance before native dependent callbacks run.
 
-The eventual network installation mechanism will accept definitions from nucleus/FSPS
-or the tablet's simpler compiler. A basic installation does not acquire an FSPS dependency
-merely because an automation needs memory. The installed executable encoding
-remains open: native state updaters require target compilation; a bounded portable
-operation form requires its corresponding execution mechanism. Neither requires
-embedding the mathematical IR interpreter or a general-purpose VM.
+These helpers are useful storage/observation facilities, not the compiler's
+program installation interface. They currently accept a native function pointer,
+only one source history, and no mutable accumulator input. Externally authored
+maintenance operations, multiple input owners, and installation after startup
+still need the resident-program representation. Do not turn those limitations into
+a requirement for the appliance author to precompile automations.
 
-Shared cycle/clock consensus and synchronization from solar observations are deferred. Historical
-storage does not require a common cycle, universal timestamps, or periodic graph
-evaluation. Local elapsed time can be an explicit input when a computation needs
-it. Local solar calculation uses the commissioned context below; future
-observational nodes can supply additional environmental timing cues.
+The combined appliance surface exposes bound history/result attributes and their
+mathematical definitions. Normal reads use the existing appliance lock; changes
+use ordinary delta transport. Publication seals these startup definitions, and
+OTA surface fingerprints cover them. Immutable surface publication must not be
+mistaken for a rule that distributed programs can only be installed before boot.
 
-### Conditional fragments and continuations
+### Program installation and current boundary
 
-`kernel::fragment::Fragment` now binds a native trigger, a fixed array of declared
-state operands, an already-compiled condition/argument function, and a local or
-peer transformer continuation. `Appliance::install_fragment` checks source/input
-ownership and local target ownership/arity. Peer targets supply an owner address,
-owner-local reference and declared argument types; reserved references and
-signatures exceeding one invocation frame are rejected. Retained operands must already
-be installed. Both installation paths share the appliance's pre-start gate and
-the common `kernel::InstallError`; publication closes both paths.
+Program definitions will arrive from an ordinary compiler/delegate peer. They
+must become fixed resident records linked to the owner's actual state and native
+functions, with upstream and conditional successor references. The program head
+controls enablement; readiness must precede admission. Persistence reconstructs
+these relationships after boot without replaying old mutation commands. Storage,
+reference reconstruction and activation must be designed as one implementation,
+not bolted onto a firmware-resident evaluator demonstration.
 
-A registered change first maintains the entire report's retained state. Each
-source then evaluates its installed fragments in registration order before its
-native callbacks. The kernel captures that fragment's declared operands; an
-unavailable operand stops evaluation, and a compiled `None` stops continuation.
-A local argument array is type-checked by the existing transformer adapter
-and invoked once under the already-held appliance lock. The transformer remains
-responsible for reporting actual observations. Acceptance does not manufacture a
-delta, and failure does not cause retry. Each fragment retains one last-completed
-outcome for local inspection, not an execution log.
+The removed `Fragment` callback prototype provided neither externally installable
+predicates nor upstream-to-head activation or an authored false continuation. Its
+API, dispatch hooks, private outgoing packet ring and dedicated tests were removed.
+The external lab retains its source snapshot and hardware evidence. Those runs
+proved callback dispatch and operand transport, not installation of an automation
+unknown when the firmware was compiled.
 
-The trigger operand uses the originating report's captured post-value. Other
-operands are read when that fragment is reached, including completed retained
-values. Earlier continuations or callbacks may therefore affect a later
-fragment's non-trigger inputs; this is sequential execution, not an atomic
-snapshot across every activation. Operand and argument extents are compile-time
-constants. The compiler supplies terminating code and finite continuation
-relationships; the kernel does not interpret IR or prove arbitrary native code.
+Retained components are state readers and mutation adapters, observation capture,
+local history storage, native invocation/replay, and peer delivery. The optional
+host owns its call-ID mappings; there is no unused fragment transport buffer.
+Program loading, native primitive bindings, per-traversal working storage and
+semantic traversal messages remain unimplemented. Native calls and surface reads
+must not be relabeled as program installation or execution.
 
-`Fragment::to_peer` submits the computed arguments to the existing LVT v7 native
-invocation path. The destination performs its existing signature/reference checks
-and bounded result replay. The sender evaluates once; its resident radio task
-drains four fixed encoded-packet records in FIFO order. Overflow evicts the oldest
-packet and increments `fragment::evicted_continuations()`. `Submitted` means only
-that transport accepted the encoded packet, and is not upgraded to `Invoked` by
-transmission or a later response. RF failure, eviction and a missing result do
-not re-evaluate or retry the program. Existing bounded MAC retries still apply.
-An invocation result terminates at its actual local origin; it cannot satisfy an
-unrelated tablet request. Pending packets wake the radio and defer update work.
+### Commissioned time and solar predicates
 
-The handoff uses at most 61 argument bytes, within one 125-byte MAC frame, with
-no new wire format or fragment reassembly. Optional host calls share the kernel's
-monotonic invocation-ID allocator. Eight host-token mappings preserve recent
-identities across USB reconnects; evicted tokens must not be reused as retries.
-Within a boot, fresh IDs never wrap/recycle. Startup uses clock/address
-decorrelation, or client-token entropy when USB supplies the first call; this
-does not establish unique identity across autonomous reboots. The transport plus
-optional host mappings has a 640-byte compile-time ceiling and allocates no heap.
+Every vertex kernel will provide the same local time and solar capabilities.
+The program binds a time/solar predicate on the vertex where that evaluation sits
+in its semantic order. There is no designated clock/solar vertex that programs
+must visit, and no system-wide broadcast for each temporal boundary.
 
-Installation is still local before startup. This adds no appliance surface
-declarations. Remote code installation, continuation to another conditional
-fragment, activation directly from a retained attribute, and hot replacement
-remain open.
+Commissioning supplies approximate location and a current UTC reference through
+an ordinary computer/tablet peer. The kernel anchors its local elapsed counter
+and calculates the temporal boundaries needed by installed predicates. A timer
+expiry generates an internal delta at the bound predicate; that delta follows the
+normal upstream-to-head activation path. Forward traversal evaluates the predicate
+at its authored position. A timer does not skip prior conditions and directly
+invoke a program's eventual mutation.
 
-### Commissioned solar context
+Local deadline records and hardware timer interrupts provide these events. The
+kernel arms the next relevant boundary and rearms after handling it; it does not
+scan all program predicates every second. Time windows have their opening/closing
+boundaries, and solar predicates use calculated sunrise/sunset or other authored
+solar boundaries. Predicted solar state remains distinct from measured ambient
+illumination. Recurrence generates future changes, not an endless evaluation loop.
 
-Planned commissioning accepts approximate installation latitude/longitude and a
-current UTC time reference from an ordinary commissioning peer. The computer and
-USB radio used for firmware maintenance can supply these values; the tablet can
-use the same operation. Neither becomes a permanent clock authority or execution
-coordinator. This configuration is independent of the appliance firmware package.
-
-The vertex owns a small rewritable nonvolatile configuration record in a
-port-reserved region outside application/rollback images and disposable transfer
-journals. Its reservation and commissioning messages still need implementation;
-the current OTA journal is not a commissioning store. Firmware replacement must
-preserve the configuration.
-
-While its counter remains continuous, the vertex derives current time from the
-supplied UTC reference and local elapsed ticks. A saved timestamp alone cannot
-measure time spent without power. Location survives a restart; usable current time
-requires a continuing backed RTC or a refreshed peer reference when counter
-continuity is lost. Preserve the distinction between stored last-known time and
-a valid current-time estimate. A connected commissioning client can refresh it
-without requiring an NTP service in the vertex network.
-
-When time must be reacquired, prefer a reachable peer with a valid current-time
-reference. That peer can be an ordinary vertex whose elapsed counter remained
-continuous; it need not be a dedicated RTC node. The receiver anchors its own
-counter to the supplied reference and continues independently. An unanchored peer
-cannot seed another. If no reachable peer retains valid time, a commissioning
-client or a surviving backed RTC supplies the new reference. This bootstrap does
-not designate a permanent clock master or implement ongoing clock consensus.
-
-Common solar calculation can derive predicted sunrise, solar noon and sunset from
-that context and register ordinary deltas at their boundaries. Jarvis's solar
-calculation core is a reuse candidate; its current sunrise/sunset API needs a noon
-calculation. Predicted solar phase and observed illumination remain distinct
-states. An outdoor light/RTC vertex can improve available observations without
-being required for basic calculated solar context. No periodic graph evaluation
-or general-purpose VM follows from this facility.
+The commissioning store, deadline bindings, and solar calculation are planned,
+not implemented by the existing RTOS tick. A rewritable port-reserved configuration
+record must survive application updates and remain separate from disposable OTA
+journals. Location can survive restart; a saved timestamp cannot measure elapsed
+time without power. Current time requires a continuing backed RTC or reacquisition
+when local counter continuity is lost. Prefer a reachable peer with a valid time
+reference; otherwise use a commissioning client or backed RTC. An unanchored peer
+cannot seed another. There is no permanent time master or clock-consensus service.
 
 ## One kernel runtime
 
@@ -372,8 +353,8 @@ without an enumeration administrator or foreign-surface catalog.
 Invocation success records the native function's return, not physical convergence.
 The kernel publishes actual observations later as reported. Remote calls return
 `Busy` if the native instance is already in use. No automatic mutation retries,
-IR evaluation, or graph work queue is introduced. Authentication and installed
-compiled fragments remain separate work. The
+IR evaluation, or graph work queue is introduced. Resident program traversal and
+installation remain to be implemented. Authentication remains separate work. The
 [native invocation path](../src/kernel/peer/INVOCATION.md) documents the exact
 frame, observation, replay, and storage semantics.
 
@@ -539,17 +520,18 @@ owned deployments and authorizing operations are not decided by that tag or PAN.
 The `LVT` version-7 envelope carries discovery, proposals, surface reads, native
 calls/results, and deltas; it rejects earlier wire versions. Ordinary discovery still
 repeats every 2–3 seconds after selection. Presence never causes an echo. Broadcast discovery/proposals do not request ACKs;
-directed presence/proposal responses use the common MAC ACK path. No peer table, appliance formation/join knob,
-graph work queue, or repeated transformer invocation is introduced.
+directed presence/proposal responses use the common MAC ACK path. Formation exposes no appliance-selected network settings and does not invoke
+transformers. Maintained peer links are owned by the normal resident runtime.
 
 The board fixture's `peer-observer` feature observes this normal path. It supplies
 an authored test surface, registers a passive event callback, and reports counters;
 it supplies no radio settings, message generator, or handler. Both C6 and Nordic
 use the same common discovery and [surface reads](../src/kernel/peer/EXPOSURE.md).
 Arrival and periodic link discovery do not transmit complete mathematical definitions.
-Arrival notices can cross eight links. One owner-discovery round after joining
-finds preexisting owners; matching owner replies follow recorded reverse paths.
-Later periodic discovery stays link-local, and arrivals do not trigger new searches.
+Arrival notices can cross eight links. Owner search is explicit; normal startup
+does not inventory the network. Periodic discovery stays link-local, and arrivals
+do not trigger searches or surface transfers. Interested peers can follow resident
+links and use learned directions for reads and native calls.
 An interested peer requests a range from a named owner. The owner encodes that
 range from immutable IR without invoking native readers/transformers. Intermediates
 forward borrowed frames and retain only request paths and learned directions.
@@ -689,8 +671,9 @@ exact arguments and returned results; eight owner records replay an identical
 call's status without invoking again. Reused caller/request with different content
 is rejected. This replay is bounded by eviction/reboot and is not an exactly-once
 ledger. Unlike immutable read attempts, uncertain mutations must not be retried
-with fresh tokens. There are no automatic command retries. Installed executable
-fragments and their activation ABI remain future work.
+with fresh tokens. There are no automatic command retries. Distributed program
+messages will use the same peer delivery facilities, but
+resident semantic bindings and their installation are not implemented.
 
 A registered observation emits a compact owner/attribute/sequence/value delta.
 The kernel preserves distinct changes, including unavailable state, and relays
@@ -811,10 +794,10 @@ learning. Local native requests use the same appliance binding and result replay
 as radio requests; success is not a physical observation. Typed scalar encoding is
 shared in `peer/wire`, with no radio-wire or IR-language change.
 Disconnect invalidates host completions while peer participation continues. Radio
-read tokens persist across host reconnects. Native calls share the kernel's ID
-allocator with compiled continuations; eight retained host-token mappings preserve
-recent identities across USB reconnects. Replay protection remains bounded and
-volatile. USB disconnect does not clear the kernel's continuation packets.
+read tokens persist across host reconnects. The resident host owns a monotonic call-ID counter and eight retained host-token
+mappings across USB reconnects. IDs never wrap within a boot; evicted tokens must
+not be replayed as uncertain commands. Replay protection remains bounded and
+volatile, with no autonomous reboot-identity guarantee.
 A timeout produces a failure without retransmitting; for a mutation, its outcome
 remains unconfirmed until observed. Periodic maintenance now sends either a link
 exchange or discovery in one iteration, leaving reception available for the reply
@@ -916,10 +899,9 @@ flowchart TB
     observation["StateHandle / observation: register actual changes, dispatch local dependents"]
     state["kernel::change: bounded outgoing deltas"]
     invocation["peer::invocation: native dispatch and bounded result replay"]
-    peers["Authorization, remote installation and inter-fragment continuation: to build"]
-    fragments["kernel::fragment: compiled condition, captured operands and local/peer transformer target"]
-    continuations["peer::continuation: four encoded packets and shared invocation IDs"]
-    retained["kernel::state: locally installed scalar history and compiled per-delta result"]
+    peers["Program installation, reconstruction and admission: planned"]
+    fragments["Resident program bindings: upstream activation, conditional edges and sized R/W heads; planned"]
+    retained["kernel::state: firmware-bound scalar history and native per-delta result"]
     solar["Commissioned location/time and local solar calculation: to build"]
     discovery["kernel::peer: channel survey, computed rendezvous, arrival and message dispatch"]
     exposure["peer::exposure: borrowed local IR and bounded range encoding"]
@@ -1064,33 +1046,26 @@ flowchart TB
     discovery -->|surveys energy, selects channel, exchanges frames through| transport
     transport -->|receives and transmits frames| radio
     transport -->|blocks on notifications while hardware works| tasks
-    peers -.->|compiled activations depend on local state| observation
-    peers -.->|invokes reached transformer| binding
-    peers -.->|runs in kernel execution contexts| tasks
-    peers -.->|configures and exchanges frames| transport
+    peers -.->|admits remote installation into resident appliance storage| binding
+    peers -.->|supplies compiled conditions and continuation bindings| fragments
     peers -.->|installs definitions, bounded storage and state updaters| retained
     binding -->|binds static records to the native instance before startup| retained
-    binding -->|checks and binds local fragments before startup| fragments
     observation -->|maintains captured changes before native callbacks| retained
-    observation -->|activates each changed source after report maintenance| fragments
-    retained -->|declared local scalar operands| fragments
-    fragments -->|checked arguments to existing transformer adapter| surface
-    fragments -->|typed arguments encoded once for peer target| continuations
-    continuations -->|ordinary invocation through learned/relay directions| forwarding
-    transport -->|wake and drain already-evaluated packets| continuations
-    hostlink -->|shares radio ID allocator, preserves host tokens| continuations
+    observation -.->|change follows upstream relationships to program heads| fragments
+    retained -.->|owned history or derived operands| fragments
+    fragments -.->|owner-local reads and reached native mutation| binding
+    fragments -.->|semantic destinations and live carried operands| forwarding
     retained -->|enumerates installed mathematical state| exposure
     retained -->|publishes changed history views and result| state
     binding -->|normal synchronized reads of installed values| retained
     exposure -->|includes installed definitions in compatibility fingerprint| update
-    retained -.->|retained values and computed operands| peers
     hostpeer -.->|commissioning data through ordinary peer messaging| solar
     cpu -.->|elapsed counter and reserved configuration storage| solar
-    solar -.->|calculated solar state and boundary changes| observation
+    solar -.->|internal deltas at the bound temporal predicate| fragments
     radio -->|IRQ waker notifies resident task| tasks
 
     classDef planned stroke-dasharray: 5 5;
-    class peers,solar planned;
+    class peers,fragments,solar planned;
 ```
 
 ## Current baseline
@@ -1128,32 +1103,23 @@ The maintained dimmer installs four level observations and a signed difference
 of its newest two observations; its native transformer still reports only power
 and level. Checks cover empty/unavailable history, oldest-value eviction, grouped
 and reentrant observations, combined surface definitions, exact delta registration, and
-OTA fingerprint coverage. This slice has not been flashed or hardware-validated.
+OTA fingerprint coverage. Earlier external lab checks exercised the shared
+retained-state mechanism on both chips; the maintained dimmer itself is build-only.
 
-Conditional fragments now have host boundary checks: reference admission,
-argument rejection, one invocation per qualifying delta, captured trigger values,
-completed grouped maintenance, registration order and instance isolation.
-Peer-transformer continuations use the existing radio invocation path without
-`host-link`. Checks cover single-frame bounds, FIFO eviction, argument preservation,
-ID exhaustion and host/result isolation.
+The firmware-callback fragment prototype and its private packet handoff have been
+removed. Its external lab runs are archived, including two-board operand dispatch
+and conditional callback chains. They are not evidence of the intended resident
+program model and do not establish an installable program ABI. Native invocation,
+state/transport boundaries and retained-state facilities retain their own checks.
+The optional host retains its call-identity/reconnect behavior without the removed
+fragment buffer. Program-specific opcodes from that experiment are not accepted.
 
-On 2026-10-20, a C6 and XIAO nRF52840 ran the current kernel with a small external
-lab appliance. In each direction, reports `10, 14, 14, 11, 18` maintained a
-two-observation history and sent only positive differences. The receiver's native
-transformer applied `4` and `7`, exactly once each; initial unavailable history,
-an unchanged report, and the negative difference produced no invocation. Both
-nodes reported zero continuation evictions. Receiver USB reads and ordinary
-remote state reads agreed. The fixtures/images/captures remain outside the kernel
-repository, and factory recovery paths were preserved. This is direct radio
-validation of software appliance state, not physical-actuator, range, multi-hop,
-reboot-identity or general RF-reliability validation.
-
-Authentication, tablet UI integration, remote fragment installation, and
-inter-fragment continuation remain open. Nordic local staging and boot recovery
+Authentication, tablet UI integration and remote fragment installation remain open.
+Nordic local staging and boot recovery
 have host and XIAO hardware validation. C6 local staging/metadata has host/build
-and hardware validation. OTA transport and activation policy remain planned in
-[the updater design](FIRMWARE_UPDATES.md). Local dependents are immediate native
-callbacks, not an installed distributed DAG. The earlier LVT v6/host v3 Linux/tablet USB companion path
+and hardware validation. Signed transfer and local activation policy are
+implemented and documented in [the updater design](FIRMWARE_UPDATES.md). Native
+dependents remain firmware callbacks; distributed program bindings are planned. The earlier LVT v6/host v3 Linux/tablet USB companion path
 has exercised native calls, state reads and pushed deltas on Nordic hardware;
 this does not establish physical appliance behavior or loss-free RF. The v7/v4
 cost exchange has host and build checks; a coordinated firmware/client rollout
@@ -1210,7 +1176,7 @@ history is bounded and volatile; this is not an exactly-once ledger.
    scoped delta forwarding, and on-demand current-state reads are implemented and
    checked on the host. The attached-host path now delivers accepted deltas with
    bounded buffering and explicit local-loss notices. Both MCU images build. The
-   tablet daemon and installed conditional activation remain open.
+   tablet daemon and distributed program activation remain open.
 
 Both supported MCU ports now have a hardware-checked local staging/trial/confirmation
 path. Common signed transfer and durable resume now use the existing peer runtime.
@@ -1223,24 +1189,33 @@ Hardware watchdog recovery and automatic confirmation now have maintained checks
 on both ports. Physical interrupted-write/swap checks remain distinct from those
 completed timeout and explicit-reset paths.
 
-Extend the working control path into compiled-fragment installation, conditional
-activation, and their forwarding semantics. Native transformer invocation is now
-available independently of fragment installation. Keep upstream state
-activation distinct from downstream execution. Nucleus supplies compiled work;
-its full implementation is not a prerequisite to building the node's common
-mechanics. Local retained history and a compiled updater now maintain an enumerable
-derived value from an existing exposed state. Local fragments consume declared
-operands on registered changes and conditionally invoke local or peer transformers.
-The direct peer handoff now has C6 ↔ nRF52840 hardware evidence. Next extend
-continuation to another conditional fragment. Remote installation still needs its own encoding and
-ownership mechanics. This
-does not depend on a hypothetical sensor or shared clock. Relay optimization and
-storage tuning follow concrete implementation
-needs rather than displacing these first runtime steps.
+The next work is the concrete resident-program design and its implementation.
+Specify each owner's predicate/calculation records, upstream and true/false links,
+input/output locations, and any retained state or local deadline. Walk one real
+program through greedy computation and live-value storage assignment, then show
+how received definitions become those records and survive reconstruction. This
+must not depend on appliance-authored evaluator callbacks.
+
+Implement externally supplied installation and the corresponding semantic traversal
+as one meaningful capability. Completion means an ordinary peer can install a new
+program on running appliance firmware, enable it once its bindings are ready, and
+exercise upstream activation, short-circuit branches, computed arguments and native
+mutation without rebuilding that firmware. Independent changes retain independent
+read/write heads. Time/solar predicates use the same activation mechanics at their
+assigned owners; building that facility does not introduce a privileged time node.
+
+Existing radio delivery, enumeration and native dispatch are foundations to reuse.
+Their previous checks are not substitutes for this capability. Resolve any remaining
+implementation-defining question with the user before introducing its representation.
+The field layout and loading/reconstruction mechanics are still design work, not
+features already selected or implemented by this document.
 
 ## Development approach
 
 Build in useful increments, compile as we go, and learn from concrete failures.
+Follow [the clarification guidance](../AGENTS.md#clarify-direction-before-provisional-implementation):
+questions are preferred over provisional work, and a request for the next step
+does not resolve unanswered implementation-defining decisions.
 Kernel tests enforce prescribed component properties: valid input domains,
 capacity and eviction bounds, reference ownership, ordering and encoding.
 Use tables for boundary partitions under one focused assertion path, and extend

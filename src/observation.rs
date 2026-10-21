@@ -2,12 +2,11 @@
 //!
 //! Dependency links live with the state they depend on. Activation is immediate
 //! in the caller's context; there is no graph work queue, polling task, or IR
-//! interpreter. The kernel updates installed history and computed state before
-//! evaluating installed fragments and running native dependents, using this
-//! report's captured values. A callback
-//! represents a compiled local activation entrypoint. Bound appliance changes
-//! also enter the kernel's fixed outgoing delta ring. Loadable fragment installation remains separate work;
-//! this local list is not its wire format or final executable ABI.
+//! interpreter. The kernel maintains native histories and computed state before
+//! running local dependents, using this report's captured values. These are
+//! firmware callbacks, not installed distributed-program predicates. Bound changes
+//! also enter the kernel's fixed outgoing delta ring. Distributed program
+//! installation remains separate work; this list is not its wire format or ABI.
 //! The resident pointer is only local fanout-list linkage. It is not a DAG entry
 //! reference, an upstream peer reference, or a distributed continuation.
 
@@ -45,7 +44,7 @@ pub struct Transition {
 /// acyclic list in dispatch order. Each callback receives the captured transition
 /// even if an earlier callback has already changed the appliance again.
 pub struct Dependent<Appliance: 'static> {
-    /// Compiled/native activation entrypoint. It returns without a graph result.
+    /// Firmware-local change callback. It returns without a graph result.
     pub activate: fn(&mut Appliance, &StateHandle<Appliance>, Transition),
     /// The next local dependent of this state, not the next edge of a DAG traversal.
     pub next: Option<&'static Self>,
@@ -104,8 +103,6 @@ impl<Appliance: 'static> Dependents<Appliance> {
 /// a delta is delivered even if an earlier callback changes that state again.
 /// Callbacks receive this report's captured values rather than rereading them.
 /// `None` becoming available or unavailable also counts as a change.
-/// For each changed source, installed fragments run before its native callbacks.
-/// Their non-trigger operands are sampled when each fragment is reached.
 ///
 /// The update's return value is preserved, including an error after a partial
 /// update: actual observed changes still produce notifications. Call separately

@@ -662,10 +662,12 @@ impl Forwarder {
         }
     }
 
+    #[cfg(feature = "host-link")]
     pub(super) fn identity(&self) -> (u64, Network) {
         (self.local, self.network)
     }
 
+    #[cfg(feature = "host-link")]
     pub(super) fn originate_call<'a>(
         &mut self,
         call: Invocation,
@@ -698,6 +700,7 @@ impl Forwarder {
         })
     }
 
+    #[cfg(feature = "host-link")]
     pub(super) fn complete_call(
         &mut self,
         incoming: Message<'_>,
@@ -715,6 +718,7 @@ impl Forwarder {
         Some((call, status))
     }
 
+    #[cfg(feature = "host-link")]
     pub(super) fn cancel_call(&mut self, call: Invocation) {
         for path in &mut self.calls {
             if path.call == call && call.caller == self.local {

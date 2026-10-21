@@ -4,8 +4,6 @@
 
 use crate::kernel::radio::cost::TimePerByte;
 mod bootstrap;
-#[cfg(feature = "use-mutexes")]
-pub(crate) mod continuation;
 pub(crate) mod exposure;
 mod forwarding;
 pub(crate) mod frame;
@@ -139,30 +137,6 @@ fn discovery_response(
     }
 }
 
-/// Terminate a locally originated result at its actual origin. In particular,
-/// consuming a fragment's return path must not settle an unrelated host call.
-#[cfg(feature = "use-mutexes")]
-fn complete_local_invocation(
-    forwarder: &mut forwarding::Forwarder,
-    message: Message<'_>,
-    now: u32,
-    #[cfg(feature = "host-link")] host: &mut host::Host,
-) -> bool {
-    let Content::InvocationResult { call, .. } = message.content else {
-        return false;
-    };
-    if call.caller != forwarder.identity().0 {
-        return false;
-    }
-    #[cfg(feature = "host-link")]
-    if host.owns_call(call) {
-        host.complete(forwarder, message, now);
-        return true;
-    }
-    let _ = forwarder.complete_call(message, now);
-    true
-}
-
 #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
 pub(crate) fn run(
     radio: &mut super::radio::task::Transport,
@@ -201,12 +175,6 @@ fn participate(
     radio.enable_peer_runtime();
     let started = tasks::xTaskGetTickCount();
     let milliseconds = ((started as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
-    // Boot-clock decorrelation, not durable identity or cryptographic entropy.
-    // A USB-first caller additionally seeds from its client's random token.
-    continuation::start(
-        local,
-        (local as u32 ^ (local >> 32) as u32 ^ started as u32).rotate_left(13),
-    );
     let arrival = forwarder.announce(started as u16, description.len(), milliseconds);
     send(radio, arrival, &mut sequence, &mut outgoing_buffer);
     let period = crate::milliseconds_to_ticks_checked(2_000 + local % 997).unwrap();
@@ -225,16 +193,6 @@ fn participate(
             )
         ))]
         crate::kernel::update::runtime::poll_control();
-        if let Some(packet) = continuation::take() {
-            let call = packet.call(local);
-            if let Some(outgoing) = forwarder.originate_call(call, packet.arguments(), milliseconds)
-            {
-                if !send(radio, outgoing, &mut sequence, &mut outgoing_buffer) {
-                    forwarder.transmit_failed(&outgoing);
-                    forwarder.cancel_call(call);
-                }
-            }
-        }
         #[cfg(feature = "host-link")]
         if let Some(outgoing) = if radio.pending_receive() && host::staging_pending() {
             None
@@ -312,17 +270,9 @@ fn participate(
             {
                 crate::kernel::update::activation::activity();
             }
-            if complete_local_invocation(
-                &mut forwarder,
-                message,
-                measured_at,
-                #[cfg(feature = "host-link")]
-                &mut host,
-            ) {
-                continue;
-            }
             #[cfg(feature = "host-link")]
-            if matches!(message.content,
+            if matches!(message.content, Content::InvocationResult { call, .. } if call.caller == local)
+                || matches!(message.content,
                 Content::LinkEntry { read, .. } if read.reader == local)
                 || matches!(message.content, Content::SurfacePart { read, .. } if read.reader == local)
                 || matches!(message.content, Content::StateValue { read, .. } if read.reader == local)
@@ -339,9 +289,7 @@ fn participate(
                 }
             } else if matches!(message.content,Content::Update{network:n,..}|Content::Updated{network:n,..} if n==network)
             {
-                let busy = forwarder.ordinary_work_pending()
-                    || continuation::pending()
-                    || radio.pending_receive();
+                let busy = forwarder.ordinary_work_pending() || radio.pending_receive();
                 if let Some(reply) = forwarder.receive_update(message, milliseconds, |request| {
                     handle_update(request, busy)
                 }) {
@@ -518,7 +466,7 @@ fn participate(
                 now,
                 local,
                 conflict,
-                forwarder.work_pending() || continuation::pending(),
+                forwarder.work_pending(),
                 |notice| {
                     let sent = send(
                         radio,

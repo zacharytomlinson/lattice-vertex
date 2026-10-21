@@ -94,9 +94,6 @@ pub struct StateHandle<Appliance: 'static> {
     #[cfg(feature = "use-mutexes")]
     pub(crate) maintained:
         core::sync::atomic::AtomicPtr<crate::kernel::state::Installation<Appliance>>,
-    #[cfg(feature = "use-mutexes")]
-    pub(crate) fragments:
-        core::sync::atomic::AtomicPtr<crate::kernel::fragment::Binding<Appliance>>,
 }
 
 impl<Appliance: 'static> StateHandle<Appliance> {
@@ -112,8 +109,6 @@ impl<Appliance: 'static> StateHandle<Appliance> {
             dependents: Dependents::new(),
             #[cfg(feature = "use-mutexes")]
             maintained: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-            #[cfg(feature = "use-mutexes")]
-            fragments: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
@@ -130,7 +125,7 @@ impl<Appliance: 'static> StateHandle<Appliance> {
     /// Install this state's resident local dependency list, or remove it with `None`.
     /// A dispatch already started finishes its original list. This replaces only
     /// local fanout-list linkage; it does not identify or relocate a DAG entry point.
-    /// Kernel-owned retained-state and fragment bindings remain installed.
+    /// Kernel-owned retained-state bindings remain installed.
     pub fn set_dependents(&self, first: Option<&'static Dependent<Appliance>>) {
         self.dependents.set(first);
     }
@@ -179,8 +174,6 @@ impl<Appliance: 'static> StateHandle<Appliance> {
     }
 
     pub(crate) fn dispatch_dependents(&self, appliance: &mut Appliance, transition: Transition) {
-        #[cfg(feature = "use-mutexes")]
-        crate::kernel::fragment::dispatch(self, appliance, transition);
         self.dependents.dispatch(appliance, self, transition);
     }
 

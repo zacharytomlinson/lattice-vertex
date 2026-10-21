@@ -161,6 +161,10 @@ struct Pending {
 }
 pub(super) struct Host {
     next_token: Option<u16>,
+    next_call: u32,
+    calls_seeded: bool,
+    call_ids: [(u32, u32); 8],
+    next_call_slot: usize,
     pending: Option<Pending>,
     payload: [u8; lattice_peer_wire::update::REQUEST_BYTES],
 }
@@ -168,10 +172,35 @@ impl Host {
     pub(super) const fn new() -> Self {
         Self {
             next_token: None,
+            next_call: 0,
+            calls_seeded: false,
+            call_ids: [(0, 0); 8],
+            next_call_slot: 0,
             pending: None,
             payload: [0; lattice_peer_wire::update::REQUEST_BYTES],
         }
     }
+    // Host tokens and radio call IDs are separate. The resident Host survives
+    // USB reconnects, retaining the eight most recent mappings. Evicted tokens
+    // get fresh IDs and must not be used to retry an uncertain mutation.
+    fn call_request(&mut self, token: u32) -> Option<u32> {
+        if let Some(&(_, id)) = self.call_ids.iter().find(|&&(t, id)| id != 0 && t == token) {
+            return Some(id);
+        }
+        if !self.calls_seeded {
+            self.next_call = (token & 0x7fff_ffff).max(1);
+            self.calls_seeded = true;
+        }
+        if self.next_call == 0 {
+            return None;
+        }
+        let request = self.next_call;
+        self.next_call = request.checked_add(1).unwrap_or(0);
+        self.call_ids[self.next_call_slot] = (token, request);
+        self.next_call_slot = (self.next_call_slot + 1) % self.call_ids.len();
+        Some(request)
+    }
+
     pub(super) fn poll<'a>(
         &'a mut self,
         forwarder: &mut Forwarder,
@@ -304,9 +333,8 @@ impl Host {
             ..
         } = request
         {
-            // Keep host correlation separate from the radio namespace shared
-            // with compiled continuations. A retained token keeps its radio ID.
-            let Some(request) = super::continuation::host_request(token) else {
+            // Preserve the retained mapping without recycling exhausted IDs.
+            let Some(request) = self.call_request(token) else {
                 deliver(
                     generation,
                     Packet::Error {
@@ -362,7 +390,7 @@ impl Host {
             if owner == local {
                 let progress = crate::kernel::peer::handle_update(
                     operation,
-                    forwarder.ordinary_work_pending() || super::continuation::pending(),
+                    forwarder.ordinary_work_pending(),
                 );
                 deliver(
                     generation,
@@ -506,12 +534,6 @@ impl Host {
             );
         }
     }
-    pub(super) fn owns_call(&self, call: Invocation) -> bool {
-        self.pending
-            .as_ref()
-            .is_some_and(|p| p.operation == Operation::Call(call))
-    }
-
     pub(super) fn complete(&mut self, forwarder: &mut Forwarder, incoming: Message<'_>, now: u32) {
         let Some(pending) = &self.pending else {
             return;

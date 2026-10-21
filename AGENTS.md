@@ -8,9 +8,44 @@ This repository extends the RTOS with the common behavior of a lattice node.
 Appliance firmware supplies its attributes, state-transforming functions, and
 required hardware interfaces. Preserve that division of responsibility.
 
+The distributed program is embodied in resident graph relationships: changes
+activate upstream toward a head, then local predicates choose true/false edges
+until a native mutation is reached. Traversals may overlap without supersession
+or a global execution lock. The compiler sizes each traversal's working values
+from their live ranges; time/solar predicates use kernel-local deadlines at their
+assigned evaluation vertices. The direction document distinguishes these intended
+facilities from the current implementation. Do not substitute firmware-authored
+automation callbacks for externally installed program bindings.
+
 Keep changes concrete and small. Follow the development approach in the kernel
 direction document; do not import workflow gates or architectural assumptions
 from neighboring reference repositories.
+
+## Clarify direction before provisional implementation
+
+Questions are preferred over provisional work. Building an assumed solution and
+then removing it to build the intended one imposes avoidable double work.
+
+- A question such as "what is next?" asks for an informed direction; it is not an
+  imperative to continue coding without understanding what that next stage entails.
+  A general go-ahead does not resolve unanswered implementation-defining questions.
+- Before implementing a new architectural step, explain how it fits the intended
+  end-to-end behavior, including its concrete representation, ownership, and
+  activation. Distinguish what exists from what is proposed or still undecided.
+- When an unresolved decision would change the implementation, stop that work,
+  explain the uncertainty, and ask the user. Stepping back to establish the
+  lower-level design is preferred to filling the gap with speculative APIs,
+  firmware-baked substitutes, or assumptions about future components.
+- Do not use testing, scaffolding, or repeated hardware demonstrations as a
+  substitute for resolving the missing design. A successful test of a narrower
+  mechanism is not evidence that the requested capability has been implemented.
+- If a disposable experiment would answer a concrete unresolved question, explain
+  that question and agree on the experiment first. Keep it outside kernel source
+  and do not promote its assumptions into the kernel API or implementation map.
+- Work in meaningful increments that establish the agreed capability. Small code
+  changes are useful; busy work and throwaway implementations are not progress.
+  Resolve routine mechanical choices independently when the intended behavior is
+  understood; this guidance does not require approval for every small edit.
 
 ## C6 RF investigation
 

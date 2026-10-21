@@ -1,4 +1,4 @@
-//! Locally installed history and compiled derived state.
+//! Firmware-bound history and derived state.
 //!
 //! Storage is supplied as a static, typed record. Installation binds it once to
 //! an initialized appliance, before kernel startup. Each registered source change
@@ -9,7 +9,8 @@
 //! unavailable observations read as None; len distinguishes occupied history.
 //! The age views and computed value are read-only mathematical states. Their
 //! changes use normal delta transport; local cascading installations and remote
-//! code loading are separate work.
+//! program loading are separate work. The native updater is supplied by firmware;
+//! this helper is not an externally authored program installation interface.
 
 use super::InstallError;
 use crate::{
@@ -103,7 +104,7 @@ struct Values<T: Scalar, U: Scalar, const N: usize> {
 /// T and U are sealed scalar types, so history uses native-width samples rather
 /// than a full tagged IR Value per entry. The updater is already compiled for the
 /// target and receives only a read-only history. Its mathematical correspondence
-/// is supplied by the compiler, like a native transformer's IR definition.
+/// is supplied by the firmware author, like a native transformer's IR definition.
 pub struct RetainedState<A: 'static, T: Scalar, U: Scalar, const N: usize> {
     source: &'static StateHandle<A>,
     samples: [ir::Attribute<Read<A>>; N],

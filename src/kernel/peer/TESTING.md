@@ -36,7 +36,8 @@ implemented. [Surface reads](EXPOSURE.md) now use bounded exploration and learne
 owner directions. Compact arrivals and owner queries now cross relays without sending
 complete surfaces.
 [Native invocation, state reads, and registered deltas](INVOCATION.md) now share that runtime.
-Compiled-fragment installation/activation and authenticated admission remain unimplemented.
+Resident distributed-program bindings, installation and semantic traversal remain
+unimplemented. Firmware callbacks are not substitutes for those facilities.
 
 The on-air discovery profile is:
 
@@ -53,7 +54,7 @@ The on-air discovery profile is:
 The same envelope includes arrival (3), surface read (4), surface part (5),
 find owners (6), owner found (7), invocation (8), result (9), state changed (10),
 read state (11), state value (12), link exchange (13), read links (14), and link
-entry (15),
+entry (15), and update traffic (16–18),
 specified in [the exposure format](EXPOSURE.md#read-envelope). Reads are driven
 by an interested consumer; discovery never triggers full-surface publication.
 
