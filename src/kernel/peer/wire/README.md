@@ -17,13 +17,6 @@ codec described in [the host interface](../host/README.md). This replaces the fo
 USB consumers, so its owner is the common peer wire crate. The crate contains no
 kernel execution, platform support, solver, or interpreter.
 
-`cost::TimePerByte` is the shared normalized time unit: microseconds per
-acknowledged MAC payload byte in Q24.8. It supports path composition, exact
-relative ratios, and quantity estimates without allocation or floating point.
-Zero represents an empty path, `0xffffffff` unknown; unknown/overflow never
-becomes a free path. Measurement and routing policy belong to the kernel.
-
-
 `update` owns the bounded header/data/preparation/status request grammar and
 progress reply shared by radio forwarding and USB. It also defines local-only
 update maintenance controls. Signature verification, journals, flash access, and
@@ -41,3 +34,51 @@ the updated phase decoder; ordinary read/call/change records are unaffected.
 `update::Absence` is the fixed nine-byte one-hop planned-outage notice. It carries
 an attempt token, phase, and bounded relative duration; LVT v7 opcode 18 encodes
 it after the network tag. It has no routed or attached-host request equivalent.
+
+## Communication cost
+
+Communication cost is normalized per unit of delivered information. The shared
+`lattice-peer-wire::cost::TimePerByte` represents microseconds per acknowledged
+MAC payload byte, in unsigned Q24.8 fixed point. Both MCU ports use the same
+meaning, independent of CPU clock. `ratio` compares two known costs;
+`estimate_us(quantity)` applies any byte quantity to the same value. Ten bytes
+and ten thousand bytes do not select different models. Energy is not silently
+mixed into the time unit.
+
+The resident transport measures each addressed send from its first attempt
+through its successful receive turn or exhausted attempts. This includes MAC
+header/FCS airtime, ACK waits, retry backoff, and the mandatory receive opportunity;
+the denominator counts the acknowledged payload once, excluding MAC header/FCS.
+Failed sends add service time and zero acknowledged bytes. Remote application
+execution and idle time between sends are not measured. The first implementation
+uses the kernel tick clock (1 ms on the supported ports), so these are quantized
+service estimates, not fine-resolution PHY timestamps or hard deadlines.
+
+Eight existing neighbor records own the measurements. Samples are aged by halving
+the accumulated evidence after roughly 4 KiB of acknowledged payload; 60 seconds
+without new samples makes the cost unknown. Four transient samples hand timing
+results from the radio task's sends to those records. No sample history array,
+allocator, network-wide cost table, or separate task is introduced. Frame overhead
+is amortized over the observed packet-size mix; changes in that mix or contention
+change the estimate as new observations arrive. A consumer counts the actual MAC
+payload bytes its operation will transmit, including its protocol envelopes.
+
+An owner's reply starts with zero remaining path cost. Each relay adds its own
+outgoing-link cost toward the replying neighbor and advertises that sum on the
+reverse reply. The recipient adds its own outgoing link to that suffix. Reverse
+link cost and request/reply processing latency are not substituted for forward
+cost. Route records retain the suffix separately, allowing fresh first-hop
+measurements to change ranking without copying or rediscovering the entire path.
+This is an additive serialized service estimate; overlapping transmissions or
+future traffic cannot be inferred as a guaranteed wall-clock completion time.
+
+Unknown is encoded as `0xffffffff`, not zero. Zero denotes an empty/local path.
+Unknown components or arithmetic overflow leave the estimate unknown. Known
+paths rank by their normalized cost, including when a longer route is cheaper
+than a direct link. Hop limits still bound traversal. Link enumeration exposes
+both the normalized outgoing cost and the existing round-trip diagnostic; RTT
+is no longer the routing objective.
+
+The OTA service preserves these quantities in its transfer replies. Measured local
+costs drive staging admission and automatic activation deferral. Firmware-local
+flash/verification/boot costs remain distinct from communication time.

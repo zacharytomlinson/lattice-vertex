@@ -8,9 +8,9 @@
 //! that to `kernel::start` on an MCU port. The kernel serves definitions, invokes
 //! native operations, and transmits registered observations without appliance packet handling.
 //!
-//! This module exposes local definitions, invocation, and state change hooks.
-//! It does not interpret IR, prove an appliance model, or install executable
-//! fragments. Observation updates and local activation use [`crate::observation`].
+//! This module supplies local declarations and hardware function adapters.
+//! The kernel owns acquisition and change registration; firmware supplies no
+//! report callback. IR interpretation and program installation are not provided here.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -18,10 +18,7 @@
 mod value;
 pub use value::{ArgumentError, Arguments, Scalar};
 
-use crate::{
-    ir::{self, Type, Value},
-    observation::{self, Dependent, Dependents, Previous, Transition},
-};
+use crate::ir::{self, Type, Value};
 
 /// A scalar state location: a native reader or an installed retained value.
 /// Reading never evaluates IR or triggers state maintenance.
@@ -72,8 +69,9 @@ pub type Operation<Appliance> = ir::Operation<'static, 'static, Read<Appliance>>
 /// One observed state of an encapsulated appliance.
 ///
 /// The native value type supplies the IR type automatically. Readers observe
-/// existing appliance state; they must not issue commands or invent a desired
-/// value. `kernel::Appliance::with` supplies task synchronization for a bound instance.
+/// actual appliance state; they must not issue commands or invent a desired
+/// value. Kernel acquisition calls the getter independently of native mutations;
+/// hardware bindings protect their own shared peripheral access.
 pub trait State {
     /// Concrete appliance encapsulation, such as a lamp or valve.
     type Appliance: 'static;
@@ -86,11 +84,10 @@ pub trait State {
 
 /// An enumerable state definition with a typed native reader.
 ///
-/// The handle stores its IR attribute and local maintenance/activation links.
+/// The handle stores its IR attribute and kernel-maintained history linkage.
 /// It neither owns nor duplicates the appliance's observed value.
 pub struct StateHandle<Appliance: 'static> {
     definition: ir::Attribute<Read<Appliance>>,
-    dependents: Dependents<Appliance>,
     #[cfg(feature = "use-mutexes")]
     pub(crate) maintained:
         core::sync::atomic::AtomicPtr<crate::kernel::state::Installation<Appliance>>,
@@ -106,7 +103,6 @@ impl<Appliance: 'static> StateHandle<Appliance> {
                     source: Reader::Native(read_state::<S>),
                 },
             },
-            dependents: Dependents::new(),
             #[cfg(feature = "use-mutexes")]
             maintained: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         }
@@ -120,40 +116,6 @@ impl<Appliance: 'static> StateHandle<Appliance> {
     /// Read live state. Unavailable observations remain distinct from false or zero.
     pub fn read(&self, appliance: &Appliance) -> Option<Value> {
         self.definition.location.read(appliance)
-    }
-
-    /// Install this state's resident local dependency list, or remove it with `None`.
-    /// A dispatch already started finishes its original list. This replaces only
-    /// local fanout-list linkage; it does not identify or relocate a DAG entry point.
-    /// Kernel-owned retained-state bindings remain installed.
-    pub fn set_dependents(&self, first: Option<&'static Dependent<Appliance>>) {
-        self.dependents.set(first);
-    }
-
-    /// Signal an established change after appliance state has been updated.
-    ///
-    /// Use this when hardware already identifies a change and its previous value
-    /// is unavailable. Every call is a distinct delta, including unavailable state.
-    /// Dependents receive the captured post-value and an unknown before-value.
-    pub fn changed(&self, appliance: &mut Appliance) {
-        let value = self.read(appliance);
-        self.record_change(appliance, value);
-        #[cfg(feature = "use-mutexes")]
-        crate::kernel::state::maintain(
-            self,
-            appliance,
-            Transition {
-                before: Previous::Unknown,
-                after: value,
-            },
-        );
-        self.dispatch_dependents(
-            appliance,
-            Transition {
-                before: Previous::Unknown,
-                after: value,
-            },
-        );
     }
 
     pub(crate) fn record_change(&self, appliance: &Appliance, value: Option<Value>) {
@@ -171,20 +133,6 @@ impl<Appliance: 'static> StateHandle<Appliance> {
             value,
         );
         let _ = (appliance, value);
-    }
-
-    pub(crate) fn dispatch_dependents(&self, appliance: &mut Appliance, transition: Transition) {
-        self.dependents.dispatch(appliance, self, transition);
-    }
-
-    /// Apply an observation update and notify dependents only if this state changed.
-    /// For one report affecting several states, use [`observation::update`] instead.
-    pub fn update<R>(
-        &self,
-        appliance: &mut Appliance,
-        update: impl FnOnce(&mut Appliance) -> R,
-    ) -> R {
-        observation::update(appliance, &[self], update)
     }
 }
 
@@ -207,15 +155,14 @@ pub trait StateTransformer {
     /// Mathematical precondition and joint state transition for this invocation.
     const DEFINITION: Operation<Self::Appliance>;
 
-    /// Perform or register the operation once, enforcing native hardware limits.
+    /// Perform the finite hardware operation once, enforcing native limits.
+    /// The kernel supplies its task; getters can run concurrently. Protect only
+    /// actual shared peripheral access inside the adapter, not the whole call.
     /// Success does not manufacture observations or imply physical convergence.
     ///
     /// # Errors
     /// Returns the appliance's own invocation error.
-    fn invoke(
-        appliance: &mut Self::Appliance,
-        arguments: Self::Arguments,
-    ) -> Result<(), Self::Error>;
+    fn invoke(appliance: &Self::Appliance, arguments: Self::Arguments) -> Result<(), Self::Error>;
 }
 
 /// An invocation was rejected before dispatch, or failed in the appliance.
@@ -227,7 +174,7 @@ pub enum InvokeError<Error> {
     Appliance(Error),
 }
 
-type Invoke<Appliance, Error> = fn(&mut Appliance, &[Value]) -> Result<(), InvokeError<Error>>;
+type Invoke<Appliance, Error> = fn(&Appliance, &[Value]) -> Result<(), InvokeError<Error>>;
 
 /// An enumerable transformer with its IR definition and native invocation adapter.
 /// Each handle owns its operation root; expressions and state references remain
@@ -275,7 +222,7 @@ impl<Appliance: 'static, Error> TransformerHandle<Appliance, Error> {
     /// Rejects malformed arguments before dispatch or propagates the appliance error.
     pub fn invoke(
         &self,
-        appliance: &mut Appliance,
+        appliance: &Appliance,
         arguments: &[Value],
     ) -> Result<(), InvokeError<Error>> {
         (self.invoke)(appliance, arguments)
@@ -283,7 +230,7 @@ impl<Appliance: 'static, Error> TransformerHandle<Appliance, Error> {
 }
 
 fn invoke_transformer<T: StateTransformer>(
-    appliance: &mut T::Appliance,
+    appliance: &T::Appliance,
     arguments: &[Value],
 ) -> Result<(), InvokeError<T::Error>> {
     value::check(T::Arguments::TYPES, arguments).map_err(InvokeError::Arguments)?;

@@ -101,7 +101,12 @@ pub struct UpdateHold {
     _activation: super::ActivationHold,
 }
 pub fn hold_updates(_: &crate::sync::TaskContext) -> Result<UpdateHold, Status> {
-    let hold = activation::try_hold()?;
+    hold_access(activation::try_hold()?)
+}
+pub(crate) fn hold_observation(_: &crate::sync::TaskContext) -> Result<UpdateHold, Status> {
+    hold_access(activation::observation_hold()?)
+}
+fn hold_access(hold: super::ActivationHold) -> Result<UpdateHold, Status> {
     ACCESS
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
             (n < FLASH - 1).then_some(n + 1)
@@ -187,6 +192,21 @@ mod tests {
     #[test]
     fn reboot_holds_allow_staging_but_appliance_access_excludes_flash() {
         let context = unsafe { crate::sync::TaskContext::assume() };
+        let epoch = activation::epoch();
+        let observation = hold_observation(&context).unwrap();
+        assert!(FlashStep::enter().is_none());
+        assert!(activation::Commit::enter().is_none());
+        assert_eq!(activation::epoch(), epoch);
+        assert!(
+            !activation::work_held(),
+            "sampling must not restart the quiet interval"
+        );
+        drop(observation);
+        assert_eq!(
+            activation::epoch(),
+            epoch,
+            "sampling alone is not user activity"
+        );
         let reboot = activation::try_hold().unwrap();
         let flash = FlashStep::enter().unwrap();
         assert!(hold_updates(&context).is_err());
@@ -197,10 +217,10 @@ mod tests {
         drop(physical);
         assert!(FlashStep::enter().is_some());
         assert!(
-            activation::held(),
+            activation::work_held(),
             "dropping access must preserve the independent reboot hold"
         );
         drop(reboot);
-        assert!(!activation::held());
+        assert!(!activation::work_held());
     }
 }

@@ -14,9 +14,7 @@ use ieee802154::mac::{
 #[cfg(test)]
 pub(super) use lattice_peer_wire::scalar::encode_arguments;
 use lattice_peer_wire::scalar::valid_arguments;
-pub(super) use lattice_peer_wire::scalar::{
-    decode_arguments, decode_value, encode_value, type_tag,
-};
+pub(super) use lattice_peer_wire::scalar::{decode_value, encode_value, type_tag};
 pub(crate) use lattice_peer_wire::{InvokeStatus, StateReadResult};
 
 const PAN: PanId = PanId(PAN_ID);
@@ -26,7 +24,9 @@ const MAX_PAYLOAD: usize = MAX_FRAME_SIZE - 21;
 // Worst-case addressed MAC header plus the complete routed reply envelope.
 pub(super) use lattice_peer_wire::SURFACE_BYTES;
 const _: () = assert!(SURFACE_BYTES == MAX_PAYLOAD - 41);
-pub(super) use lattice_peer_wire::{CALL_ARGUMENT_BYTES, MAX_CALL_ARGUMENTS};
+pub(super) use lattice_peer_wire::CALL_ARGUMENT_BYTES;
+#[cfg(test)]
+use lattice_peer_wire::{scalar::decode_arguments, MAX_CALL_ARGUMENTS};
 const _: () = assert!(CALL_ARGUMENT_BYTES == MAX_PAYLOAD - 43);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -29,7 +29,7 @@ pub(crate) struct Description {
 
 impl Description {
     #[cfg(feature = "use-mutexes")]
-    pub(crate) fn with_installed<A: Send + 'static, E: 'static>(
+    pub(crate) fn with_installed<A: Send + Sync + 'static, E: 'static>(
         appliance: &'static crate::kernel::Appliance<A, E>,
     ) -> Result<Self, EncodeError> {
         appliance.seal();
@@ -282,7 +282,7 @@ impl<A: 'static, E> Encode for Surface<'_, A, E> {
 }
 
 #[cfg(feature = "use-mutexes")]
-impl<A: Send + 'static, E: 'static> Encode for crate::kernel::Appliance<A, E> {
+impl<A: Send + Sync + 'static, E: 'static> Encode for crate::kernel::Appliance<A, E> {
     fn encode(&self, writer: &mut Writer<'_>) -> Result<(), EncodeError> {
         encode_surface(
             self.surface(),
@@ -397,7 +397,7 @@ mod tests {
                 arguments: &[],
             },
         };
-        fn invoke(_: &mut Switch, _: ()) -> Result<(), ()> {
+        fn invoke(_: &Switch, _: ()) -> Result<(), ()> {
             panic!("exposure must not invoke hardware")
         }
     }

@@ -153,14 +153,6 @@ the cap on a stuck receiver. C6 and Nordic
 builds check the common integration. Hardware validation must use ordinary peers,
 not assume that a successful spaced probe covers back-to-back state changes.
 
-
-A two-Nordic A/B/A isolated the deterministic paired-delta failure: the source
-completed all 16 delta transmissions, but only eight reached the attached host.
-Disabling only the companion's delta rebroadcast delivered 15/16; restoring it
-restored the repeated second-delta loss. With receive turns and bounded completion
-of active frames, an uninstrumented 32-call run delivered 57 of 58 registered
-changes, 29/32 native results, and 28/30 surface ranges. The owner watermark was
-read before/after to count generated changes independently of command results.
-No mutation or packet was automatically retried. Residual losses and absolute
-RSSI/range remain unresolved; this run is not a reliability guarantee. Diagnostic
-images, traces, and the rebroadcast bypass remain exclusively in the external lab.
+Residual RF losses and absolute RSSI/range remain unresolved. Diagnostic images,
+controlled comparisons, and traces are preserved in the external lab; their
+packet counts are not delivery guarantees for the maintained transport.

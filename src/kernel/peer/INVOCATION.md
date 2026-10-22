@@ -4,8 +4,8 @@ This is the basic installation path: an ordinary tablet daemon peer addresses an
 appliance's exposed native transformer; the kernel invokes it and communicates
 subsequent established state changes. No nucleus, solver, IR interpreter, learned
 surface, or compiled-fragment runtime is required. Any peer can also read one
-exposed attribute to establish its initial value. The optional [attached host endpoint](host/README.md) and the Linux client in
-`lattice-tablet` originate these calls and reads. Registered local changes and
+exposed attribute to establish its initial value. The optional [attached host endpoint](host/README.md) and the shared Linux client in
+`lattice-tools` (also consumed by `lattice-tablet`) originate these calls and reads. Registered local changes and
 accepted remote deltas also stream to an attached host without state polling.
 The host event buffer is bounded and reports oldest-event eviction separately
 from command results; it does not guarantee RF delivery or retain state history.
@@ -13,33 +13,58 @@ from command results; it does not guarantee RF delivery or retain state history.
 This is native control, not distributed program installation. The callback-based
 fragment prototype and its transport buffer have been removed. The compiler's
 resident predicates, upstream/conditional edges and per-traversal storage remain
-[design work](../../../docs/KERNEL_DIRECTION.md#program-installation-and-current-boundary).
+[design work](../../../docs/KERNEL_DIRECTION.md#immediate-design-work).
 Experimental LVT v7 opcodes 19/20 and result statuses 6/7 are retired and rejected;
 do not reuse them for different semantics within this wire version. Native
 invocation opcodes 8/9, statuses 0–5, and host-v4 encoding are unchanged.
 
 ## Appliance ownership
 
-Firmware declares its existing `State`, `StateTransformer`, and static `Surface`,
-then reserves one `kernel::Appliance<Device, Error>` with `Appliance::new(&SURFACE)`.
-Before scheduler startup it calls `APPLIANCE.initialize(&context, device)`, and
-passes `&APPLIANCE` to `kernel::start(context, radio, &APPLIANCE)`.
+Firmware declares `State`, `StateTransformer` and a static `Surface`, initializes
+one `kernel::Appliance<Device, Error>`, then enters `kernel::start`. It supplies
+hardware getter/setter hooks; it has no monitoring/reporting loop or delta API.
+The adapter is `Send + Sync`; getters and transformers take shared `&Device` access.
+Hardware bindings protect their own short peripheral critical sections rather
+than exclusively borrowing the whole appliance throughout a long operation.
 
-The binding owns the actual native instance, one static RTOS mutex/control block,
-and the borrowed surface. It does not copy the appliance's values into a second
-state table. Hardware reporting tasks use `APPLIANCE.with(&context, |device| ...)`
-and the existing `StateHandle::update` or grouped `observation::update` inside
-that closure. These are task-context operations. The kernel provides the networking;
-firmware still establishes which physical observations actually occurred.
-The closure must not reacquire the same appliance. Native transformers should
-return promptly after performing or registering device I/O; physical completion
-may arrive later through a reporting task.
+The kernel starts one acquisition task and two native-call tasks, each currently
+reserving 4 KiB of static stack and an RTOS control block. These kernel build bounds
+live in `config.rs`, alongside the 32-native-state observation capacity and 10 ms
+fallback sampling interval. The interval follows completion of an acquisition pass;
+it is not a guaranteed sample deadline. Direct hardware-event acquisition is future
+port integration, and sampling cannot recover unobserved intervening transitions.
 
-Remote calls use the same mutex without waiting behind hardware work: contention
-returns `Busy`. Native dispatch matches the supplied reference against the exposed
-transformer handles, decodes its typed arguments, and invokes the matching adapter.
-A numeric remote reference is never dereferenced as a pointer. Native implementations
-remain responsible for hardware limits; the kernel does not interpret IR preconditions.
+The acquisition task calls the supplied getters and owns the previous/current
+established observations. Native calls also request acquisition before and after
+execution, including on error. The first pass establishes a baseline without
+inventing a delta or history sample. Subsequently unchanged values emit nothing;
+availability changes are real changes. Physical I/O holds no observation-cache mutex,
+so reads can return the preceding established observation while acquisition runs.
+
+A complete pass captures native inputs, records changed states, maintains history,
+then releases publication to transport. Source and derived deltas retain distinct
+sequence numbers and normal hard eviction. No report callback belongs in firmware.
+The old `StateHandle::update`, `changed`, and local `Dependent` API/example were
+removed; retained native history helpers remain separate from program installation.
+
+Invocation reserves a native task and owns its argument bytes. A matching pending
+copy joins the same invocation and up to two return directions. Full execution
+storage reports Busy; there is no waiting-job queue. The worker decodes arguments,
+resolves the native handle, checks its signature, and invokes the function once.
+Completion wakes the peer task to retain/return its status over RF or local USB.
+Starting a task does not produce an `Invoked` result. Long finite functions do not
+block peer dispatch or exclude getter access through a whole-appliance mutex.
+
+Pending invocation records cannot be evicted by completed-history churn. A host
+session ending or timing out does not cancel admitted hardware work. Existing
+8-second host deadlines and 10-second relay paths still bound response delivery;
+a late result is not guaranteed after its path expires. No timeout starts another
+mutation. Hardware success and established state remain separate facts.
+
+With updates enabled, admission holds flash staging/activation until the call
+finishes. Acquisition uses a quiet hold: it excludes conflicting flash/commit work
+without resetting the update quiet interval merely because a getter ran. Actual
+registered changes still count as activity.
 
 ## One frame per call, read, result, or delta
 
@@ -59,7 +84,7 @@ and channel (1).
 
 Replies (opcodes 9 and 12) append a Q24.8 microseconds-per-byte path cost;
 `0xffffffff` is unknown and an owner starts at zero. See the cost model in
-[the kernel direction](../../../docs/KERNEL_DIRECTION.md#marginal-communication-cost).
+[the shared wire definitions](wire/README.md#communication-cost).
 
 The invocation control byte keeps remaining hops (1–8) in bits 0–3. Bit 4 is
 `copies - 1`: zero permits one copy, one permits a single split into two copies.
@@ -143,51 +168,64 @@ and reboot/session identity remain subsequent protocol work.
 
 ## Observation propagation
 
-`StateHandle::update` and `observation::update` compare established before/after
-values. An unchanged value emits nothing. `StateHandle::changed` registers one
-explicit delta even when a previous value is unavailable. Only exposed handles
-on the exact bound native instance are published.
+Kernel acquisition compares captured getter values with the last established
+local observations. Only declared native states and installed history views of
+the bound instance enter `kernel::change`. A batch becomes visible to transport
+after native cache/history maintenance completes; notification coalescing does
+not merge the individual records.
 
-For a grouped hardware report, the kernel captures all changed values and registers
-them before local dependent callbacks can create newer observations. Local callbacks
-continue to execute synchronously and read current native state. Distinct registered
-changes retain distinct sequence numbers, including changes to unavailable state.
-
-`kernel::change` owns an eight-entry transport ring. It retains only pending
-attribute/sequence/value records, with hard oldest eviction and an eviction counter.
-This is neither an appliance-state mirror nor a graph execution queue. A short
-interrupt-masked section protects its metadata on the supported single-core ports;
-no native I/O occurs there. Notification wakes the existing radio task. Once formation
-finishes, pending deltas interrupt its receive wait, while TX/energy operations retain
-their ordinary completion/cancellation rules. Coalesced wakeups do not coalesce records.
+`kernel::change` retains eight pending attribute/sequence/value records with hard
+oldest eviction and a counter. It is neither a foreign-state mirror nor a graph
+execution queue. A short interrupt-masked section protects metadata on the
+supported single-core ports; no hardware I/O runs there. The radio task wakes for
+published records, while its existing receive/TX completion rules remain intact.
 
 Each accepted delta can cross eight links. Relays retain eight recent owner/sequence
-keys for 10 seconds, suppressing duplicate transport copies without merging distinct
-changes. A received remote delta never overwrites local appliance state. Resident upstream activation and forward program traversal remain unimplemented. State sequence numbers restart on reboot;
-rapid restart can collide with retained history. Missing frames, ring eviction, or
-history eviction are not recovered by a retry engine or a current-state cache.
+keys for 10 seconds, suppressing transport duplicates without merging distinct
+changes. Remote deltas never overwrite the local hardware adapter. Resident upstream
+activation and forward program traversal remain unimplemented. Sequence numbers
+restart on reboot; loss, eviction and restart do not imply automatic recovery.
+
+### Retained native state
+
+`kernel::state::History` and `RetainedState` use native-width static storage.
+`Appliance::install_state` binds one source history and a firmware-compiled updater
+before startup. Acquired changes append captured post-values and evict oldest
+when full. Missing values remain unavailable; unchanged acquisitions add no sample.
+Acquisition finishes this maintenance before publishing the batch.
+
+Each history position and result is an exposed scalar with a mathematical
+definition. Normal reads use the observation-cache lock and changes use the
+ordinary delta ring. One acquired change can shift several views, consuming one ring entry per changed
+view and incurring the same hard eviction. History storage itself is not copied
+onto the stack or transmitted as a packed history record.
+
+The native history updater accepts one source history and no mutable accumulator
+input. Publication seals these startup definitions; OTA surface fingerprints include them. These are
+current native helper limits, not the compiler-program interface. External maintenance
+operations, multiple sources and post-startup installation remain design work;
+immutable surface publication must not prohibit later program installation.
 
 ## Reading current state
 
 A peer learns an attribute reference/type from its owner's surface and sends
 `ReadState` when it needs the current established observation. Each read and result
-is complete in one frame. No periodic polling, automatic initial broadcast, or
-all-appliance snapshot is added. The reply returns along the same bounded read
+is complete in one frame. The request does not add network polling, an initial
+broadcast or an all-appliance snapshot. The reply returns along the same bounded read
 paths used by surface requests; it is never a state-change broadcast.
 
-At the owner, `Appliance` matches the reference against its exposed state handles
-and acquires its existing mutex without waiting. It calls that state's reader
-once and pairs the value with the latest registered local change sequence while
-still holding the mutex. This neither invokes a transformer, runs dependents,
-increments the sequence, nor drains the outgoing delta ring. A previously sent or
-evicted delta does not erase the sequence watermark. All physical updates must
-still use the established observation primitives.
+At the owner, `Appliance` matches the reference against its declarations and
+returns the latest kernel-acquired observation with the owner change watermark
+under the observation-cache lock. It does not run physical I/O on the peer task,
+invoke a transformer, maintain history, increment a sequence or consume outgoing
+deltas. Acquisition continues independently. Contention with the brief publication
+step returns Busy; an unacquired or unavailable state returns an unavailable value.
 
 Result tag 0 carries a value/sequence; the typed value can be unavailable (255).
 Tag 1 means `UnknownAttribute`, and tag 2 means `Busy`; neither carries a sequence
 or value. Unavailable is an actual observation state and is distinct from a read
-failure, false, or zero. A retry uses a fresh read token and samples again; relays
-and owners do not cache/replay a state value. Duplicate copies of the same read
+failure, false, or zero. A retry uses a fresh read token and obtains the latest acquired value; relays
+and owners do not replay an earlier request's result. Duplicate copies of the same read
 are suppressed within the existing retained-path window.
 
 Surface, state, and link reads share eight fixed path records and one reader/token
@@ -212,15 +250,16 @@ ordering across reboot, compensate for packet loss, or prove physical convergenc
 The common forwarder retains its 2,464-byte compile-time ceiling, including three
 owners with two candidate directions each, maintained adjacent links, read/discovery
 records, four call paths with two-way branch bookkeeping, and eight delta duplicate keys. Owner
-invocation history has a 768-byte ceiling. Appliance and transport storage are
+invocation history has a 1,280-byte compile-time ceiling, including active-call
+tickets and return directions. Appliance and transport storage are
 static; argument decoding uses bounded stack storage. No allocator is enabled.
 
 Component checks are owned by the code whose properties they constrain:
 
 | Owner | Boundaries checked |
 | --- | --- |
-| `peer::invocation` | Exact replay key/payload, argument admission, retained result and oldest eviction |
-| `appliance` | Native signature/reference admission, mutex contention, reads without delta consumption, partial mutations and grouped report order |
+| `peer::invocation` | Exact replay key/payload, admission, pending identity protection, result replay and completed-history eviction |
+| `appliance` | Native signature/reference admission, acquired-value transitions, reads without delta consumption and partial hardware effects |
 | `change` | Instance/reference filtering, FIFO capacity, sequence wrap and hard eviction |
 | `peer::forwarding` | Read correlation, hop and copy budgets, incoming direction limits, normalized route ranking, expiry and bounded duplicate history |
 | `peer::host` | Session correlation, timeout without retry, result preservation, reply/event separation and bounded event loss |
@@ -229,7 +268,8 @@ Component checks are owned by the code whose properties they constrain:
 Tables partition these local boundaries without simulating several peers or
 reimplementing appliance behavior. Replay checks apply while the result remains
 retained; they do not extend that guarantee across history eviction or reboot.
-Ordinary C6/nRF images build. Earlier callback-chain hardware captures remain in
+Host checks and C6/nRF ordinary and OTA builds cover this revision; its new
+RTOS acquisition/call task integration has not yet been exercised on hardware. Earlier callback-chain hardware captures remain in
 the external lab as evidence of native calls, retained-state maintenance and
 operand transport. They do not validate an externally installable distributed
 program. RF investigation remains paused.

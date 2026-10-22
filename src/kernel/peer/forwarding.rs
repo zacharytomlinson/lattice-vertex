@@ -816,7 +816,7 @@ impl Forwarder {
         &mut self,
         incoming: Message<'a>,
         now: u32,
-        invoke: impl FnOnce(Invocation, &[u8]) -> InvokeStatus,
+        invoke: impl FnOnce(Invocation, &[u8]) -> Option<InvokeStatus>,
     ) -> [Option<Message<'a>>; 2] {
         self.expire(now);
         match incoming.content {
@@ -831,7 +831,9 @@ impl Forwarder {
                     return [None; 2];
                 }
                 if call.owner == self.local {
-                    let status = invoke(call, arguments);
+                    let Some(status) = invoke(call, arguments) else {
+                        return [None; 2];
+                    };
                     return [
                         Some(Message {
                             path_cost: TimePerByte::ZERO,
@@ -2275,7 +2277,7 @@ mod tests {
             );
             owner.receive_control(input, 0, |_, _| {
                 invoked = true;
-                InvokeStatus::Invoked
+                Some(InvokeStatus::Invoked)
             });
             assert_eq!(invoked, allowed);
         }

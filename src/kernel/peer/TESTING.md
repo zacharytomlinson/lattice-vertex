@@ -127,48 +127,17 @@ the range/forwarding checks. Two passive observers do not initiate reads.
 
 ## Validation scope
 
-The earlier version-6 kernel had host/build validation, plus a two-Nordic
-attached-host `ReadLinks` run. The Linux client obtained the attached resident's
-neighbor and read that neighbor's reciprocal link and end-of-list over radio.
-The test exposed a back-to-back discovery/link-offer conflict; maintenance now
-sends one solicitation per interval, and both links established after that change.
-USB reopen and software DFU entry also worked. The subsequent host v2 path read
-the maintained dimmer's complete surface, invoked its typed native transformer,
-and read back registered state. Wrong argument types and out-of-range values
-returned distinct native errors. The fixture is software-backed; this is not
-physical actuator verification or a range/loss-rate test. Some reads timed out;
-no mutation was automatically retried. A final read after closing the diagnostic
-console succeeded too. Earlier console-closed and post-reflash reads timed out,
-including a rerun with that console open; console state alone was not established
-as their cause. One concrete restart defect was fixed: host-originated reads now
-seed their counter from the host token instead of deliberately reusing read 1
-while another node retains that identity. A regression check covers that case.
-The radio stack now reserves 12 KiB (24 KiB for signed OTA) for the resident frame, callers,
-callees, and exception context. Neither that allocation nor the diagnostic USB
-polling cleanup established the cause of every earlier timeout.
+Owner-local host checks cover native replay, read correlation, maintained links,
+forwarding budgets, route costs, wire bounds, and event-buffer behavior. C6 and
+Nordic builds check platform integration. Selected hardware runs have exercised
+formation, reciprocal link reads, surface/native access, and host delta delivery;
+that does not validate every current multi-hop path or physical actuator.
 
-The host v3 stream has also delivered registered power changes and a subsequent
-single-state level change to Linux after native calls, without `ReadState` requests.
-An idle `watch` blocks on USB input and makes no serial writes. The same check had
-surface-read timeouts and incomplete two-change bursts; no overflow marker was
-reported. This proves the event path, not complete delivery or the cause of a
-missing delta. Ring overflow, reply priority, reconnect isolation, and coalesced
-reply/event decoding have deterministic checks.
+The resident transport provides [receive turns and MAC delivery](../radio/TESTING.md#receive-turns-in-the-resident-peer)
+for ordinary peer traffic. Native mutation results and observed state remain
+distinct; neither a transmitted frame nor an ACK proves physical convergence.
+Externally installed program traversal is still unimplemented.
 
-Native calls, relayed
-surface/current-state reads, reciprocal link maintenance, guided traversal, owner
-discovery, scored alternate directions, bounded invocation replication, and deltas
-have deterministic host checks; their
-complete tablet-to-appliance path still needs hardware validation. Earlier images
-exercised channel formation and peer exchange on C6 and Nordic. Those results do
-not establish the current wire version's end-to-end behavior or radio range.
-
-The subsequent transport investigation identified the repeated second-delta loss
-as a half-duplex turnaround failure. The common transport now receives between
-sends, preserves captured bytes for ordinary dispatch, and bounds completion of
-an already-started frame before interruption. See the [radio validation](../radio/TESTING.md#receive-turns-in-the-resident-peer)
-for the controlled comparison and remaining losses. Forwarding and native replay
-semantics are unchanged; no retry engine was added.
-
-Historical board captures and RF comparisons live in an external lab archive.
-They are not dependencies of these checks. RF investigation remains paused.
+Historical captures, superseded wire-version runs, and RF comparisons are retained
+in the external lab. They are not test dependencies or current reliability bounds.
+RF investigation remains paused.

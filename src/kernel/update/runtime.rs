@@ -221,7 +221,8 @@ pub(crate) fn poll_activation(
                 .then(|| (r.header.unwrap(), r.storage.activation_swap_bytes()))
         })
     };
-    let busy = activation::held() || pending() || work_pending || crate::kernel::change::pending();
+    let busy =
+        activation::work_held() || pending() || work_pending || crate::kernel::change::pending();
     match state.poll(now, local, ready, busy, neighbor_busy) {
         Action::Wait => {}
         Action::Announce(notice) => {

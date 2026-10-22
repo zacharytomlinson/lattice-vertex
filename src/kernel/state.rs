@@ -15,7 +15,6 @@
 use super::InstallError;
 use crate::{
     ir::{self, Value},
-    observation::Transition,
     surface::{Predicate, Read, Scalar, StateHandle},
 };
 use core::{
@@ -267,7 +266,7 @@ pub(crate) struct Installation<A: 'static> {
     pub next_appliance: Option<&'static Self>,
     next_source: AtomicPtr<Self>,
     storage: *const (),
-    update: unsafe fn(*const (), &mut A, Transition),
+    update: unsafe fn(*const (), &A, Option<Value>),
 }
 // Records and pointers are permanently resident, immutable after publication.
 unsafe impl<A> Sync for Installation<A> {}
@@ -277,11 +276,11 @@ impl<A> Installation<A> {
         self.samples.iter().chain(core::iter::once(self.result))
     }
 }
-pub(crate) fn maintain<A>(source: &StateHandle<A>, appliance: &mut A, transition: Transition) {
+pub(crate) fn maintain<A>(source: &StateHandle<A>, appliance: &A, value: Option<Value>) {
     let mut next = unsafe { source.maintained.load(Ordering::Acquire).as_ref() };
     while let Some(node) = next {
         unsafe {
-            (node.update)(node.storage, appliance, transition);
+            (node.update)(node.storage, appliance, value);
         }
         next = unsafe { node.next_source.load(Ordering::Acquire).as_ref() };
     }
@@ -307,8 +306,8 @@ unsafe fn read<A: 'static, T: Scalar + Send, U: Scalar + Send, const N: usize>(
 }
 unsafe fn maintain_record<A: 'static, T: Scalar + Send, U: Scalar + Send, const N: usize>(
     storage: *const (),
-    appliance: &mut A,
-    transition: Transition,
+    appliance: &A,
+    value: Option<Value>,
 ) {
     let state = unsafe { &*storage.cast::<RetainedState<A, T, U, N>>() };
     if state.owner.load(Ordering::Acquire).cast_const() != ptr::from_ref(appliance) {
@@ -320,9 +319,7 @@ unsafe fn maintain_record<A: 'static, T: Scalar + Send, U: Scalar + Send, const 
     let values = unsafe { &mut *state.values.get() };
     let oldest = values.history.value(N - 1);
     let old_result = values.computed;
-    let sample = transition
-        .after
-        .map(|v| T::from_value(v).expect("source scalar changed type"));
+    let sample = value.map(|v| T::from_value(v).expect("source scalar changed type"));
     values.history.append(sample);
     values.computed = (values.update.unwrap())(&values.history);
     // Values are committed before publication. These are ordinary state deltas,

@@ -84,14 +84,11 @@ Host checks use the real Embassy swap algorithm with a NOR model: bounds and
 vectors, duplicate writes, confirmation/reversion, and interruptions during
 staging, swapping, and reverting. They are not hardware power-loss evidence.
 
-On the checked XIAO, reset-to-USB-return took approximately 24.6 seconds for a
-trial swap and 24.8 seconds for reversion. Confirmation followed by reset returned
-within the one-second observation interval. That revision-1 loader swapped the entire 376 KiB
-active slot, even for the 90,684-byte test image. These observations include factory
-boot and USB enumeration; they are not guaranteed activation bounds or isolated
-flash timings. The release loader occupies 2,804 flash bytes; its swap buffer uses
-4 KiB of startup stack. The kernel fixture uses about 23 KiB of static RAM, plus
-its startup stack, without an allocator.
+Physical staging, trial, confirmation, and reversion have been exercised through
+the maintained USB fixture. Swap work covers the whole active slot, not merely
+the candidate length. Measure each release using the
+[cost tool](../../../../tools/README.md#measuring-a-release); historical fixture
+timings are not activation bounds. Detailed captures remain in the external lab.
 
 ```sh
 cargo +stable test --lib --locked
@@ -101,7 +98,6 @@ cargo +nightly build -Z build-std=core --release --locked \
 
 The maintained USB/RTOS fixture and upload instructions are
 [beside the port tests](../tests/UPDATE.md).
-
 
 Watchdog handoff and automatic local startup confirmation now use the common
 [updater startup path](../../../../docs/FIRMWARE_UPDATES.md#watchdog-backed-startup-confirmation).

@@ -1,4 +1,6 @@
-//! Resident appliance storage and synchronized native dispatch.
+//! Passive appliance binding, kernel-owned acquisition and native dispatch.
+
+pub(crate) mod execution;
 
 use super::{
     peer::frame::{InvokeStatus, StateReadResult},
@@ -14,7 +16,7 @@ use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     ptr,
-    sync::atomic::{AtomicPtr, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering},
 };
 
 /// Local retained-state installation failure. No new binding is published on failure.
@@ -38,30 +40,41 @@ pub enum InstallError {
 
 /// Static storage for an appliance's native state and mathematical surface.
 /// Initialize once before scheduler startup, then pass it to `kernel::start`.
-/// Hardware tasks use `with` to apply established observations through the
-/// existing `StateHandle::update` / `observation::update` interfaces.
+/// The kernel samples getters and invokes native functions in its own tasks.
+/// The adapter has no report loop. Hardware resources use their own scoped access.
 pub struct Appliance<A: 'static, E: 'static> {
     surface: &'static Surface<'static, A, E>,
     control: UnsafeCell<StaticQueue_t>,
-    native: UnsafeCell<MaybeUninit<Mutex<A>>>,
+    native: UnsafeCell<MaybeUninit<A>>,
+    observations: UnsafeCell<MaybeUninit<Mutex<Observations>>>,
     instance: AtomicPtr<()>,
     ready: AtomicU8,
+    sampled: AtomicBool,
+    acquiring: AtomicBool,
     installed: AtomicPtr<super::state::Installation<A>>,
 }
 
 // Initialization is once-only and published with release/acquire. After that,
-// the existing RTOS mutex exclusively protects A. The surface is immutable.
-unsafe impl<A: Send, E> Sync for Appliance<A, E> {}
+// A is shared only after publication and must be Sync. The observation mutex
+// protects acquisition/history, never the lifetime of a native operation.
+unsafe impl<A: Send + Sync, E> Sync for Appliance<A, E> {}
 
-impl<A: Send, E> Appliance<A, E> {
+impl<A: Send + Sync, E> Appliance<A, E> {
     /// Reserve native storage without an allocator or caller-supplied mutex.
     pub const fn new(surface: &'static Surface<'static, A, E>) -> Self {
+        assert!(
+            surface.states.len() <= crate::configLATTICE_NATIVE_STATES,
+            "native state capacity"
+        );
         Self {
             surface,
             control: UnsafeCell::new(StaticQueue_t::new()),
             native: UnsafeCell::new(MaybeUninit::uninit()),
+            observations: UnsafeCell::new(MaybeUninit::uninit()),
             instance: AtomicPtr::new(ptr::null_mut()),
             ready: AtomicU8::new(0),
+            sampled: AtomicBool::new(false),
+            acquiring: AtomicBool::new(false),
             installed: AtomicPtr::new(ptr::null_mut()),
         }
     }
@@ -80,53 +93,95 @@ impl<A: Send, E> Appliance<A, E> {
                 .is_ok(),
             "appliance already initialized"
         );
-        // The static control block is exclusively initialized once. Neither it
-        // nor the inline mutex/native value can move after this publication.
+        // The initialized native object never moves and only shared references
+        // escape. The distinct mutex serializes acquisition, not appliance calls.
         unsafe {
-            let mutex = Mutex::new_static(context, value, &mut *self.control.get())
-                .expect("appliance mutex");
-            (*self.native.get()).write(mutex);
-            let guard = (*self.native.get())
-                .assume_init_ref()
-                .try_lock(context)
-                .unwrap();
-            self.instance
-                .store(ptr::from_ref(&*guard).cast_mut().cast(), Ordering::Release);
+            (*self.native.get()).write(value);
+            self.instance.store(
+                (*self.native.get()).as_ptr().cast_mut().cast(),
+                Ordering::Release,
+            );
+            let observations =
+                Mutex::new_static(context, Observations::new(), &mut *self.control.get())
+                    .expect("observation mutex");
+            (*self.observations.get()).write(observations);
         }
         self.ready.store(2, Ordering::Release);
     }
 
-    fn native(&self) -> &Mutex<A> {
-        assert_eq!(
-            self.ready.load(Ordering::Acquire) & 2,
-            2,
+    fn native(&self) -> &A {
+        assert!(
+            self.ready.load(Ordering::Acquire) & 2 != 0,
             "initialize appliance before use"
         );
         unsafe { (*self.native.get()).assume_init_ref() }
     }
+    fn observations(&self) -> &Mutex<Observations> {
+        unsafe { (*self.observations.get()).assume_init_ref() }
+    }
 
-    /// Access native state in task context. Register physical observations with
-    /// the state update primitives inside this closure; their networking is
-    /// automatic once the kernel binds this instance. The closure must not
-    /// recursively acquire this same appliance.
-    pub fn with<R>(&self, context: &TaskContext, update: impl FnOnce(&mut A) -> R) -> R {
+    /// Access the passive hardware adapter. Native functions use shared access;
+    /// synchronization of physical resources belongs to their hardware binding.
+    pub fn with<R>(&self, context: &TaskContext, access: impl FnOnce(&A) -> R) -> R {
         #[cfg(feature = "firmware-update")]
-        let _activity = loop {
-            if let Ok(guard) = super::update::hold_updates(context) {
-                break guard;
+        let _hold = loop {
+            if let Ok(hold) = super::update::hold_updates(context) {
+                break hold;
             }
-            // A flash step or activation owns admission. Start hardware work
-            // only after it completes (or the selected image resets).
             crate::delay_ms(context, 1);
         };
-        let mutex = self.native();
-        let mut guard = if tasks::xTaskGetSchedulerState() == tasks::taskSCHEDULER_NOT_STARTED {
-            mutex.try_lock(context)
-        } else {
-            mutex.lock(context)
+        let _ = context;
+        access(self.native())
+    }
+
+    fn sample(&self, context: &TaskContext) {
+        let native = self.native();
+        #[cfg(feature = "firmware-update")]
+        let Ok(_hold) = super::update::hold_observation(context) else {
+            return;
+        };
+        if self
+            .acquiring
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
         }
-        .expect("appliance lock");
-        update(&mut guard)
+        struct Finish<'a>(&'a AtomicBool);
+        impl Drop for Finish<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _acquisition = Finish(&self.acquiring);
+        let mut after = [None; crate::configLATTICE_NATIVE_STATES];
+        for (index, state) in self.surface.states.iter().enumerate() {
+            after[index] = state.read(native);
+        }
+        // No observation mutex is held during physical I/O. Readers can return
+        // the previous established observation while a getter is in progress.
+        let Some(mut samples) = self.observations().try_lock(context) else {
+            return;
+        };
+        let batch = super::change::batch();
+        // Capture every native input before maintenance publishes derived state.
+        for (index, state) in self.surface.states.iter().enumerate() {
+            if samples.values[index].is_some_and(|before| before != after[index]) {
+                state.record_change(native, after[index]);
+            }
+        }
+        for (index, state) in self.surface.states.iter().enumerate() {
+            if let Some(before) = samples.values[index] {
+                if before != after[index] {
+                    super::state::maintain(state, native, after[index]);
+                }
+            }
+            // First acquisition establishes the baseline, not an invented change.
+            samples.values[index] = Some(after[index]);
+        }
+        self.sampled.store(true, Ordering::Release);
+        drop(samples);
+        drop(batch);
     }
 
     pub(crate) fn surface(&self) -> &'static Surface<'static, A, E> {
@@ -191,11 +246,11 @@ impl<A: Send, E> Appliance<A, E> {
             }
         }
         let _finish = Finish(&self.ready);
-        let mutex = unsafe { (*self.native.get()).assume_init_ref() };
-        let Some(guard) = mutex.try_lock(context) else {
+        let native = unsafe { (*self.native.get()).assume_init_ref() };
+        let Some(_guard) = self.observations().try_lock(context) else {
             return Err(InstallError::Busy);
         };
-        install(&guard)
+        install(native)
     }
 
     pub(crate) fn seal(&self) {
@@ -225,7 +280,7 @@ impl<A: Send, E> Appliance<A, E> {
     }
 }
 
-impl<A: Send + 'static, E: 'static> crate::ir::Surface for Appliance<A, E> {
+impl<A: Send + Sync + 'static, E: 'static> crate::ir::Surface for Appliance<A, E> {
     type Location = crate::surface::Read<A>;
     fn states<'s>(&'s self) -> impl Iterator<Item = &'s crate::ir::Attribute<Self::Location>> {
         self.state_definitions()
@@ -249,12 +304,13 @@ impl<A: Send + 'static, E: 'static> crate::ir::Surface for Appliance<A, E> {
 pub(crate) trait Native: Sync {
     fn ready(&self) -> bool;
     fn seal(&self) {}
+    fn acquire(&self, _context: &TaskContext) {}
     fn owns(&self, instance: *const (), attribute: u64) -> bool;
     fn read(&self, context: &TaskContext, attribute: u64) -> StateReadResult;
     fn invoke(&self, context: &TaskContext, transformer: u64, arguments: &[Value]) -> InvokeStatus;
 }
 
-impl<A: Send, E> Native for Appliance<A, E> {
+impl<A: Send + Sync, E> Native for Appliance<A, E> {
     fn ready(&self) -> bool {
         self.ready.load(Ordering::Acquire) & 2 == 2
     }
@@ -267,21 +323,41 @@ impl<A: Send, E> Native for Appliance<A, E> {
                 .state_definitions()
                 .any(|s| ptr::from_ref(s) as usize as u64 == attribute)
     }
+    fn acquire(&self, context: &TaskContext) {
+        self.sample(context);
+    }
     fn read(&self, context: &TaskContext, attribute: u64) -> StateReadResult {
+        if !self.ready() {
+            return StateReadResult::Busy;
+        }
+        if let Some(index) = self
+            .surface
+            .states
+            .iter()
+            .position(|s| ptr::from_ref(s.definition()) as usize as u64 == attribute)
+        {
+            let Some(samples) = self.observations().try_lock(context) else {
+                return StateReadResult::Busy;
+            };
+            return StateReadResult::Value {
+                sequence: super::change::sequence(),
+                value: samples.values[index].flatten(),
+            };
+        }
         let Some(state) = self
-            .state_definitions()
+            .installations()
+            .flat_map(|i| i.states())
             .find(|s| ptr::from_ref(*s) as usize as u64 == attribute)
         else {
             return StateReadResult::UnknownAttribute;
         };
-        let Some(guard) = self.native().try_lock(context) else {
+        let Some(_guard) = self.observations().try_lock(context) else {
             return StateReadResult::Busy;
         };
-        // Hold the same mutex used for observation updates while reading the
-        // value and its change watermark. A read neither registers nor drains deltas.
-        let value = state.location.read(&guard);
-        let sequence = super::change::sequence();
-        StateReadResult::Value { sequence, value }
+        StateReadResult::Value {
+            sequence: super::change::sequence(),
+            value: state.location.read(self.native()),
+        }
     }
 
     fn invoke(&self, context: &TaskContext, transformer: u64, arguments: &[Value]) -> InvokeStatus {
@@ -297,181 +373,30 @@ impl<A: Send, E> Native for Appliance<A, E> {
         else {
             return InvokeStatus::UnknownTransformer;
         };
-        let Some(mut guard) = self.native().try_lock(context) else {
+        self.sample(context);
+        if !self.sampled.load(Ordering::Acquire) {
             return InvokeStatus::Busy;
-        };
-        match handle.invoke(&mut guard, arguments) {
+        }
+        let result = match handle.invoke(self.native(), arguments) {
             Ok(()) => InvokeStatus::Invoked,
             Err(InvokeError::Arguments(_)) => InvokeStatus::Arguments,
             Err(InvokeError::Appliance(_)) => InvokeStatus::ApplianceError,
+        };
+        self.sample(context);
+        result
+    }
+}
+
+struct Observations {
+    values: [Option<Option<Value>>; crate::configLATTICE_NATIVE_STATES],
+}
+impl Observations {
+    const fn new() -> Self {
+        Self {
+            values: [None; crate::configLATTICE_NATIVE_STATES],
         }
     }
 }
 
 #[cfg(all(test, feature = "port-test"))]
-mod tests {
-    extern crate std;
-    use super::*;
-    use crate::{
-        ir::{Effect, Expr},
-        observation::{self, Dependent},
-        surface::{
-            Arguments, Definition, Operation, Predicate, State, StateHandle, StateTransformer,
-            TransformerHandle,
-        },
-    };
-    type Device = [Option<bool>; 2];
-    struct Slot<const I: usize>;
-    impl<const I: usize> State for Slot<I> {
-        type Appliance = Device;
-        type Value = bool;
-        fn read(a: &Device) -> Option<bool> {
-            a[I]
-        }
-    }
-    static FIRST: StateHandle<Device> = StateHandle::new::<Slot<0>>();
-    static SECOND: StateHandle<Device> = StateHandle::new::<Slot<1>>();
-    static TRUE: Definition<Device> = Definition {
-        body: Expr::Constant(Value::boolean(true)),
-        arguments: &[],
-        inputs: &[],
-    };
-    struct Apply;
-    impl StateTransformer for Apply {
-        type Appliance = Device;
-        type Arguments = (bool,);
-        type Error = ();
-        const DEFINITION: Operation<Device> = Operation {
-            precondition: Predicate {
-                definition: &TRUE,
-                inputs: &[],
-            },
-            effect: Effect {
-                inputs: &[],
-                outputs: &[FIRST.definition()],
-                results: &[Expr::Argument(0)],
-                arguments: Self::Arguments::TYPES,
-            },
-        };
-        fn invoke(a: &mut Device, (v,): (bool,)) -> Result<(), ()> {
-            if v {
-                return Ok(());
-            } // Accepted request without an observation.
-            FIRST.update(a, |a| a[0] = Some(false));
-            Err(()) // An error must not suppress a partial physical update.
-        }
-    }
-    static APPLY: TransformerHandle<Device, ()> = TransformerHandle::new::<Apply>();
-    static SURFACE: Surface<Device, ()> = Surface {
-        states: &[&FIRST, &SECOND],
-        transformers: &[&APPLY],
-        axioms: &[],
-        invariants: &[],
-    };
-    fn reference<T>(v: &T) -> u64 {
-        ptr::from_ref(v) as usize as u64
-    }
-    fn initialize() -> (TaskContext, &'static Appliance<Device, ()>) {
-        crate::port::test_port_reset();
-        super::super::change::reset();
-        FIRST.set_dependents(None);
-        let context = unsafe { TaskContext::assume() };
-        let owner = std::boxed::Box::leak(std::boxed::Box::new(Appliance::new(&SURFACE)));
-        owner.initialize(&context, [None; 2]);
-        super::super::change::bind(owner);
-        (context, owner)
-    }
-
-    #[test]
-    fn native_admission() {
-        let (context, owner) = initialize();
-        let handle = reference(&APPLY);
-        for (target, args, expected) in [
-            (
-                0,
-                &[Value::boolean(true)][..],
-                InvokeStatus::UnknownTransformer,
-            ),
-            (handle, &[][..], InvokeStatus::Arguments),
-            (
-                handle,
-                &[Value::integer(crate::ir::Integer::U8, 1).unwrap()][..],
-                InvokeStatus::Arguments,
-            ),
-            (handle, &[Value::boolean(true)][..], InvokeStatus::Invoked),
-        ] {
-            assert_eq!(owner.invoke(&context, target, args), expected);
-            assert!(!super::super::change::pending());
-            assert_eq!(
-                owner.read(&context, reference(FIRST.definition())),
-                StateReadResult::Value {
-                    sequence: 0,
-                    value: None
-                }
-            );
-        }
-        owner.with(&context, |_| {
-            assert_eq!(
-                owner.invoke(&context, handle, &[Value::boolean(true)]),
-                InvokeStatus::Busy
-            );
-            assert_eq!(
-                owner.read(&context, reference(FIRST.definition())),
-                StateReadResult::Busy
-            );
-        });
-        for target in [0, handle, reference(&Slot::<0>)] {
-            assert_eq!(
-                owner.read(&context, target),
-                StateReadResult::UnknownAttribute
-            );
-        }
-        assert_eq!(
-            owner.invoke(&context, handle, &[Value::boolean(false)]),
-            InvokeStatus::ApplianceError
-        );
-        for _ in 0..2 {
-            assert_eq!(
-                owner.read(&context, reference(FIRST.definition())),
-                StateReadResult::Value {
-                    sequence: 1,
-                    value: Some(Value::boolean(false))
-                }
-            );
-        }
-        let delta = super::super::change::take().unwrap();
-        assert_eq!(
-            (delta.sequence, delta.value),
-            (1, Some(Value::boolean(false)))
-        );
-        assert!(!super::super::change::pending());
-        super::super::change::reset();
-    }
-
-    #[test]
-    fn report_order() {
-        let (context, owner) = initialize();
-        static NEXT: Dependent<Device> = Dependent {
-            activate: |a, _, _| SECOND.update(a, |a| a[1] = Some(false)),
-            next: None,
-        };
-        FIRST.set_dependents(Some(&NEXT));
-        owner.with(&context, |a| {
-            observation::update(a, &[&FIRST, &SECOND], |a| *a = [Some(true); 2])
-        });
-        for (sequence, attribute, value) in [
-            (1, FIRST.definition(), true),
-            (2, SECOND.definition(), true),
-            (3, SECOND.definition(), false),
-        ] {
-            let delta = super::super::change::take().unwrap();
-            assert_eq!(
-                (delta.sequence, delta.attribute, delta.value),
-                (sequence, reference(attribute), Some(Value::boolean(value)))
-            );
-        }
-        assert!(!super::super::change::pending());
-        FIRST.set_dependents(None);
-        super::super::change::reset();
-    }
-}
+mod tests;

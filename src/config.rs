@@ -509,3 +509,12 @@ pub const tskSET_NEW_STACKS_TO_KNOWN_VALUE: BaseType_t = if configCHECK_FOR_STAC
 /// Stacks are filled with this value and then scanned to determine
 /// how much has been used.
 pub const tskSTACK_FILL_BYTE: u8 = 0xA5;
+
+// Lattice resident execution storage. Values are kernel build policy, not
+// appliance networking settings. All stacks and control blocks remain static.
+pub const configLATTICE_NATIVE_STATES: usize = 32;
+pub const configLATTICE_NATIVE_TASKS: usize = 2;
+pub const configLATTICE_NATIVE_STACK_WORDS: usize = 1024;
+pub const configLATTICE_ACQUISITION_STACK_WORDS: usize = 1024;
+/// Fallback hardware acquisition interval; unchanged samples emit no deltas.
+pub const configLATTICE_ACQUISITION_MS: u32 = 10;

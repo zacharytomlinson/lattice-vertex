@@ -2,7 +2,7 @@
 //! Only the kernel emits packets. Each record describes one range, not a
 //! completed surface transfer; no foreign mathematical surface is retained.
 
-use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering::Relaxed};
 use lattice_vertex::{
     ir::{Binary, Effect, Expr, Integer, Unary, Value},
     kernel::radio::testing::Event,
@@ -14,15 +14,15 @@ use lattice_vertex::{
 };
 
 pub struct Controls {
-    power: bool,
-    level: u8,
+    power: AtomicBool,
+    level: AtomicU8,
 }
 struct Power;
 impl State for Power {
     type Appliance = Controls;
     type Value = bool;
     fn read(a: &Controls) -> Option<bool> {
-        Some(a.power)
+        Some(a.power.load(Relaxed))
     }
 }
 struct Level;
@@ -30,13 +30,13 @@ impl State for Level {
     type Appliance = Controls;
     type Value = u8;
     fn read(a: &Controls) -> Option<u8> {
-        Some(a.level)
+        Some(a.level.load(Relaxed))
     }
 }
 static POWER: StateHandle<Controls> = StateHandle::new::<Power>();
 static LEVEL: StateHandle<Controls> = StateHandle::new::<Level>();
-// Compiler-like local installation data. Native SetLevel continues to report
-// only power/level; kernel maintenance owns all history and derived updates.
+// Native fixture history: the adapter only changes hardware-backed values.
+// Kernel acquisition owns detection, history maintenance and delta publication.
 static LEVEL_HISTORY: RetainedState<Controls, u8, i16, 4> = RetainedState::new(&LEVEL);
 static LEVEL_DIFFERENCE: Definition<Controls> = Definition {
     body: Expr::Binary(
@@ -131,8 +131,8 @@ impl StateTransformer for SetPower {
             arguments: Self::Arguments::TYPES,
         },
     };
-    fn invoke(a: &mut Controls, (power,): (bool,)) -> Result<(), ()> {
-        POWER.update(a, |a| a.power = power);
+    fn invoke(a: &Controls, (power,): (bool,)) -> Result<(), ()> {
+        a.power.store(power, Relaxed);
         Ok(())
     }
 }
@@ -156,14 +156,12 @@ impl StateTransformer for SetLevel {
             arguments: Self::Arguments::TYPES,
         },
     };
-    fn invoke(a: &mut Controls, (level,): (u8,)) -> Result<(), ()> {
+    fn invoke(a: &Controls, (level,): (u8,)) -> Result<(), ()> {
         if level > 200 {
             return Err(());
         }
-        lattice_vertex::observation::update(a, &[&POWER, &LEVEL], |a| {
-            a.level = level;
-            a.power = level != 0;
-        });
+        a.level.store(level, Relaxed);
+        a.power.store(level != 0, Relaxed);
         Ok(())
     }
 }
@@ -199,8 +197,8 @@ pub fn appliance(
     appliance.initialize(
         context,
         Controls {
-            power: false,
-            level: 0,
+            power: AtomicBool::new(false),
+            level: AtomicU8::new(0),
         },
     );
     if dimmer {

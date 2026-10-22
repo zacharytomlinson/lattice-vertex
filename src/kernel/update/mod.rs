@@ -18,6 +18,7 @@ mod startup;
     all(feature = "port-esp32c6", feature = "esp32c6-update")
 ))]
 pub use runtime::{confirm, select_trial, snapshot, PlatformStorage};
+pub(crate) use staging::hold_observation;
 pub use staging::{hold_updates, UpdateHold};
 
 use lattice_peer_wire::update::{PackageId, Request};
@@ -66,7 +67,7 @@ pub fn surface_identity<A: 'static, E: 'static>(
 /// This seals installation, just like starting publication. Use after all local
 /// installations when preparing a release policy for that appliance.
 #[cfg(feature = "use-mutexes")]
-pub fn appliance_surface_identity<A: Send + 'static, E: 'static>(
+pub fn appliance_surface_identity<A: Send + Sync + 'static, E: 'static>(
     appliance: &'static super::Appliance<A, E>,
 ) -> [u8; 32] {
     description_identity(

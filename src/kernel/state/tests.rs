@@ -10,18 +10,28 @@ use crate::{
         peer::{exposure::Description, frame::StateReadResult},
         Appliance,
     },
-    observation::{self, Dependent, Previous},
     surface::{Definition, State, Surface},
     sync::TaskContext,
 };
 
-type Device = Option<u8>;
+struct Device(core::sync::atomic::AtomicU16);
+impl Device {
+    fn new(v: Option<u8>) -> Self {
+        Self(core::sync::atomic::AtomicU16::new(v.map_or(256, u16::from)))
+    }
+    fn set(&self, v: Option<u8>) {
+        self.0.store(v.map_or(256, u16::from), Ordering::Relaxed);
+    }
+    fn get(&self) -> Option<u8> {
+        u8::try_from(self.0.load(Ordering::Relaxed)).ok()
+    }
+}
 struct Level;
 impl State for Level {
     type Appliance = Device;
     type Value = u8;
-    fn read(a: &Device) -> Device {
-        *a
+    fn read(a: &Device) -> Option<u8> {
+        a.get()
     }
 }
 static SOURCE: StateHandle<Device> = StateHandle::new::<Level>();
@@ -65,8 +75,6 @@ impl Fixture {
     fn new() -> Self {
         crate::port::test_port_reset();
         change::reset();
-        SOURCE.set_dependents(None);
-        ALIAS.set_dependents(None);
         Self {
             context: unsafe { TaskContext::assume() },
             owner: leak(Appliance::new(&SURFACE)),
@@ -74,15 +82,16 @@ impl Fixture {
         }
     }
     fn initialize(&self) {
-        self.owner.initialize(&self.context, None);
+        self.owner.initialize(&self.context, Device::new(None));
+        self.owner.acquire(&self.context);
     }
     fn install(&self) -> Result<(), InstallError> {
         self.owner
             .install_state(&self.context, self.state, difference, &RULE)
     }
-    fn set(&self, v: Device) {
-        self.owner
-            .with(&self.context, |a| SOURCE.update(a, |a| *a = v));
+    fn set(&self, v: Option<u8>) {
+        self.owner.with(&self.context, |a| a.set(v));
+        self.owner.acquire(&self.context);
     }
     fn read(&self, attr: &ir::Attribute<Read<Device>>) -> Option<Value> {
         let StateReadResult::Value { value, .. } = self.owner.read(&self.context, reference(attr))
@@ -95,8 +104,6 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         change::reset();
-        SOURCE.set_dependents(None);
-        ALIAS.set_dependents(None);
     }
 }
 
@@ -144,14 +151,12 @@ fn installation_admission() {
         Uninitialized,
         Open,
         Bound,
-        Locked,
         Published,
     }
     for (phase, expected, count) in [
         (Phase::Uninitialized, Err(InstallError::NotInitialized), 0),
         (Phase::Open, Ok(()), 1),
         (Phase::Bound, Err(InstallError::AlreadyInstalled), 1),
-        (Phase::Locked, Err(InstallError::Busy), 0),
         (Phase::Published, Err(InstallError::Closed), 0),
     ] {
         let f = Fixture::new();
@@ -164,11 +169,7 @@ fn installation_admission() {
         if phase == Phase::Published {
             f.owner.seal();
         }
-        let result = if phase == Phase::Locked {
-            f.owner.with(&f.context, |_| f.install())
-        } else {
-            f.install()
-        };
+        let result = f.install();
         assert_eq!(result, expected, "{phase:?}");
         assert_eq!(f.owner.installations().count(), count, "{phase:?}");
     }
@@ -218,28 +219,21 @@ fn maintenance_deltas() {
     change::bind(f.owner);
     let mut accepted = Vec::new();
     let attrs = [f.state.sample(0), f.state.sample(1), f.state.result()];
-    // Equality, extrema, loss/recovery, and explicitly qualified repeats.
-    for (next, explicit) in [
-        (Some(0), false),
-        (Some(0), false),
-        (Some(255), false),
-        (Some(0), false),
-        (None, false),
-        (None, true),
-        (Some(10), false),
-        (Some(10), true),
+    // Equality, extrema and loss/recovery; repeated getter values are not changes.
+    for next in [
+        Some(0),
+        Some(0),
+        Some(255),
+        Some(0),
+        None,
+        None,
+        Some(10),
+        Some(10),
     ] {
         let previous = f.read(SOURCE.definition());
         let before = attrs.map(|a| f.read(a));
-        f.owner.with(&f.context, |a| {
-            if explicit {
-                *a = next;
-                SOURCE.changed(a);
-            } else {
-                SOURCE.update(a, |a| *a = next);
-            }
-        });
-        let changed = explicit || previous != next.map(Scalar::into_value);
+        f.set(next);
+        let changed = previous != next.map(Scalar::into_value);
         if changed {
             accepted.push(next);
         }
@@ -281,7 +275,8 @@ fn instance_ownership() {
         .install_state(&f.context, second, difference, &RULE)
         .unwrap();
     let other = leak(Appliance::new(&SURFACE));
-    other.initialize(&f.context, None);
+    other.initialize(&f.context, Device::new(None));
+    other.acquire(&f.context);
     assert_eq!(
         other.install_state(&f.context, f.state, difference, &RULE),
         Err(InstallError::AlreadyInstalled)
@@ -289,7 +284,8 @@ fn instance_ownership() {
     change::bind(f.owner);
     for owned in [false, true] {
         let owner = if owned { f.owner } else { other };
-        owner.with(&f.context, |a| SOURCE.update(a, |a| *a = Some(31)));
+        owner.with(&f.context, |a| a.set(Some(31)));
+        owner.acquire(&f.context);
         for record in [f.state, second] {
             assert_eq!(
                 f.read(record.sample(0)),
@@ -298,7 +294,6 @@ fn instance_ownership() {
         }
         assert_eq!(change::pending(), owned);
     }
-    SOURCE.set_dependents(None);
     f.set(Some(32));
     for record in [f.state, second] {
         assert_eq!(f.read(record.result()), Some(1i16.into_value()));
@@ -306,60 +301,6 @@ fn instance_ownership() {
             assert_eq!(record.result().location.read(a), None)
         });
     }
-    f.owner.with(&f.context, |_| {
-        assert_eq!(
-            f.owner.read(&f.context, reference(f.state.result())),
-            StateReadResult::Busy
-        )
-    });
-}
-
-#[test]
-fn transition_order() {
-    let f = Fixture::new();
-    f.initialize();
-    f.install().unwrap();
-    static REENTER: Dependent<Device> = Dependent {
-        activate: |a, _, _| SOURCE.update(a, |a| *a = Some(20)),
-        next: None,
-    };
-    static SEEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    static CHECK: Dependent<Device> = Dependent {
-        activate: |_, _, t| {
-            let expected = [
-                Transition {
-                    before: Previous::Captured(value(10)),
-                    after: value(20),
-                },
-                Transition {
-                    before: Previous::Captured(None),
-                    after: value(10),
-                },
-                Transition {
-                    before: Previous::Unknown,
-                    after: value(20),
-                },
-            ];
-            assert_eq!(t, expected[SEEN.fetch_add(1, Ordering::Relaxed)]);
-        },
-        next: None,
-    };
-    SEEN.store(0, Ordering::Relaxed);
-    ALIAS.set_dependents(Some(&REENTER));
-    SOURCE.set_dependents(Some(&CHECK));
-    // History order and captured callbacks must survive a reentrant report.
-    f.owner.with(&f.context, |a| {
-        observation::update(a, &[&ALIAS, &SOURCE], |a| *a = Some(10))
-    });
-    for (attr, expected) in [
-        (f.state.sample(0), value(20)),
-        (f.state.sample(1), value(10)),
-        (f.state.result(), Some(10i16.into_value())),
-    ] {
-        assert_eq!(f.read(attr), expected);
-    }
-    f.owner.with(&f.context, |a| SOURCE.changed(a));
-    assert_eq!(SEEN.load(Ordering::Relaxed), 3);
 }
 
 #[test]

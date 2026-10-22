@@ -35,17 +35,12 @@ the previous valid image. `confirm` records `Valid`. Seeing a running image stil
 marked `New` is rejected as missing rollback support. There is no slot-copy outage
 as on Nordic; both images stay in their own flash regions.
 
-Current validation: host checks cover reference CRCs, aborted/torn metadata,
-running-slot mismatch, protected rollback images, confirmation, uncertain metadata
-commits, bounds, duplicates, and wrong-target images. C6 builds and the maintained
-vendor bootloader build pass. The [USB fixture](../tests/UPDATE.md#validation) has
-also completed staging, trial boot, reset without confirmation back to A, and
-confirmation followed by a reset retaining B on an 8 MiB C6. First successful
-status arrived within about 0.28 seconds of reset acknowledgement, including the
-host's 250 ms wait. Physical interrupted writes remain separate from host checks.
-A full unplug/reconnect with an incomplete, unselected candidate also retained
-confirmed B. The test-console framing issue found during that check was fixed in
-the shared fixture decoder; it did not change the boot/storage implementation.
+Host checks cover reference CRCs, aborted/torn metadata, running-slot mismatch,
+protected rollback images, confirmation, uncertain commits, bounds, duplicate
+writes, and wrong-target images. Physical staging, trial, confirmation and rollback
+have been exercised through the [maintained fixtures](../../TESTING.md#update-checks).
+Physical interrupted writes remain separate from host fault injection. Historical
+capture details and timings are preserved in the external lab.
 
 The API is local boot machinery. The optional `kernel::update` service adds signed
 packages, download resume, and radio transfer above it. Its validated partition
@@ -59,7 +54,6 @@ operations remain synchronous and can interrupt radio service.
 ```sh
 cargo +stable test --lib --locked
 ```
-
 
 Watchdog handoff and automatic local startup confirmation now use the common
 [updater startup path](../../../../docs/FIRMWARE_UPDATES.md#watchdog-backed-startup-confirmation).

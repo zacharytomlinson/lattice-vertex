@@ -184,6 +184,22 @@ fn participate(
         let now = tasks::xTaskGetTickCount();
         let milliseconds = ((now as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
         forwarder.expire(milliseconds);
+        if let Some(done) = invocations.take_completion() {
+            for previous in done.previous.into_iter().filter(|p| *p != 0) {
+                let reply = Message {
+                    source: local,
+                    destination: Some(previous),
+                    path_cost: crate::kernel::radio::cost::TimePerByte::ZERO,
+                    content: Content::InvocationResult {
+                        network,
+                        call: done.call,
+                        status: done.status,
+                        hops: 1,
+                    },
+                };
+                send(radio, reply, &mut sequence, &mut outgoing_buffer);
+            }
+        }
         collect_costs(radio, &mut forwarder, milliseconds);
         #[cfg(all(
             feature = "firmware-update",
@@ -325,7 +341,11 @@ fn participate(
                 }
                 for reply in forwarder
                     .receive_control(message, now, |call, arguments| {
-                        invocations.invoke(native, &context, call, arguments)
+                        let status = invocations.submit(native, &context, call, arguments);
+                        if status.is_none() {
+                            invocations.return_via(call, message.source);
+                        }
+                        status
                     })
                     .into_iter()
                     .flatten()

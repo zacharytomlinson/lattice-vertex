@@ -143,11 +143,12 @@ enum Operation {
     Read(ReadRequest),
     Control,
     Call(Invocation),
+    LocalCall(Invocation),
 }
 impl Operation {
     fn cancel(self, forwarder: &mut Forwarder) {
         match self {
-            Self::Control => {}
+            Self::Control | Self::LocalCall(_) => {}
             Self::Read(read) => forwarder.cancel_read(read),
             Self::Call(call) => forwarder.cancel_call(call),
         }
@@ -205,11 +206,27 @@ impl Host {
         &'a mut self,
         forwarder: &mut Forwarder,
         description: &Description,
-        native: &dyn Native,
+        native: &'static dyn Native,
         invocations: &mut Invocations,
         context: &TaskContext,
         now: u32,
     ) -> Option<Message<'a>> {
+        if let Some(p) = &self.pending {
+            if let Operation::LocalCall(call) = p.operation {
+                if let Some(status) = invocations.result(call) {
+                    let p = self.pending.take().unwrap();
+                    deliver(
+                        p.generation,
+                        Packet::Invoked {
+                            token: p.host_token,
+                            owner: call.owner,
+                            transformer: call.transformer,
+                            status,
+                        },
+                    );
+                }
+            }
+        }
         if let Some(p) = &self.pending {
             if p.operation == Operation::Control {
                 if let Some((progress, release)) =
@@ -351,16 +368,26 @@ impl Host {
                 transformer,
             };
             if owner == local {
-                let status = invocations.invoke(native, context, call, arguments.as_slice());
-                deliver(
-                    generation,
-                    Packet::Invoked {
-                        token,
-                        owner,
-                        transformer,
-                        status,
-                    },
-                );
+                if let Some(status) =
+                    invocations.submit(native, context, call, arguments.as_slice())
+                {
+                    deliver(
+                        generation,
+                        Packet::Invoked {
+                            token,
+                            owner,
+                            transformer,
+                            status,
+                        },
+                    );
+                } else {
+                    self.pending = Some(Pending {
+                        generation,
+                        host_token: token,
+                        operation: Operation::LocalCall(call),
+                        started: now,
+                    });
+                }
             } else {
                 let args = arguments.as_slice();
                 self.payload[..args.len()].copy_from_slice(args);

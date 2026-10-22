@@ -51,7 +51,8 @@ pub mod tasks;
 pub mod timers;
 
 /// Establish the kernel-owned radio task and start local execution.
-/// Hardware clocks/CPU-port initialization and any appliance tasks must be ready.
+/// Hardware clocks/CPU-port initialization and the passive appliance binding must
+/// be ready. The kernel creates acquisition, native-call and radio tasks.
 /// The resident radio enters common peer discovery. Appliance code supplies no
 /// channel, PAN, discovery loop, or diagnostic workload.
 /// `appliance` owns the initialized native instance and borrows its static surface.
@@ -65,7 +66,7 @@ pub mod timers;
 /// Before scheduler startup, rejects uninitialized/already-bound appliances, an
 /// encoded surface over 65,535 bytes, or expression nesting reaching 32 levels.
 #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
-pub fn start<A: Send + 'static, E: 'static>(
+pub fn start<A: Send + Sync + 'static, E: 'static>(
     context: crate::sync::TaskContext,
     radio: crate::port::RadioPeripheral,
     appliance: &'static Appliance<A, E>,
@@ -73,6 +74,7 @@ pub fn start<A: Send + 'static, E: 'static>(
     let description = peer::exposure::Description::with_installed(appliance)
         .expect("surface exceeds description limits");
     change::bind(appliance);
+    appliance::execution::start(&context, appliance);
     radio::start(&context, radio, description, appliance);
     crate::start_scheduler(context)
 }
@@ -86,7 +88,7 @@ pub fn start<A: Send + 'static, E: 'static>(
         all(feature = "port-esp32c6", feature = "esp32c6-update")
     )
 ))]
-pub fn start_with_updates<A: Send + 'static, E: 'static>(
+pub fn start_with_updates<A: Send + Sync + 'static, E: 'static>(
     context: crate::sync::TaskContext,
     radio: crate::port::RadioPeripheral,
     appliance: &'static Appliance<A, E>,

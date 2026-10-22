@@ -1,6 +1,7 @@
 //! A lamp exposes typed states, one transformer, and its operating mathematics.
 //! Run on the host with `cargo run --locked --example surface`.
 
+use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
 use lattice_vertex::{
     ir::{Binary, Effect, Expr, Integer, Value},
     surface::{
@@ -11,7 +12,7 @@ use lattice_vertex::{
 
 // This example lamp derives power from its PWM level. Its safe limit is 200.
 struct Lamp {
-    level: u8,
+    level: AtomicU8,
 }
 
 struct Power;
@@ -19,7 +20,7 @@ impl State for Power {
     type Appliance = Lamp;
     type Value = bool;
     fn read(lamp: &Lamp) -> Option<bool> {
-        Some(lamp.level != 0)
+        Some(lamp.level.load(Relaxed) != 0)
     }
 }
 
@@ -28,7 +29,7 @@ impl State for Level {
     type Appliance = Lamp;
     type Value = u8;
     fn read(lamp: &Lamp) -> Option<u8> {
-        Some(lamp.level)
+        Some(lamp.level.load(Relaxed))
     }
 }
 
@@ -108,12 +109,12 @@ impl StateTransformer for Set {
         },
     };
 
-    fn invoke(lamp: &mut Lamp, (power, level): (bool, u8)) -> Result<(), InvalidSetting> {
+    fn invoke(lamp: &Lamp, (power, level): (bool, u8)) -> Result<(), InvalidSetting> {
         if power != (level != 0) || level > 200 {
             return Err(InvalidSetting);
         }
         // Real firmware writes its PWM hardware and establishes its observation.
-        lattice_vertex::observation::update(lamp, &[&POWER, &LEVEL], |lamp| lamp.level = level);
+        lamp.level.store(level, Relaxed);
         Ok(())
     }
 }
@@ -127,7 +128,9 @@ static SURFACE: Surface<'static, Lamp, InvalidSetting> = Surface {
 };
 
 fn main() {
-    let mut lamp = Lamp { level: 0 };
+    let lamp = Lamp {
+        level: AtomicU8::new(0),
+    };
     println!(
         "Exposed: {} states, {} transformer, {} axiom, {} invariant",
         SURFACE.states.len(),
@@ -137,7 +140,7 @@ fn main() {
     );
     SURFACE.transformers[0]
         .invoke(
-            &mut lamp,
+            &lamp,
             &[
                 Value::boolean(true),
                 Value::integer(Integer::U8, 128).unwrap(),

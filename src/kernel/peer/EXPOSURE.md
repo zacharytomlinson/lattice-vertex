@@ -24,7 +24,7 @@ vertex and follows references, reading appliance surfaces along the way. This
 requires explicit forwarding through the vertex that supplied a new reference;
 a remote address alone does not establish a radio path. The local destination
 cache is not the enumerable topology. See the
-[kernel direction](../../../docs/KERNEL_DIRECTION.md#maintained-peer-links-and-progressive-discovery).
+[kernel direction](LINKS.md#reading-and-following-references).
 
 Maintained links and guided traversal are implemented in the common runtime;
 see [the link protocol](LINKS.md). Startup performs local link maintenance;

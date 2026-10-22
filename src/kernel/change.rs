@@ -20,6 +20,7 @@ struct Outgoing {
     count: usize,
     sequence: u32,
     evicted: u32,
+    batches: u32,
 }
 impl Outgoing {
     const fn new() -> Self {
@@ -30,6 +31,7 @@ impl Outgoing {
             count: 0,
             sequence: 0,
             evicted: 0,
+            batches: 0,
         }
     }
 }
@@ -81,23 +83,45 @@ pub(crate) fn record(instance: *const (), attribute: u64, value: Option<Value>) 
         #[cfg(feature = "firmware-update")]
         super::update::activation::activity();
         #[cfg(any(feature = "port-esp32c6", feature = "port-nrf52840"))]
-        super::radio::task::notify_work();
+        if pending() {
+            super::radio::task::notify_work();
+        }
+    }
+}
+
+/// Hold transport publication until native samples and derived state are committed.
+/// This does not merge records or change their hard-eviction policy.
+pub(crate) struct Batch;
+pub(crate) fn batch() -> Batch {
+    access(|out| out.batches = out.batches.checked_add(1).expect("observation batch depth"));
+    Batch
+}
+impl Drop for Batch {
+    fn drop(&mut self) {
+        access(|out| {
+            assert!(out.batches != 0);
+            out.batches -= 1;
+        });
+        #[cfg(any(feature = "port-esp32c6", feature = "port-nrf52840"))]
+        if pending() {
+            super::radio::task::notify_work();
+        }
     }
 }
 
 pub(crate) fn pending() -> bool {
-    access(|out| out.count != 0)
+    access(|out| out.count != 0 && out.batches == 0)
 }
 
 /// Latest registered local change, including records already sent or evicted.
-/// Sample with the appliance mutex held when pairing this watermark with state.
+/// Sample with the observation-cache lock when pairing this watermark with state.
 pub(crate) fn sequence() -> u32 {
     access(|out| out.sequence)
 }
 
 pub(crate) fn take() -> Option<Change> {
     access(|out| {
-        if out.count == 0 {
+        if out.count == 0 || out.batches != 0 {
             return None;
         }
         let change = out.records[out.first].take();
@@ -170,6 +194,17 @@ mod tests {
             record(instance, attribute, None);
         }
         assert_eq!((sequence(), pending(), evicted()), (0, false, 0));
+        let batch = batch();
+        record(
+            core::ptr::from_ref(&INSTANCE).cast(),
+            1,
+            Some(Value::boolean(true)),
+        );
+        assert!(!pending());
+        assert!(take().is_none());
+        drop(batch);
+        assert!(pending());
+        assert_eq!(take().unwrap().value, Some(Value::boolean(true)));
         access(|out| out.sequence = u32::MAX - 1);
         for expected in [u32::MAX, 0] {
             record(core::ptr::from_ref(&INSTANCE).cast(), 1, None);

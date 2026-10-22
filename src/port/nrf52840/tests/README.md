@@ -32,21 +32,18 @@ This correction alone does not provide CSMA backoff or reliable publication.
 `test-appliance` binds the existing portable dimmer fixture to ordinary kernel
 startup, without a radio probe or passive observer. Its software-backed states are
 power and an unsigned 8-bit level; its transformer accepts levels 0..=200 and
-registers both actual fixture changes through the kernel. Use it with
+changes its hardware-backed atomic values; kernel acquisition registers deltas. Use it with
 `xiao-bootloader,usb-console` to exercise surface reads, native argument/range
 validation, and state reads from the tablet's attached radio. `peer-observer` can
 be added for passive kernel-event diagnostics; it supplies no networking behavior.
 The fixture now also installs four retained level observations and a signed
 newest-minus-previous result before startup. All seven scalar states appear in
 the ordinary surface and state-read path. The history starts empty; two level
-changes make the difference available. This addition has host/build validation;
-the hardware run described below predates retained-state installation.
-This verifies native dispatch and registered state, not a physical dimmer output.
-The final two-board run consumed the full surface, invoked the native operation,
-and read registered changes. A read after closing the diagnostic console also
-succeeded. Earlier closed-console and post-reflash reads timed out; console state
-alone was not established as their cause. This is functional validation, not RF
-range or delivery-reliability validation.
+changes make the difference available. Retained-state behavior has host/build
+checks; earlier hardware runs established the native control/read/delta path.
+This revision builds with kernel-owned acquisition/native-call tasks; their hardware
+check remains outstanding. The fixture verifies native dispatch and registered state, not physical dimmer
+output, RF range, or delivery reliability. Detailed run evidence is in the lab.
 
 ## XIAO nRF52840 Sense: USB upload and diagnostics
 
