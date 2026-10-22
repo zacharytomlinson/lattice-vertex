@@ -36,6 +36,9 @@ pub(crate) mod change;
 pub mod event_groups;
 pub mod list;
 pub(crate) mod peer;
+#[cfg(feature = "use-mutexes")]
+pub(crate) mod program;
+pub(crate) mod storage;
 #[cfg(feature = "firmware-update")]
 pub mod update;
 #[cfg(feature = "host-link")]
@@ -73,10 +76,24 @@ pub fn start<A: Send + Sync + 'static, E: 'static>(
 ) -> ! {
     let description = peer::exposure::Description::with_installed(appliance)
         .expect("surface exceeds description limits");
+    program::runtime::initialize(appliance, description.identity());
     change::bind(appliance);
     appliance::execution::start(&context, appliance);
     radio::start(&context, radio, description, appliance);
     crate::start_scheduler(context)
+}
+
+/// Start with protected local configuration, without an OTA signing policy.
+/// The port supplies its flash/boot binding; the kernel restores installed programs.
+#[cfg(any(feature = "nrf52840-update", feature = "esp32c6-update"))]
+pub fn start_with_storage<A: Send + Sync + 'static, E: 'static>(
+    context: crate::sync::TaskContext,
+    radio: crate::port::RadioPeripheral,
+    appliance: &'static Appliance<A, E>,
+    storage: storage::PlatformStorage,
+) -> ! {
+    storage::initialize(storage);
+    start(context, radio, appliance)
 }
 
 /// Start normal peer participation with the port's reserved update storage and

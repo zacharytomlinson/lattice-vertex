@@ -54,7 +54,7 @@ def prepare(args):
     for option in ['CONFIG_SECURE_BOOT=y', 'CONFIG_SECURE_FLASH_ENC_ENABLED=y', 'CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=y']:
         if option in config:
             raise ValueError(f'unsupported provisioning option: {option}')
-    out = HERE/('target/ota' if args.ota else 'target/update')
+    out = HERE/('target/program' if args.program else 'target/ota' if args.ota else 'target/update')
     out.mkdir(parents=True, exist_ok=True)
     loader = (build/'bootloader/bootloader.bin').read_bytes()
     if len(loader) > 0x8000 or loader[0] != 0xe9:
@@ -63,15 +63,15 @@ def prepare(args):
     shutil.copyfile(build/'partition_table/partition-table.bin', out/'partition-table.bin')
     (out/'otadata-empty.bin').write_bytes(b'\xff' * 0x2000)
     (out/'journal-empty.bin').write_bytes(b'\xff' * 0x2000)
-    images = [('a', 'ota-test'), ('b', 'ota-image-b')] if args.ota else [('a', 'update-test'), ('b', 'update-image-b')]
+    images = [('a', 'program-test')] if args.program else [('a', 'ota-test'), ('b', 'ota-image-b')] if args.ota else [('a', 'update-test'), ('b', 'update-image-b')]
     if args.watchdog_check:
         images += [('stall-entry', 'ota-stall-before-init'), ('stall-radio', 'ota-stall-before-radio')]
     for image, features in images:
         if args.staging_check and image == 'a': features += ',ota-staging-check'
         if args.activation_check and image == 'a': features += ',ota-activation-check'
         subprocess.run(['cargo', '+nightly', 'build', '-Z', 'build-std=core', '--release', '--locked',
-                        '--bin', 'ota' if args.ota else 'update', '--features', features], cwd=HERE, check=True)
-        elf = HERE/('target/riscv32imac-unknown-none-elf/release/ota' if args.ota else 'target/riscv32imac-unknown-none-elf/release/update')
+                        '--bin', 'radio' if args.program else 'ota' if args.ota else 'update', '--features', features], cwd=HERE, check=True)
+        elf = HERE/('target/riscv32imac-unknown-none-elf/release/radio' if args.program else 'target/riscv32imac-unknown-none-elf/release/ota' if args.ota else 'target/riscv32imac-unknown-none-elf/release/update')
         shutil.copyfile(elf, out/f'{image}.elf')
         subprocess.run(['espflash', 'save-image', '--chip', 'esp32c6', '--flash-size', '8mb',
                         '--flash-mode', 'dio', '--flash-freq', '40mhz', '--skip-update-check',
@@ -115,7 +115,9 @@ def main():
     build.add_argument('--activation-check', action='store_true', help='hold automatic activation for ten seconds after verification in image A')
     build.add_argument('--staging-check', action='store_true', help='hold staging for ten seconds after accepting an offer in image A')
     build.add_argument('--watchdog-check', action='store_true', help='also build stalled trial images for hardware rollback checks')
-    build.add_argument('--ota', action='store_true', help='build the signed receiver and binary host interface')
+    mode = build.add_mutually_exclusive_group()
+    mode.add_argument('--ota', action='store_true', help='build the signed receiver and binary host interface')
+    mode.add_argument('--program', action='store_true', help='build the storage-backed appliance without signing policy or preinstalled programs')
     build.add_argument('--idf')
     build.add_argument('--idf-python', default=sys.executable)
     for action in ['status', 'stage', 'reset', 'confirm']:

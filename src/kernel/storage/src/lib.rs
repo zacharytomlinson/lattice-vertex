@@ -1,12 +1,15 @@
 #![no_std]
 // SPDX-License-Identifier: MIT
-//! Bounded inactive-image writes shared by the MCU update ports. The port owns
-//! the flash reservation and boot selection; this crate owns sequential chunk
-//! acceptance, erase progress, duplicate handling, padding, and digest checking.
-//! Progress is volatile. No network handler, allocator, or boot policy lives here.
+//! Bounded flash regions, image staging and committed local configuration.
+//! Ports own the physical device, reservations and boot policy. This crate owns
+//! byte acceptance, erase progress, integrity and publication of complete copies.
+//! No network handler, allocator or appliance code lives here.
 
 use embedded_storage::nor_flash::{NorFlash, NorFlashError, NorFlashErrorKind};
 use sha2::{Digest, Sha256};
+
+pub mod configuration;
+pub mod region;
 
 #[repr(align(4))]
 struct Buffer([u8; 256]);

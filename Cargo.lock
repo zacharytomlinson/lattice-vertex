@@ -1113,15 +1113,7 @@ name = "lattice-c6-boot"
 version = "0.1.0"
 dependencies = [
  "embedded-storage",
- "lattice-image-storage",
-]
-
-[[package]]
-name = "lattice-image-storage"
-version = "0.1.0"
-dependencies = [
- "embedded-storage",
- "sha2",
+ "lattice-storage",
 ]
 
 [[package]]
@@ -1137,7 +1129,7 @@ dependencies = [
  "embassy-embedded-hal",
  "embassy-sync 0.8.0",
  "embedded-storage",
- "lattice-image-storage",
+ "lattice-storage",
 ]
 
 [[package]]
@@ -1145,6 +1137,14 @@ name = "lattice-peer-wire"
 version = "0.1.0"
 dependencies = [
  "lattice-ir",
+]
+
+[[package]]
+name = "lattice-storage"
+version = "0.1.0"
+dependencies = [
+ "embedded-storage",
+ "sha2",
 ]
 
 [[package]]
@@ -1167,10 +1167,10 @@ dependencies = [
  "heapless 0.9.3",
  "ieee802154",
  "lattice-c6-boot",
- "lattice-image-storage",
  "lattice-ir",
  "lattice-nrf52840-boot",
  "lattice-peer-wire",
+ "lattice-storage",
  "riscv 0.12.1",
  "riscv-rt",
  "sha2",

@@ -5,7 +5,9 @@
 use super::{
     exposure::Description,
     forwarding::{Forwarder, ReadRequest},
-    frame::{Content, Invocation, LinkRead, Message, StateRead, SurfaceRead, UpdateRead},
+    frame::{
+        Content, Invocation, LinkRead, Message, ProgramRead, StateRead, SurfaceRead, UpdateRead,
+    },
     invocation::Invocations,
 };
 use crate::kernel::appliance::Native;
@@ -129,7 +131,12 @@ pub(crate) fn pending() -> bool {
     access(|m| m.request.is_some())
 }
 pub(crate) fn staging_pending() -> bool {
-    access(|m| matches!(m.request, Some(Packet::Update { .. })))
+    access(|m| {
+        matches!(
+            m.request,
+            Some(Packet::Update { .. } | Packet::Program { .. })
+        )
+    })
 }
 fn deliver(generation: u32, packet: Packet) {
     access(|m| {
@@ -314,6 +321,7 @@ impl Host {
             | Packet::ReadSurface { owner, .. }
             | Packet::ReadState { owner, .. }
             | Packet::Invoke { owner, .. }
+            | Packet::Program { owner, .. }
             | Packet::Update { owner, .. } => owner,
             _ => unreachable!("submit rejects replies"),
         };
@@ -328,6 +336,9 @@ impl Host {
                 Packet::Update { data, .. } => {
                     lattice_peer_wire::update::Request::decode(data.as_slice()).is_none()
                 }
+                Packet::Program { data, .. } => {
+                    lattice_peer_wire::program::transfer::Request::decode(data.as_slice()).is_none()
+                }
                 _ => false,
             };
         if invalid {
@@ -341,7 +352,7 @@ impl Host {
             return None;
         }
         #[cfg(feature = "firmware-update")]
-        if !matches!(request, Packet::Update { .. }) {
+        if !matches!(request, Packet::Update { .. } | Packet::Program { .. }) {
             crate::kernel::update::activation::activity();
         }
         if let Packet::Invoke {
@@ -398,6 +409,50 @@ impl Host {
                         generation,
                         host_token: token,
                         operation: Operation::Call(call),
+                        started: now,
+                    });
+                    return Some(outgoing);
+                }
+                deliver(
+                    generation,
+                    Packet::Error {
+                        token,
+                        failure: Failure::InvalidRequest,
+                    },
+                );
+            }
+            return None;
+        }
+        if let Packet::Program { data, .. } = request {
+            let operation =
+                lattice_peer_wire::program::transfer::Request::decode(data.as_slice()).unwrap();
+            if owner == local {
+                let mut response = [0; lattice_peer_wire::program::transfer::REPLY_BYTES];
+                let n = crate::kernel::program::runtime::receive(local, operation, &mut response);
+                deliver(
+                    generation,
+                    Packet::ProgramResult {
+                        token,
+                        owner,
+                        data: Bytes::new(&response[..n]).unwrap(),
+                    },
+                );
+            } else {
+                let radio_token = self.next_token.map_or(token as u16, |n| n.wrapping_add(1));
+                self.next_token = Some(radio_token);
+                let read = ProgramRead {
+                    reader: local,
+                    owner,
+                    request: radio_token,
+                };
+                self.payload[..data.as_slice().len()].copy_from_slice(data.as_slice());
+                if let Some(outgoing) =
+                    forwarder.originate_program(read, &self.payload[..data.as_slice().len()], now)
+                {
+                    self.pending = Some(Pending {
+                        generation,
+                        host_token: token,
+                        operation: Operation::Read(ReadRequest::Program(read)),
                         started: now,
                     });
                     return Some(outgoing);
@@ -584,6 +639,14 @@ impl Host {
                 return;
             };
             match message.content {
+                Content::ProgramResult { read, bytes, .. } => (
+                    Operation::Read(ReadRequest::Program(read)),
+                    Packet::ProgramResult {
+                        token,
+                        owner: read.owner,
+                        data: Bytes::new(bytes).unwrap(),
+                    },
+                ),
                 Content::Updated { read, progress, .. } => (
                     Operation::Read(ReadRequest::Update(read)),
                     Packet::Updated {

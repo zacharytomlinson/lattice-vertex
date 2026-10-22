@@ -6,7 +6,7 @@ by the Nordic kernel port and its separately linked loader. The loader uses
 radio, USB stack, task scheduler, or allocator. The kernel consumes the storage
 side through `port::nrf52840::update` with `nrf52840-update` enabled.
 Chunk staging, padding, duplicate handling, and SHA-256 verification now use the
-same [common storage crate](../../../kernel/update/storage/README.md) as C6.
+same [common storage crate](../../../kernel/storage/README.md) as C6.
 Nordic's flash layout and swap/trial/confirmation state remain in this port.
 
 Current status: host checks, ARM builds, and the XIAO USB staging/trial/confirm/revert
@@ -27,13 +27,19 @@ application linker generator, and provisioning tool.
 | Below `0x27000` | Existing MBR/SoftDevice, untouched |
 | `0x27000..0x2F000` | Lattice loader, 32 KiB reserved |
 | `0x2F000..0x30000` | Embassy boot progress, 4 KiB |
-| `0x30000..0x8D000` | Active image, 372 KiB |
-| `0x8D000..0xEB000` | Candidate/rollback image plus swap page, 376 KiB |
-| `0xEB000..0xED000` | Signed transfer header and page checkpoints, 8 KiB |
+| `0x30000..0x8B000` | Active image, 364 KiB |
+| `0x8B000..0xE7000` | Candidate/rollback image plus swap page, 368 KiB |
+| `0xE7000..0xE9000` | Signed transfer header and page checkpoints, 8 KiB |
+| `0xE9000..0xED000` | Protected local configuration, 16 KiB |
 | `0xED000` and above | Existing storage/factory recovery loader/settings, untouched |
 
-This is layout revision 2. The earlier local fixture used 376/380 KiB slots and
-no journal; migrate with the two provisioning uploads before using OTA.
+This is layout revision 3. Provision its loader and application together using
+the two uploads; an ordinary OTA package cannot migrate an earlier layout.
+The last 64 bytes of the loader reservation contain an immutable descriptor at
+`0x2EFC0`; the kernel port checks it before granting flash access. This prevents
+an old loader from swapping through the configuration reservation. Existing live
+boot/update evidence predates layout 3; the new boundaries have host/build checks,
+not physical provisioning or power-loss validation.
 
 The application is always linked at the active address. During reset, the Lattice
 loader performs any pending swap/revert, validates the active vectors, resets the
@@ -63,6 +69,12 @@ and handles final-word padding. Identical written ranges return without another
 NOR write. Out-of-order/conflicting writes fail. A write error invalidates the
 in-memory candidate, requiring a fresh erase before retrying uncertain flash.
 The active image and loader are never written during staging.
+
+`configuration()` lends a bounded flash region to the common configuration store
+without creating another peripheral owner. The view is read-only during an
+unconfirmed trial or after selection. Image/journal writes and Embassy swap/revert
+never include it. The common store's commit generation is local persistence
+metadata, not a distributed program identity or traversal counter.
 
 `verify_step` hashes a bounded number of image bytes and checks the vectors when
 the digest completes. `verify_image` is its synchronous convenience wrapper.

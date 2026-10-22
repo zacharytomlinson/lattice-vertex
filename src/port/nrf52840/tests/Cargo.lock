@@ -592,7 +592,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lattice-image-storage"
+name = "lattice-storage"
 version = "0.1.0"
 dependencies = [
  "embedded-storage",
@@ -612,7 +612,7 @@ dependencies = [
  "embassy-embedded-hal",
  "embassy-sync 0.8.0",
  "embedded-storage",
- "lattice-image-storage",
+ "lattice-storage",
 ]
 
 [[package]]
@@ -656,7 +656,7 @@ dependencies = [
  "embassy-sync 0.8.0",
  "embedded-storage",
  "ieee802154",
- "lattice-image-storage",
+ "lattice-storage",
  "lattice-ir",
  "lattice-nrf52840-boot",
  "lattice-peer-wire",

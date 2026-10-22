@@ -20,11 +20,11 @@ Both [Nordic](../src/port/nrf52840/tests/UPDATE.md#signed-ota-fixture) and
 `update.py prepare --ota` from their own tests directory. Follow that port's
 provisioning procedure with its ignored `tests/target/ota` artifacts. Nordic needs
 both factory DFU uploads; C6 also writes `journal-empty.bin` at `0x210000`.
-Old Nordic layout-1 fixtures need layout-2 loader/application provisioning together;
+Older Nordic fixtures need layout-3 loader/application provisioning together;
 an ordinary package cannot migrate that layout.
 
-The empty-appliance checks use family `01010101010101010101010101010101`, layout 2,
-release A=1 and B=2. Their surface is thirteen bytes: `LSF`, byte 1, byte 32, then
+The empty-appliance checks use family `01010101010101010101010101010101`, layout 3,
+release A=1 and B=2. Their surface is thirteen bytes: `LSF`, byte 2, byte 64, then
 eight zero bytes. Keep that dump beside generated artifacts. Replace `PORT` below
 with `src/port/nrf52840` or `src/port/esp32c6`; platform is respectively 1 or 2.
 
@@ -32,7 +32,7 @@ with `src/port/nrf52840` or `src/port/esp32c6`; platform is respectively 1 or 2.
 python tools/update_package.py pack --image PORT/tests/target/ota/b.bin \
   --surface CURRENT_SURFACE --candidate-surface CANDIDATE_SURFACE \
   --key /PRIVATE/PATH/release-key --output PORT/tests/target/ota/b.lvup \
-  --platform PLATFORM --layout 2 --release 2 \
+  --platform PLATFORM --layout 3 --release 2 \
   --appliance 01010101010101010101010101010101 --unmeasured
 python tools/update_peer.py --port SOURCE_USB info
 python tools/update_peer.py --port SOURCE_USB upload --owner RECEIVER_HEX PACKAGE
@@ -78,10 +78,10 @@ identity, and confirms it. This modifies the board; build preparation alone does
 
 ```sh
 python tools/update_costs.py --port ACTUAL_PORT --image CANDIDATE_BIN \
-  --output costs.json --swap-bytes 380928
+  --output costs.json --swap-bytes 372736
 ```
 
-The swap extent above is Nordic layout 2; omit `--swap-bytes` for C6. Port fixtures
+The swap extent above is Nordic layout 3; omit `--swap-bytes` for C6. Port fixtures
 report `elapsed_us` excluding serial output: C6 uses its monotonic timer and Nordic
 wrapping differences from its 64 MHz cycle counter. Erase cost uses the largest
 observed page time; programming/verification use Q24.8 microseconds per byte.

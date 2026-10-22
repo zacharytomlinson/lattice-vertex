@@ -138,6 +138,12 @@ fn main() -> ! {
             cfg!(feature = "test-appliance")
                 || port::nrf52840::hal::pac::FICR.deviceid(0).read() & 1 != 0,
         );
+        #[cfg(feature = "program-test")]
+        {
+            let storage = port::nrf52840::update::image_storage(p.NVMC, port::nrf52840::update::layout::XIAO).unwrap();
+            lattice_vertex::kernel::start_with_storage(context, radio, appliance, storage)
+        }
+        #[cfg(not(feature = "program-test"))]
         lattice_vertex::kernel::start(context, radio, appliance)
     }
     #[cfg(not(any(

@@ -7,9 +7,9 @@ use crate::kernel::radio::cost::{TimePerByte, Transmission};
 use super::{
     exposure::Description,
     frame::{
-        Content, Invocation, InvokeStatus, LinkPhase, LinkRead, Message, StateChange, StateRead,
-        StateReadResult, SurfaceOwner, SurfaceRead, UpdateRead, CALL_ARGUMENT_BYTES, MAX_HOPS,
-        SURFACE_BYTES,
+        Content, Invocation, InvokeStatus, LinkPhase, LinkRead, Message, ProgramRead, StateChange,
+        StateRead, StateReadResult, SurfaceOwner, SurfaceRead, UpdateRead, CALL_ARGUMENT_BYTES,
+        MAX_HOPS, SURFACE_BYTES,
     },
     links::Links,
     Network,
@@ -87,6 +87,7 @@ impl Route {
 /// All read kinds share one bounded reverse-path budget and token namespace.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReadRequest {
+    Program(ProgramRead),
     Update(UpdateRead),
     Surface(SurfaceRead),
     State(StateRead),
@@ -95,6 +96,7 @@ pub(super) enum ReadRequest {
 impl ReadRequest {
     pub(super) fn reader(self) -> u64 {
         match self {
+            Self::Program(r) => r.reader,
             Self::Update(r) => r.reader,
             Self::Surface(r) => r.reader,
             Self::State(r) => r.reader,
@@ -103,6 +105,7 @@ impl ReadRequest {
     }
     pub(super) fn owner(self) -> u64 {
         match self {
+            Self::Program(r) => r.owner,
             Self::Update(r) => r.owner,
             Self::Surface(r) => r.owner,
             Self::State(r) => r.owner,
@@ -111,6 +114,7 @@ impl ReadRequest {
     }
     fn request(self) -> u16 {
         match self {
+            Self::Program(r) => r.request,
             Self::Update(r) => r.request,
             Self::Surface(r) => r.request,
             Self::State(r) => r.request,
@@ -248,7 +252,9 @@ const _: () = assert!(core::mem::size_of::<Forwarder>() <= 2464);
 impl Forwarder {
     pub(super) fn ordinary_work_pending(&self) -> bool {
         self.reads.iter().any(|r| {
-            r.read.reader() != 0 && !r.answered && !matches!(r.read, ReadRequest::Update(_))
+            r.read.reader() != 0
+                && !r.answered
+                && !matches!(r.read, ReadRequest::Update(_) | ReadRequest::Program(_))
         }) || self
             .calls
             .iter()
@@ -381,6 +387,7 @@ impl Forwarder {
             Content::OwnerFound { hops, .. }
             | Content::SurfacePart { hops, .. }
             | Content::Updated { hops, .. }
+            | Content::ProgramResult { hops, .. }
             | Content::InvocationResult { hops, .. }
             | Content::StateValue { hops, .. }
             | Content::LinkEntry { hops, .. } => hops == 1,
@@ -463,7 +470,7 @@ impl Forwarder {
         request: ReadRequest,
         now: u32,
     ) -> Option<Message<'static>> {
-        if matches!(request, ReadRequest::Update(_)) {
+        if matches!(request, ReadRequest::Update(_) | ReadRequest::Program(_)) {
             return None;
         }
         let destination = self.originate_read_path(request, now)?;
@@ -472,7 +479,7 @@ impl Forwarder {
             source: self.local,
             destination,
             content: match request {
-                ReadRequest::Update(_) => return None, // payload-bearing origin uses originate_update
+                ReadRequest::Update(_) | ReadRequest::Program(_) => return None, // payload-bearing origins
                 ReadRequest::Links(read) => Content::ReadLinks {
                     network: self.network,
                     read,
@@ -610,6 +617,104 @@ impl Forwarder {
     }
 
     #[cfg(feature = "host-link")]
+    pub(super) fn originate_program<'a>(
+        &mut self,
+        read: ProgramRead,
+        bytes: &'a [u8],
+        now: u32,
+    ) -> Option<Message<'a>> {
+        let destination = self.originate_read_path(ReadRequest::Program(read), now)?;
+        Some(Message {
+            source: self.local,
+            destination,
+            path_cost: TimePerByte::UNKNOWN,
+            content: Content::Program {
+                network: self.network,
+                read,
+                remaining: MAX_HOPS,
+                bytes,
+            },
+        })
+    }
+    pub(super) fn receive_program<'a>(
+        &mut self,
+        incoming: Message<'a>,
+        now: u32,
+        output: &'a mut [u8; lattice_peer_wire::program::transfer::REPLY_BYTES],
+        mut handle: impl FnMut(
+            u64,
+            lattice_peer_wire::program::transfer::Request<'_>,
+            &mut [u8; lattice_peer_wire::program::transfer::REPLY_BYTES],
+        ) -> usize,
+    ) -> Option<Message<'a>> {
+        self.expire(now);
+        match incoming.content {
+            Content::Program {
+                network,
+                read,
+                remaining,
+                bytes,
+            } if network == self.network => {
+                let next = self
+                    .begin_read(ReadRequest::Program(read), incoming.source, remaining, now)?
+                    .onward;
+                if read.owner == self.local {
+                    let request = lattice_peer_wire::program::transfer::Request::decode(bytes)?;
+                    let n = handle(read.reader, request, output);
+                    return Some(Message {
+                        source: self.local,
+                        destination: Some(incoming.source),
+                        path_cost: TimePerByte::ZERO,
+                        content: Content::ProgramResult {
+                            network,
+                            read,
+                            hops: 1,
+                            bytes: &output[..n],
+                        },
+                    });
+                }
+                Some(Message {
+                    source: self.local,
+                    destination: (next != 0).then_some(next),
+                    path_cost: TimePerByte::UNKNOWN,
+                    content: Content::Program {
+                        network,
+                        read,
+                        remaining: remaining - 1,
+                        bytes,
+                    },
+                })
+            }
+            Content::ProgramResult {
+                network,
+                read,
+                hops,
+                bytes,
+            } if network == self.network && incoming.destination == Some(self.local) => {
+                let previous = self.return_read(
+                    ReadRequest::Program(read),
+                    incoming.source,
+                    hops,
+                    now,
+                    incoming.path_cost,
+                )?;
+                Some(Message {
+                    source: self.local,
+                    destination: Some(previous),
+                    path_cost: self.response_cost(incoming),
+                    content: Content::ProgramResult {
+                        network,
+                        read,
+                        hops: hops + 1,
+                        bytes,
+                    },
+                })
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "host-link")]
     pub(super) fn complete_read<'a>(
         &mut self,
         incoming: Message<'a>,
@@ -617,6 +722,12 @@ impl Forwarder {
     ) -> Option<Message<'a>> {
         self.expire(now);
         let (network, request, hops) = match incoming.content {
+            Content::ProgramResult {
+                network,
+                read,
+                hops,
+                ..
+            } => (network, ReadRequest::Program(read), hops),
             Content::Updated {
                 network,
                 read,
@@ -1653,6 +1764,7 @@ impl Forwarder {
         let owner = match outgoing.content {
             Content::ReadSurface { read, .. } => read.owner,
             Content::Update { read, .. } => read.owner,
+            Content::Program { read, .. } => read.owner,
             Content::ReadState { read, .. } => read.owner,
             Content::ReadLinks { read, .. } => ReadRequest::Links(read).direction(self.local),
             Content::Invoke { call, .. } => call.owner,
@@ -1689,8 +1801,13 @@ mod tests {
         b[0] = 4;
         b
     };
-    fn reads(reader: u64, owner: u64, request: u16) -> [ReadRequest; 4] {
+    fn reads(reader: u64, owner: u64, request: u16) -> [ReadRequest; 5] {
         [
+            ReadRequest::Program(ProgramRead {
+                reader,
+                owner,
+                request,
+            }),
             ReadRequest::Surface(SurfaceRead {
                 reader,
                 owner,
@@ -1729,6 +1846,12 @@ mod tests {
     fn query(read: ReadRequest, network: Network, remaining: u8) -> Message<'static> {
         envelope(
             match read {
+                ReadRequest::Program(read) => Content::Program {
+                    network,
+                    read,
+                    remaining,
+                    bytes: &[0],
+                },
                 ReadRequest::Surface(read) => Content::ReadSurface {
                     network,
                     read,
@@ -1757,6 +1880,12 @@ mod tests {
     fn answer(read: ReadRequest, hops: u8) -> Message<'static> {
         envelope(
             match read {
+                ReadRequest::Program(read) => Content::ProgramResult {
+                    network: NET,
+                    read,
+                    hops,
+                    bytes: &[0; 12],
+                },
                 ReadRequest::Surface(read) => Content::SurfacePart {
                     network: NET,
                     read,
@@ -1799,6 +1928,20 @@ mod tests {
     ) -> Option<Message<'a>> {
         let local = node.local;
         match input.content {
+            Content::Program { .. } | Content::ProgramResult { .. } => node.receive_program(
+                input,
+                now,
+                (&mut part[..lattice_peer_wire::program::transfer::REPLY_BYTES])
+                    .try_into()
+                    .unwrap(),
+                |_, _, output| {
+                    assert_eq!(local, 4);
+                    lattice_peer_wire::program::transfer::Reply::status(
+                        lattice_peer_wire::program::transfer::Status::Unsupported,
+                    )
+                    .encode(output)
+                },
+            ),
             Content::ReadSurface { .. } | Content::SurfacePart { .. } => node.receive_surface(
                 input,
                 &Description::new(&crate::surface::EMPTY).unwrap(),

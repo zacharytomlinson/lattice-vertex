@@ -9,6 +9,7 @@ publish = false
 [features]
 radio-probe = ["dep:lattice-radio-test"]
 peer-observer = ["dep:lattice-radio-test"]
+program-test = ["update-test", "peer-observer"]
 update-test = ["lattice-vertex/esp32c6-update", "lattice-vertex/stack-overflow-check", "lattice-vertex/trace-facility", "lattice-vertex/test-support"]
 update-image-b = ["update-test"]
 ota-test = ["update-test", "lattice-vertex/firmware-update", "lattice-vertex/host-link"]

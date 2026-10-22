@@ -6,7 +6,7 @@
 
 mod metadata;
 use embedded_storage::nor_flash::{NorFlash, NorFlashError, NorFlashErrorKind};
-use lattice_image_storage::{Candidate, Error as StorageError};
+use lattice_storage::{Candidate, Error as StorageError};
 pub use metadata::BootState;
 use metadata::Record;
 
@@ -40,6 +40,7 @@ impl Region {
 pub struct Layout {
     pub ota_data: Region,
     pub journal: Option<Region>,
+    pub configuration: Option<Region>,
     pub images: [Region; 2],
 }
 impl Layout {
@@ -56,6 +57,14 @@ impl Layout {
             && !b.overlaps(self.ota_data)
             && self.journal.is_none_or(|j| {
                 j.valid(capacity) && !j.overlaps(a) && !j.overlaps(b) && !j.overlaps(self.ota_data)
+            })
+            && self.configuration.is_none_or(|c| {
+                c.valid(capacity)
+                    && c.length.is_multiple_of(2 * SECTOR_SIZE)
+                    && !c.overlaps(a)
+                    && !c.overlaps(b)
+                    && !c.overlaps(self.ota_data)
+                    && self.journal.is_none_or(|j| !c.overlaps(j))
             })
     }
 }
@@ -142,6 +151,18 @@ impl<F: NorFlash> ImageStorage<F> {
     }
     pub fn image_capacity(&self) -> u32 {
         self.layout.images[1 - self.running].length
+    }
+    pub fn configuration(&mut self) -> Result<lattice_storage::region::Region<'_, F>, Error> {
+        let read_only = self.selected || self.boot_state() == BootState::PendingVerify;
+        let region = self.layout.configuration.ok_or(Error::Layout)?;
+        let region =
+            lattice_storage::region::Region::new(&mut self.flash, region.offset, region.length)
+                .map_err(Error::Flash)?;
+        Ok(if read_only {
+            region.read_only()
+        } else {
+            region
+        })
     }
 
     pub fn confirm(&mut self) -> Result<(), Error> {

@@ -4,6 +4,10 @@
 use embassy_nrf::{nvmc::Nvmc, pac};
 use lattice_nrf52840_boot::{layout::XIAO, prepare_boot, watchdog, BootState};
 
+#[used]
+#[link_section = ".lattice_layout"]
+static LAYOUT: [u32; 16] = lattice_nrf52840_boot::layout::DESCRIPTOR;
+
 #[cortex_m_rt::entry]
 fn main() -> ! {
     let p = embassy_nrf::init(Default::default());

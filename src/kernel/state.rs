@@ -126,7 +126,10 @@ unsafe impl<A, T: Scalar + Send, U: Scalar + Send, const N: usize> Sync
 impl<A, T: Scalar + Send, U: Scalar + Send, const N: usize> RetainedState<A, T, U, N> {
     /// Reserve a history and result without allocating or binding any appliance.
     /// The initial history is empty and the computed value unavailable.
-    pub const fn new(source: &'static StateHandle<A>) -> Self {
+    /// `name` permanently identifies this retained definition. Sample age is a
+    /// member of that binding; the result has its own reserved member, so changing
+    /// capacity does not silently rename it.
+    pub const fn new(name: &str, source: &'static StateHandle<A>) -> Self {
         assert!(
             N > 0 && N < u16::MAX as usize,
             "invalid retained history extent"
@@ -134,14 +137,18 @@ impl<A, T: Scalar + Send, U: Scalar + Send, const N: usize> RetainedState<A, T, 
         let mut samples = [const {
             ir::Attribute {
                 ty: T::TYPE,
-                location: Read::retained(0, read::<A, T, U, N>),
+                location: Read::retained(0, 0, read::<A, T, U, N>),
             }
         }; N];
         let mut age = 0;
         while age < N {
             samples[age] = ir::Attribute {
                 ty: T::TYPE,
-                location: Read::retained(age, read::<A, T, U, N>),
+                location: Read::retained(
+                    crate::surface::binding_reference(3, name, age as u16),
+                    age,
+                    read::<A, T, U, N>,
+                ),
             };
             age += 1;
         }
@@ -150,7 +157,11 @@ impl<A, T: Scalar + Send, U: Scalar + Send, const N: usize> RetainedState<A, T, 
             samples,
             result: ir::Attribute {
                 ty: U::TYPE,
-                location: Read::retained(N, read::<A, T, U, N>),
+                location: Read::retained(
+                    crate::surface::binding_reference(3, name, u16::MAX),
+                    N,
+                    read::<A, T, U, N>,
+                ),
             },
             owner: AtomicPtr::new(ptr::null_mut()),
             installed: AtomicBool::new(false),
@@ -171,6 +182,10 @@ impl<A, T: Scalar + Send, U: Scalar + Send, const N: usize> RetainedState<A, T, 
     /// owner-directed state reads after this record has been installed.
     pub const fn result(&self) -> &ir::Attribute<Read<A>> {
         &self.result
+    }
+
+    pub(super) fn states(&self) -> impl Iterator<Item = &ir::Attribute<Read<A>>> {
+        self.samples.iter().chain(core::iter::once(&self.result))
     }
 
     pub(super) fn install(
@@ -339,11 +354,7 @@ unsafe fn maintain_record<A: 'static, T: Scalar + Send, U: Scalar + Send, const 
             after.map(Scalar::into_value),
         );
         if before != after {
-            super::change::record(
-                instance,
-                ptr::from_ref(&state.samples[age]) as usize as u64,
-                after,
-            );
+            super::change::record(instance, state.samples[age].location.reference(), after);
         }
     }
     let (before, after) = (
@@ -351,11 +362,7 @@ unsafe fn maintain_record<A: 'static, T: Scalar + Send, U: Scalar + Send, const 
         values.computed.map(Scalar::into_value),
     );
     if before != after {
-        super::change::record(
-            instance,
-            ptr::from_ref(&state.result) as usize as u64,
-            after,
-        );
+        super::change::record(instance, state.result.location.reference(), after);
     }
 }
 

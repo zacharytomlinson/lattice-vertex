@@ -406,7 +406,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lattice-image-storage"
+name = "lattice-storage"
 version = "0.1.0"
 dependencies = [
  "embedded-storage",
@@ -424,7 +424,7 @@ dependencies = [
  "embassy-nrf",
  "embassy-sync",
  "embedded-storage",
- "lattice-image-storage",
+ "lattice-storage",
  "sha2",
 ]
 

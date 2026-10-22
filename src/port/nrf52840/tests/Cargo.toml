@@ -10,6 +10,7 @@ publish = false
 radio-probe = ["dep:lattice-radio-test"]
 peer-observer = ["dep:lattice-radio-test"]
 test-appliance = ["dep:lattice-radio-test"]
+program-test = ["update-test", "test-appliance"]
 xiao-bootloader = ["cortex-m-rt/set-vtor", "cortex-m-rt/set-sp"]
 usb-console = ["dep:embassy-usb", "dep:embassy-futures"]
 update-test = ["xiao-bootloader", "usb-console", "lattice-vertex/nrf52840-update", "lattice-vertex/stack-overflow-check", "lattice-vertex/trace-facility", "lattice-vertex/test-support"]

@@ -1,7 +1,7 @@
 # Shared numeric wire definitions
 
 `lattice-peer-wire` owns the declared-width scalar/argument codec used by peer
-frames, surface literals, and attached-host messages. The current consumers use LVT v7, host v4, and LSF v1. Values and integer domains
+frames, surface literals, and attached-host messages. The current consumers use LVT v7, host v4, and LSF v2. Values and integer domains
 come from `lattice-ir`; protocol status values live here so the host need not invent
 a second interpretation of native dispatch or state-read failures. The registered
 `StateChange` record is also shared by RF deltas and host events.
@@ -9,7 +9,10 @@ a second interpretation of native dispatch or state-read failures. The registere
 Native invocation messages use the existing scalar argument bounds and statuses
 0–5. Experimental LVT v7 opcodes 19/20 and statuses 6/7 belonged to the removed
 callback-fragment prototype; they are now rejected and reserved against semantic
-reuse in this wire version. The distributed program/head encoding remains open.
+reuse in this wire version. `program` now owns LPD v1 records and installation
+commands/replies used by LVT opcodes 21/22 and host kinds 7/0x87. See the
+[program component](../../program/README.md) for their limits. Traversal-head
+delivery and execution remain separate work.
 
 The optional `host` feature adds the bounded local packet records and COBS stream
 codec described in [the host interface](../host/README.md). This replaces the former

@@ -45,7 +45,13 @@ still enforce their appliance's hardware limits.
 codec is shared by radio frames, surface literals, and USB. `host` is an optional
 module containing the local records/stream decoder; ordinary appliance builds do
 not include it. Neither module contains a radio driver, RTOS, allocator, or IR
-interpreter. The radio remains **LVT v7**, and surfaces remain **LSF v1**.
+interpreter. The radio remains **LVT v7**, and surfaces remain **LSF v2**.
+
+Host request/result kinds **7/0x87** carry owner-directed program installation and
+inspection through the same bounded mailbox. The payload is the numeric command
+or reply from `lattice_peer_wire::program::transfer`; see the
+[program component](../../program/README.md#installation-transport). An installed
+definition is inactive and does not imply admitted execution.
 
 Host version **4** uses little-endian records, COBS, and a zero delimiter. Older versions
 are rejected. The largest current encoded record is 87 bytes, in a fixed 128-byte

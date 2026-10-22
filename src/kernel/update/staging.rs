@@ -118,7 +118,7 @@ fn hold_access(hold: super::ActivationHold) -> Result<UpdateHold, Status> {
     })
 }
 
-pub(super) struct FlashStep {
+pub(crate) struct FlashStep {
     _private: (),
 }
 impl FlashStep {

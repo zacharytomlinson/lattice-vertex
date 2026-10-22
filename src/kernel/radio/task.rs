@@ -193,6 +193,9 @@ pub(crate) fn notify_work() {
 pub(crate) fn watchdog_progress(radio_completed: bool) {
     #[cfg(any(feature = "nrf52840-update", feature = "esp32c6-update"))]
     {
+        if crate::kernel::storage::startup_progress(radio_completed) {
+            return;
+        }
         #[cfg(feature = "firmware-update")]
         crate::kernel::update::runtime::startup_progress(radio_completed);
         // Local boot fixtures intentionally retain explicit confirmation.
@@ -397,6 +400,9 @@ impl Transport {
 
 extern "C" fn run(_: *mut c_void) {
     WAKE_TARGET.store(tasks::xTaskGetCurrentTaskHandle(), Ordering::Release);
+    // Restore on the resident task's stack, before PHY startup/formation and
+    // before a trial can be confirmed. This requires no peer or physical sample.
+    crate::kernel::program::runtime::poll();
     let peripheral = unsafe { PERIPHERAL.take().unwrap() };
     let radio = port::Radio::new(peripheral);
     let waker = unsafe {

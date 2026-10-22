@@ -36,7 +36,7 @@ def read_hex(hex_path):
 def validate(hex_path):
     """Check every emitted address before handing an image to the DFU tool."""
     memory = read_hex(hex_path)
-    if any(not 0x27000 <= address < 0xED000 for address in memory):
+    if any(not 0x27000 <= address < 0xE9000 for address in memory):
         raise ValueError("record outside XIAO application region")
     if not memory or min(memory) != 0x27000:
         raise ValueError("missing XIAO application vector table at 0x27000")

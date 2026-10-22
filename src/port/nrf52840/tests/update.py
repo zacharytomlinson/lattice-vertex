@@ -30,7 +30,7 @@ def layout():
     body = re.search(r"pub const XIAO: Layout = Layout \{([^}]+)\}", source).group(1)
     fields = {key: int(value, 16) for key, value in
               re.findall(r"(\w+):\s*(0x[0-9a-fA-F]+)\s*,", body)}
-    if set(fields) != {"loader_start", "state_start", "active_start", "dfu_start", "journal_start", "end"}:
+    if set(fields) != {"loader_start", "state_start", "active_start", "dfu_start", "journal_start", "configuration_start", "end"}:
         raise ValueError("unsupported XIAO layout definition")
     return fields
 
@@ -80,7 +80,7 @@ def prepare(args):
         raise ValueError("--watchdog-check requires --ota")
     if args.activation_check and not args.ota:
         raise ValueError("--activation-check requires --ota")
-    out = HERE / ("target/ota" if args.ota else "target/update")
+    out = HERE / ("target/program" if args.program else "target/ota" if args.ota else "target/update")
     out.mkdir(parents=True, exist_ok=True)
     regions = layout()
     common = ["cargo", "+nightly", "build", "-Z", "build-std=core", "--release", "--locked"]
@@ -90,14 +90,14 @@ def prepare(args):
     loader = read_hex(out / "loader.hex")
     check_image(loader, regions["loader_start"], regions["state_start"])
     images = {}
-    builds = [("a", "ota-test"), ("b", "ota-image-b")] if args.ota else [("a", "update-test"), ("b", "update-image-b")]
+    builds = [("a", "program-test")] if args.program else [("a", "ota-test"), ("b", "ota-image-b")] if args.ota else [("a", "update-test"), ("b", "update-image-b")]
     if args.watchdog_check:
         builds += [("stall-entry", "ota-stall-before-init"), ("stall-radio", "ota-stall-before-radio")]
     for name, features in builds:
         if args.staging_check and name == "a": features += ",ota-staging-check"
         if args.activation_check and name == "a": features += ",ota-activation-check"
-        subprocess.run(common + ["--bin", "ota" if args.ota else "update", "--features", features], cwd=HERE, check=True)
-        elf = HERE / "target" / TARGET / ("release/ota" if args.ota else "release/update")
+        subprocess.run(common + ["--bin", "radio" if args.program else "ota" if args.ota else "update", "--features", features], cwd=HERE, check=True)
+        elf = HERE / "target" / TARGET / ("release/radio" if args.program else "release/ota" if args.ota else "release/update")
         shutil.copyfile(elf, out / f"{name}.elf")
         subprocess.run([args.objcopy, "-I", "elf32-little", "-O", "ihex", str(elf), str(out / f"{name}.hex")], check=True)
         image = read_hex(out / f"{name}.hex")
@@ -148,7 +148,9 @@ def main():
     build.add_argument("--activation-check", action="store_true", help="hold automatic activation for ten seconds after verification in image A")
     build.add_argument("--staging-check", action="store_true", help="hold staging for ten seconds after accepting an offer in image A")
     build.add_argument("--watchdog-check", action="store_true", help="also build stalled trial images for hardware rollback checks")
-    build.add_argument("--ota", action="store_true", help="build the signed receiver and binary host interface")
+    mode = build.add_mutually_exclusive_group()
+    mode.add_argument("--ota", action="store_true", help="build the signed receiver and binary host interface")
+    mode.add_argument("--program", action="store_true", help="build the storage-backed appliance without signing policy or preinstalled programs")
     for action in ["status", "stage", "reset", "confirm", "dfu"]:
         command = sub.add_parser(action)
         command.add_argument("--port", required=True)

@@ -1,0 +1,549 @@
+//! Persistent owner-local program definitions and native dependency wiring.
+//! Installation is distinct from admission of a distributed traversal.
+
+pub(crate) mod runtime;
+mod validation;
+
+use super::appliance::Native;
+use core::sync::atomic::Ordering;
+use embedded_storage::nor_flash::NorFlash;
+use lattice_peer_wire::program::{
+    transfer::{Reply, Request, Status, DATA_BYTES},
+    Definition, Error, Source, NONE,
+};
+use lattice_storage::configuration::Configuration;
+use sha2::{Digest, Sha256};
+
+const CAPACITY: usize = 8192;
+const PREFIX: usize = 24;
+const MAGIC: [u8; 4] = *b"LPG\x01";
+
+#[derive(Clone, Copy)]
+struct Part<'a> {
+    offset: u16,
+    generation: u32,
+    caller: u64,
+    transfer: u32,
+    definition: Definition<'a>,
+}
+fn parts(bytes: &[u8]) -> impl Iterator<Item = Result<Part<'_>, Status>> {
+    let mut at = 4;
+    core::iter::from_fn(move || {
+        if at >= bytes.len() {
+            return None;
+        }
+        let result = (|| {
+            let prefix = bytes.get(at..at + PREFIX).ok_or(Status::Invalid)?;
+            let length = u16::from_le_bytes(prefix[..2].try_into().unwrap()) as usize;
+            if length < PREFIX || prefix[2..4] != [0, 0] || prefix[20..24] != [0, 0, 0, 0] {
+                return Err(Status::Invalid);
+            }
+            let generation = u32::from_le_bytes(prefix[4..8].try_into().unwrap());
+            if generation == 0 {
+                return Err(Status::Invalid);
+            }
+            let part = Part {
+                offset: at as u16,
+                generation,
+                caller: u64::from_le_bytes(prefix[8..16].try_into().unwrap()),
+                transfer: u32::from_le_bytes(prefix[16..20].try_into().unwrap()),
+                definition: Definition::parse(
+                    bytes.get(at + PREFIX..at + length).ok_or(Status::Invalid)?,
+                )
+                .map_err(status)?,
+            };
+            at += length;
+            Ok(part)
+        })();
+        if result.is_err() {
+            at = bytes.len();
+        }
+        Some(result)
+    })
+}
+fn status(error: Error) -> Status {
+    match error {
+        Error::Bounds | Error::Capacity => Status::Bounds,
+        Error::Binding => Status::Binding,
+        Error::Compatibility => Status::Compatibility,
+        _ => Status::Invalid,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Receiving,
+    Erasing,
+    Writing(u16),
+    Committing,
+}
+#[derive(Clone, Copy)]
+struct Pending {
+    caller: u64,
+    transfer: u32,
+    length: u16,
+    accepted: u16,
+    generation: u32,
+    phase: Phase,
+    digest: Option<[u8; 32]>,
+}
+
+pub(crate) struct Programs {
+    bytes: [u8; CAPACITY],
+    reply: [u8; DATA_BYTES],
+    used: u16,
+    store: Option<Configuration>,
+    pending: Option<Pending>,
+    last_activity: u32,
+    state: Status,
+}
+impl Programs {
+    pub(crate) const fn new() -> Self {
+        Self {
+            bytes: [0; CAPACITY],
+            reply: [0; DATA_BYTES],
+            used: 0,
+            store: None,
+            pending: None,
+            last_activity: 0,
+            state: Status::Unsupported,
+        }
+    }
+    pub(crate) fn restore<F: NorFlash>(
+        &mut self,
+        flash: &mut F,
+        native: &dyn Native,
+        surface: &[u8; 32],
+    ) -> Result<(), Status> {
+        native.clear_dependencies();
+        self.pending = None;
+        self.state = Status::Storage;
+        let store = Configuration::open(flash).map_err(|_| Status::Storage)?;
+        let used = store.current().map_or(4, |i| i.length() as usize);
+        if !(4..=CAPACITY).contains(&used) {
+            return Err(Status::Bounds);
+        }
+        if store.current().is_some() {
+            store
+                .read(flash, 0, &mut self.bytes[..used])
+                .map_err(|_| Status::Storage)?;
+        } else {
+            self.bytes[..4].copy_from_slice(&MAGIC);
+        }
+        self.used = used as u16;
+        self.store = Some(store);
+        if self.bytes[..4] != MAGIC {
+            self.state = Status::Invalid;
+            return Err(self.state);
+        }
+        let result = (|| {
+            for part in parts(&self.bytes[..used]) {
+                validation::validate(part?.definition.bytes(), native, surface).map_err(status)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.state = error;
+            return Err(error);
+        }
+        self.wire(native);
+        self.state = Status::Ok;
+        Ok(())
+    }
+    fn wire(&mut self, native: &dyn Native) {
+        native.clear_dependencies();
+        let mut part_offset = 4;
+        while part_offset < self.used as usize {
+            let length =
+                u16::from_le_bytes(self.bytes[part_offset..part_offset + 2].try_into().unwrap())
+                    as usize;
+            let start = part_offset + PREFIX;
+            let count =
+                u16::from_le_bytes(self.bytes[start + 8..start + 10].try_into().unwrap()) as usize;
+            for index in 0..count {
+                let at = start
+                    + lattice_peer_wire::program::HEADER_BYTES
+                    + index * lattice_peer_wire::program::SOURCE_BYTES;
+                let state = u64::from_le_bytes(self.bytes[at..at + 8].try_into().unwrap());
+                let (_, head) = native
+                    .state_binding(state)
+                    .expect("validated native binding");
+                self.bytes[at + 10..at + 12]
+                    .copy_from_slice(&head.load(Ordering::Relaxed).to_le_bytes());
+                head.store(at as u16, Ordering::Release);
+            }
+            part_offset += length;
+        }
+    }
+    pub(crate) fn dependency(&self, offset: u16) -> Option<(u16, u32, Source, u16)> {
+        if offset == NONE || self.state != Status::Ok {
+            return None;
+        }
+        for part in parts(&self.bytes[..self.used as usize]) {
+            let part = part.ok()?;
+            let start = part.offset as usize + PREFIX;
+            for source in part.definition.sources() {
+                if start + source.offset as usize == offset as usize {
+                    let next = u16::from_le_bytes(
+                        self.bytes[offset as usize + 10..offset as usize + 12]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    return Some((part.offset, part.generation, source, next));
+                }
+            }
+        }
+        None
+    }
+    fn progress(&self, state: Status) -> Reply<'_> {
+        if let Some(p) = self.pending {
+            Reply {
+                status: state,
+                offset: self.used,
+                generation: p.generation,
+                accepted: p.accepted,
+                total: p.length,
+                bytes: &[],
+            }
+        } else {
+            Reply {
+                status: state,
+                total: self.used,
+                accepted: 0,
+                ..Reply::status(state)
+            }
+        }
+    }
+    pub(crate) fn receive<'a>(
+        &'a mut self,
+        caller: u64,
+        request: Request<'_>,
+        native: &dyn Native,
+        surface: &[u8; 32],
+    ) -> Reply<'a> {
+        if let Request::Read { offset } = request {
+            if offset > self.used {
+                return Reply::status(Status::Bounds);
+            }
+            let end = (offset as usize + DATA_BYTES).min(self.used as usize);
+            canonical_range(
+                &self.bytes[..self.used as usize],
+                offset as usize,
+                &mut self.reply[..end - offset as usize],
+            );
+            return Reply {
+                status: self.state,
+                offset,
+                total: self.used,
+                bytes: &self.reply[..end - offset as usize],
+                ..Reply::status(self.state)
+            };
+        }
+        if self.state != Status::Ok {
+            return self.progress(self.state);
+        }
+        if let Request::Dependencies { state, after } = request {
+            let Some((_, head)) = native.state_binding(state) else {
+                return Reply::status(Status::Binding);
+            };
+            let cursor = if after == NONE {
+                head.load(Ordering::Acquire)
+            } else {
+                match self.dependency(after) {
+                    Some((_, _, s, next)) if s.state == state => next,
+                    _ => return Reply::status(Status::Bounds),
+                }
+            };
+            if cursor == NONE {
+                return Reply::status(Status::Ok);
+            }
+            let Some((definition, generation, source, next)) = self.dependency(cursor) else {
+                return Reply::status(Status::Invalid);
+            };
+            self.reply[..2].copy_from_slice(&cursor.to_le_bytes());
+            self.reply[2..4].copy_from_slice(&next.to_le_bytes());
+            self.reply[4..6].copy_from_slice(&source.entry.to_le_bytes());
+            return Reply {
+                offset: definition,
+                generation,
+                bytes: &self.reply[..6],
+                ..Reply::status(Status::Ok)
+            };
+        }
+        if let Request::Info = request {
+            self.reply[..2].copy_from_slice(
+                &(self.store.as_ref().unwrap().capacity().min(CAPACITY as u32) as u16)
+                    .to_le_bytes(),
+            );
+            self.reply[2..4].copy_from_slice(&(validation::MAX_RECORDS as u16).to_le_bytes());
+            let mut reply = self.progress(self.pending.map_or(Status::Ok, |p| {
+                if p.phase == Phase::Receiving {
+                    Status::Receiving
+                } else {
+                    Status::Persisting
+                }
+            }));
+            reply.bytes = &self.reply[..4];
+            return reply;
+        }
+        let transfer = match request {
+            Request::Begin { transfer, .. }
+            | Request::Data { transfer, .. }
+            | Request::Commit { transfer, .. }
+            | Request::Abort { transfer } => transfer,
+            _ => unreachable!(),
+        };
+        if transfer == 0 || caller == 0 || caller == u64::MAX {
+            return self.progress(Status::Invalid);
+        }
+        if let Some(part) = parts(&self.bytes[..self.used as usize])
+            .filter_map(Result::ok)
+            .find(|p| p.caller == caller && p.transfer == transfer)
+        {
+            let matches = match request {
+                Request::Begin { length, .. } => length as usize == part.definition.bytes().len(),
+                Request::Commit { digest, .. } => canonical_digest(part.definition) == digest,
+                _ => false,
+            };
+            return Reply {
+                status: if matches {
+                    Status::Installed
+                } else {
+                    Status::Conflict
+                },
+                offset: part.offset,
+                generation: part.generation,
+                accepted: part.definition.bytes().len() as u16,
+                total: part.definition.bytes().len() as u16,
+                bytes: &[],
+            };
+        }
+        if self
+            .pending
+            .is_some_and(|p| p.caller != caller || p.transfer != transfer)
+        {
+            return self.progress(Status::Busy);
+        }
+        let result = match request {
+            Request::Begin { length, .. } => {
+                if let Some(p) = self.pending {
+                    if p.length != length {
+                        Status::Conflict
+                    } else if p.phase == Phase::Receiving {
+                        Status::Receiving
+                    } else {
+                        Status::Persisting
+                    }
+                } else if (length as usize) < lattice_peer_wire::program::HEADER_BYTES
+                    || self.used as usize + PREFIX + length as usize
+                        > self.store.as_ref().unwrap().capacity().min(CAPACITY as u32) as usize
+                {
+                    Status::Bounds
+                } else {
+                    let Some(generation) = self
+                        .store
+                        .as_ref()
+                        .unwrap()
+                        .current()
+                        .map_or(Some(1), |i| i.generation().checked_add(1))
+                        .and_then(|v| u32::try_from(v).ok())
+                    else {
+                        return self.progress(Status::Bounds);
+                    };
+                    self.pending = Some(Pending {
+                        caller,
+                        transfer,
+                        length,
+                        accepted: 0,
+                        generation,
+                        phase: Phase::Receiving,
+                        digest: None,
+                    });
+                    Status::Receiving
+                }
+            }
+            Request::Data { offset, bytes, .. } => {
+                let Some(p) = self.pending.as_mut() else {
+                    return self.progress(Status::Conflict);
+                };
+                let end = offset as usize + bytes.len();
+                let start = self.used as usize + PREFIX;
+                if p.phase != Phase::Receiving {
+                    Status::Busy
+                } else if bytes.is_empty() || bytes.len() > DATA_BYTES || end > p.length as usize {
+                    Status::Bounds
+                } else if end <= p.accepted as usize {
+                    if self.bytes[start + offset as usize..start + end] == *bytes {
+                        Status::Receiving
+                    } else {
+                        Status::Conflict
+                    }
+                } else if offset != p.accepted {
+                    Status::Conflict
+                } else {
+                    self.bytes[start + offset as usize..start + end].copy_from_slice(bytes);
+                    p.accepted = end as u16;
+                    Status::Receiving
+                }
+            }
+            Request::Commit { digest, .. } => {
+                let Some(mut p) = self.pending else {
+                    return self.progress(Status::Conflict);
+                };
+                if p.phase != Phase::Receiving {
+                    if p.digest == Some(digest) {
+                        Status::Persisting
+                    } else {
+                        Status::Conflict
+                    }
+                } else if p.accepted != p.length {
+                    Status::Invalid
+                } else {
+                    let start = self.used as usize + PREFIX;
+                    let bytes = &self.bytes[start..start + p.length as usize];
+                    let hash: [u8; 32] = Sha256::digest(bytes).into();
+                    if hash != digest {
+                        Status::Conflict
+                    } else if let Err(error) = validation::validate(bytes, native, surface) {
+                        status(error)
+                    } else if Definition::parse(bytes)
+                        .unwrap()
+                        .sources()
+                        .any(|s| bytes[s.offset as usize + 10..s.offset as usize + 12] != [0xff; 2])
+                    {
+                        Status::Invalid
+                    } else {
+                        let prefix = &mut self.bytes[self.used as usize..start];
+                        prefix.fill(0);
+                        prefix[..2].copy_from_slice(&(PREFIX as u16 + p.length).to_le_bytes());
+                        prefix[4..8].copy_from_slice(&p.generation.to_le_bytes());
+                        prefix[8..16].copy_from_slice(&p.caller.to_le_bytes());
+                        prefix[16..20].copy_from_slice(&p.transfer.to_le_bytes());
+                        if self
+                            .store
+                            .as_mut()
+                            .unwrap()
+                            .begin((start + p.length as usize) as u32)
+                            .is_err()
+                        {
+                            Status::Storage
+                        } else {
+                            p.phase = Phase::Erasing;
+                            p.digest = Some(digest);
+                            self.pending = Some(p);
+                            Status::Persisting
+                        }
+                    }
+                }
+            }
+            Request::Abort { .. } => {
+                if self.pending.is_some_and(|p| p.phase != Phase::Receiving) {
+                    Status::Busy
+                } else {
+                    self.pending = None;
+                    Status::Ok
+                }
+            }
+            _ => unreachable!(),
+        };
+        self.progress(result)
+    }
+    pub(crate) fn pending_write(&self) -> bool {
+        self.pending.is_some_and(|p| p.phase != Phase::Receiving) && self.state == Status::Ok
+    }
+    pub(crate) fn expire(&mut self, now: u32) {
+        if self.pending.is_some_and(|p| p.phase == Phase::Receiving)
+            && now.wrapping_sub(self.last_activity) >= 30_000
+        {
+            self.pending = None;
+        }
+    }
+    pub(crate) fn poll<F: NorFlash>(
+        &mut self,
+        flash: &mut F,
+        native: &dyn Native,
+    ) -> Result<(), Status> {
+        let Some(mut p) = self.pending else {
+            return Ok(());
+        };
+        if self.state != Status::Ok {
+            return Err(self.state);
+        }
+        let store = self.store.as_mut().unwrap();
+        let total = self.used as usize + PREFIX + p.length as usize;
+        let result = (|| {
+            match p.phase {
+                Phase::Receiving => {}
+                Phase::Erasing => {
+                    if store.erase_next_page(flash)? {
+                        p.phase = Phase::Writing(0);
+                    }
+                }
+                Phase::Writing(offset) => {
+                    let end = (offset as usize + 256).min(total);
+                    let mut bytes = [0; 256];
+                    canonical_range(
+                        &self.bytes[..total],
+                        offset as usize,
+                        &mut bytes[..end - offset as usize],
+                    );
+                    store.write(flash, offset as u32, &bytes[..end - offset as usize])?;
+                    p.phase = if end == total {
+                        Phase::Committing
+                    } else {
+                        Phase::Writing(end as u16)
+                    };
+                }
+                Phase::Committing => {
+                    store.commit(flash)?;
+                    self.used = total as u16;
+                }
+            }
+            Ok::<(), lattice_storage::Error>(())
+        })();
+        if result.is_err() {
+            self.state = Status::Storage;
+            return Err(Status::Storage);
+        }
+        if p.phase == Phase::Committing && self.used as usize == total {
+            self.pending = None;
+            self.wire(native);
+        } else {
+            self.pending = Some(p);
+        }
+        Ok(())
+    }
+}
+fn canonical_digest(definition: Definition<'_>) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    let bytes = definition.bytes();
+    let mut at = 0;
+    for source in definition.sources() {
+        let next = source.offset as usize + 10;
+        hash.update(&bytes[at..next]);
+        hash.update([0xff; 2]);
+        at = next + 2;
+    }
+    hash.update(&bytes[at..]);
+    hash.finalize().into()
+}
+
+fn canonical_range(image: &[u8], offset: usize, output: &mut [u8]) {
+    output.copy_from_slice(&image[offset..offset + output.len()]);
+    for part in parts(image) {
+        let Ok(part) = part else {
+            break;
+        };
+        for source in part.definition.sources() {
+            let link = part.offset as usize + PREFIX + source.offset as usize + 10;
+            for at in link..link + 2 {
+                if at >= offset && at - offset < output.len() {
+                    output[at - offset] = 0xff;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "port-test"))]
+mod tests;

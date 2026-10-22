@@ -203,12 +203,23 @@ traversal.
 
 ### Durable identity and runtime address
 
-A saved memory reference can serve as an identity after shutdown. On reconstruction,
-manual graph traversal establishes the correspondence between saved identities and new
-local addresses and fixes each relationship. A multi-node reference adds the owning node's
-identity to this reconstruction domain. Boot, replacement, and slot reuse must distinguish
-a new binding incarnation from delayed traffic for its previous occupant. The compact
-encoding and reuse bounds remain an ABI obligation.
+Native appliance states and mutation functions have durable owner-local bindings.
+Their declarations supply permanent binding names; the kernel converts those names
+to numeric references and resolves them to the current native handles. Names are
+not display labels, Rust type names, enumeration positions or transmitted strings.
+Compatible firmware relocation must preserve those references. Reusing a name for
+a different physical meaning is an incompatible change, even if its type matches.
+Duplicate references must be rejected rather than ambiguously dispatched.
+
+On reconstruction, graph traversal resolves saved native bindings and fixes local
+relationships after checking types and compatibility. A multi-node reference adds
+the owning node's identity to this reconstruction domain. Mathematical definitions
+and surface compatibility fingerprints must not depend on firmware addresses.
+Installed graph storage has separate incarnation/reuse rules: boot, replacement
+and reuse must distinguish a new binding from delayed traffic for its previous
+occupant. Stable native names do not establish that a changed program or hardware
+implementation is compatible. Concrete record and installation formats belong
+with the kernel implementation.
 
 ## The common IR and peripheral semantics
 
@@ -219,8 +230,8 @@ later use them. Compilation connects owner-local predicates, value calculations 
 mutation endpoints through resident graph edges. Definitions supplied after firmware
 compilation select and bind the kernel's native primitives; they do not require a
 firmware-authored Rust evaluator for each automation. The common IR is not an interpreter
-hosted on every vertex. The concrete resident-record and loading ABI still requires
-design.
+hosted on every vertex. Concrete resident-record and installation formats are
+maintained with the kernel implementation.
 
 Definitions are composed from the language's primitives rather than added as new
 domain-specific opcodes. Duration, duty fraction, warmth, illumination preference, or a
@@ -637,6 +648,12 @@ initiates ordinary evaluation of the currently applicable conditions. Manual mut
 remains a direct authorized invocation; it does not imply a timed hold or an automatically
 inserted expected-starting-state guard. A later legitimate automation activation can
 change the peripheral again.
+
+Initial enablement likewise admits one fresh evaluation before ordinary delta-driven
+operation. After a reboot, a restored enabled head evaluates current conditions once
+its required local state/time are available. This is a new traversal with current
+inputs, never replay of an interrupted traversal or mutation. Repeated delivery of
+the same enable request must not manufacture additional enablement evaluations.
 
 The ordering of an explicit disable or delete against an already admitted traversal needs
 a precise lifecycle contract. Ordinary state-change supersession is excluded regardless of

@@ -181,6 +181,9 @@ fn participate(
     let mut last_discovery = started;
     loop {
         super::radio::task::watchdog_progress(false);
+        if !radio.pending_receive() {
+            crate::kernel::program::runtime::poll();
+        }
         let now = tasks::xTaskGetTickCount();
         let milliseconds = ((now as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
         forwarder.expire(milliseconds);
@@ -259,6 +262,11 @@ fn participate(
         collect_costs(radio, &mut forwarder, measured_at);
         let timeout =
             period.saturating_sub(tasks::xTaskGetTickCount().wrapping_sub(last_discovery));
+        let timeout = if crate::kernel::program::runtime::pending() {
+            timeout.min(crate::milliseconds_to_ticks_checked(10).unwrap())
+        } else {
+            timeout
+        };
         #[cfg(feature = "host-link")]
         let timeout = host.wait_ms(milliseconds).map_or(timeout, |ms| {
             timeout.min(crate::milliseconds_to_ticks_checked(ms as u64).unwrap())
@@ -293,13 +301,27 @@ fn participate(
                 || matches!(message.content, Content::SurfacePart { read, .. } if read.reader == local)
                 || matches!(message.content, Content::StateValue { read, .. } if read.reader == local)
                 || matches!(message.content, Content::Updated { read, .. } if read.reader == local)
+                || matches!(message.content, Content::ProgramResult { read, .. } if read.reader == local)
             {
                 let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
                     / crate::configTICK_RATE_HZ as u64) as u32;
                 host.complete(&mut forwarder, message, now);
                 continue;
             }
-            if let Content::UpdateAbsence { network: n, notice } = message.content {
+            if matches!(message.content, Content::Program {network:n,..}|Content::ProgramResult {network:n,..} if n==network)
+            {
+                let mut reply_bytes = [0; lattice_peer_wire::program::transfer::REPLY_BYTES];
+                if let Some(reply) = forwarder.receive_program(
+                    message,
+                    milliseconds,
+                    &mut reply_bytes,
+                    crate::kernel::program::runtime::receive,
+                ) {
+                    if !send(radio, reply, &mut sequence, &mut outgoing_buffer) {
+                        forwarder.transmit_failed(&reply);
+                    }
+                }
+            } else if let Content::UpdateAbsence { network: n, notice } = message.content {
                 if n == network {
                     forwarder.record_update_absence(message.source, notice, measured_at);
                 }
@@ -486,7 +508,7 @@ fn participate(
                 now,
                 local,
                 conflict,
-                forwarder.work_pending(),
+                forwarder.work_pending() || crate::kernel::program::runtime::pending(),
                 |notice| {
                     let sent = send(
                         radio,
@@ -557,6 +579,8 @@ fn send(
                 },
                 // This successful send needs no dedicated fixture counter.
                 Content::UpdateAbsence { .. }
+                | Content::Program { .. }
+                | Content::ProgramResult { .. }
                 | Content::ReadState { .. }
                 | Content::Update { .. }
                 | Content::Updated { .. }

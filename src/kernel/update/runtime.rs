@@ -4,18 +4,15 @@
 use super::{
     activation::{self, Action, Activation},
     package::Policy,
-    Receiver, Storage,
+    Storage,
 };
 use crate::{kernel::tasks, port, sync::TaskContext};
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use lattice_peer_wire::update::{Progress, Request, Status};
 
-#[cfg(feature = "port-nrf52840")]
-pub type PlatformStorage = crate::port::nrf52840::update::ImageStorage<'static>;
+pub use crate::kernel::storage::PlatformStorage;
 #[cfg(feature = "port-nrf52840")]
 type PortError = crate::port::nrf52840::update::Error;
-#[cfg(feature = "port-esp32c6")]
-pub type PlatformStorage = crate::port::esp32c6::update::ImageStorage<'static>;
 #[cfg(feature = "port-esp32c6")]
 type PortError = crate::port::esp32c6::update::Error;
 
@@ -73,12 +70,12 @@ pub struct Snapshot {
     pub control_pending: bool,
     pub release: u64,
 }
-static mut RECEIVER: Option<Receiver<PlatformStorage>> = None;
 static CONTROL: AtomicU8 = AtomicU8::new(0);
 static mut ACTIVATION: Activation = Activation::new();
 static mut ACTIVITY_EPOCH: u32 = 0;
 static mut STAGING: super::staging::Staging = super::staging::Staging::new();
-static mut STARTUP: super::startup::Startup = super::startup::Startup::new(0);
+static mut STARTUP: crate::kernel::storage::startup::Startup =
+    crate::kernel::storage::startup::Startup::new(0);
 // Other tasks read this monotonic result without borrowing the peer-owned record.
 static STARTUP_CONFIRMED: AtomicBool = AtomicBool::new(false);
 static mut SNAPSHOT: Snapshot = Snapshot {
@@ -105,12 +102,9 @@ pub(crate) fn initialize(storage: PlatformStorage, policy: Policy) {
         "update journal is not provisioned"
     );
     unsafe {
-        assert!(
-            (*core::ptr::addr_of!(RECEIVER)).is_none(),
-            "updater already initialized"
-        );
-        core::ptr::addr_of_mut!(RECEIVER).write(Some(Receiver::new(storage, policy)));
-        core::ptr::addr_of_mut!(STARTUP).write(super::startup::Startup::new(
+        crate::kernel::storage::initialize(storage);
+        crate::kernel::storage::enable_updates(policy);
+        core::ptr::addr_of_mut!(STARTUP).write(crate::kernel::storage::startup::Startup::new(
             tasks::xTaskGetTickCount() as u32,
         ));
         publish(Status::Ok);
@@ -118,7 +112,7 @@ pub(crate) fn initialize(storage: PlatformStorage, policy: Policy) {
 }
 
 unsafe fn publish(control_result: Status) {
-    let Some(receiver) = (&*core::ptr::addr_of!(RECEIVER)).as_ref() else {
+    let Some(receiver) = crate::kernel::storage::receiver() else {
         return;
     };
     let id = receiver.header.map_or(receiver.assembling, |h| h.id);
@@ -164,9 +158,14 @@ pub fn confirm(_: &TaskContext) -> Result<(), Status> {
 /// Only the resident task calls this. A successful local radio operation plus
 /// tick progress proves startup without depending on any other vertex.
 pub(crate) fn startup_progress(radio_completed: bool) {
-    let Some(receiver) = (unsafe { (&mut *core::ptr::addr_of_mut!(RECEIVER)).as_mut() }) else {
+    let Some(receiver) = (unsafe { crate::kernel::storage::receiver() }) else {
         return;
     };
+    if crate::kernel::storage::is_trial(&receiver.storage)
+        && !crate::kernel::program::runtime::reconstructed()
+    {
+        return;
+    }
     let startup = unsafe { &mut *core::ptr::addr_of_mut!(STARTUP) };
     if startup.progress(tasks::xTaskGetTickCount() as u32, radio_completed, || {
         receiver.confirm()
@@ -187,7 +186,7 @@ pub(crate) fn contending() -> bool {
 }
 pub(crate) fn awaiting_activation() -> bool {
     unsafe {
-        (&*core::ptr::addr_of!(RECEIVER)).as_ref().is_some_and(|r| {
+        crate::kernel::storage::receiver().is_some_and(|r| {
             r.phase == lattice_peer_wire::update::Phase::Ready
                 && r.header.is_some_and(|h| {
                     h.costs
@@ -216,7 +215,7 @@ pub(crate) fn poll_activation(
         }
     }
     let ready = unsafe {
-        (&*core::ptr::addr_of!(RECEIVER)).as_ref().and_then(|r| {
+        crate::kernel::storage::receiver().and_then(|r| {
             (r.phase == Phase::Ready)
                 .then(|| (r.header.unwrap(), r.storage.activation_swap_bytes()))
         })
@@ -254,12 +253,7 @@ pub(crate) fn poll_activation(
                 });
                 return;
             }
-            let result = unsafe {
-                (&mut *core::ptr::addr_of_mut!(RECEIVER))
-                    .as_mut()
-                    .unwrap()
-                    .activate()
-            };
+            let result = unsafe { crate::kernel::storage::receiver().unwrap().activate() };
             unsafe {
                 publish(result.err().unwrap_or(Status::Ok));
             }
@@ -302,7 +296,7 @@ pub(crate) fn poll_control() {
         reset_chip();
     }
     let result = unsafe {
-        match (&mut *core::ptr::addr_of_mut!(RECEIVER)).as_mut() {
+        match crate::kernel::storage::receiver() {
             Some(r) => {
                 if command == 1 {
                     r.activate()
@@ -320,7 +314,7 @@ pub(crate) fn poll_control() {
 }
 pub(crate) fn receive(request: Request<'_>, traffic_pending: bool) -> Progress {
     let reply = unsafe {
-        match (&mut *core::ptr::addr_of_mut!(RECEIVER)).as_mut() {
+        match crate::kernel::storage::receiver() {
             Some(r) => {
                 if let Some((work, costs)) = r.staging_work(request) {
                     let pacing = &mut *core::ptr::addr_of_mut!(STAGING);

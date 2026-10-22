@@ -63,7 +63,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lattice-image-storage"
+name = "lattice-storage"
 version = "0.1.0"
 dependencies = [
  "embedded-storage",

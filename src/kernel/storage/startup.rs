@@ -2,12 +2,12 @@
 use lattice_peer_wire::update::Status;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum State {
+pub(crate) enum State {
     Waiting,
     Confirmed,
     Failed,
 }
-pub(super) struct Startup {
+pub(crate) struct Startup {
     started: u32,
     radio_completed: bool,
     state: State,

@@ -123,24 +123,41 @@ limit is sufficient; the kernel can write its own retained configuration beyond
 that boundary. New images must fit the established limit. Independent kernel and
 appliance binaries are not required for this protection.
 
-The current layouts do not yet reserve this region. Nordic boot uses the entire
-configured active slot during swap/revert, so those extents must be adjusted too.
-C6 can reserve another data region in its existing partition map. Provisioning and
-ordinary updates must honor the same boundaries. See the architectural
-[storage requirement](ARCHITECTURE.md#protected-local-configuration).
+Layout 3 now reserves 16 KiB: Nordic `0xE9000..0xED000`, C6
+`lattice_config` at `0x212000..0x216000`. Nordic's active/DFU extents shrink to
+364/368 KiB; its loader descriptor at `0x2EFC0` must match before the port permits
+flash access. C6 validates the data partition's type, alignment and disjointness.
+Both ports lend this region through their existing flash owner. An unconfirmed
+trial can read it but cannot rewrite it. Configuration is excluded from journal
+and image erase/write/swap operations.
+
+The shared [configuration store](../src/kernel/storage/README.md#local-configuration)
+maintains two committed copies, detects incomplete/corrupt writes and retains the
+previous valid copy. The [program loader](../src/kernel/program/README.md) now
+validates and reconstructs installed definitions from it; definitions remain
+inactive until the separate execution/admission layer is implemented.
+Layout 3 needs coordinated loader/partition/application provisioning. No boards
+have been provisioned or power-cut-tested with these new boundaries yet.
 
 ## Handle compatibility
 
-Surface handles derive from local declaration addresses. Rebuilding can move a
-handle or reuse its address for a different declaration. Clearing a consumer's
-cache cannot prevent a delayed message from addressing the new declaration.
+Surface handles now derive from permanent appliance binding names. Reads, native
+invocation and deltas resolve those numeric references against the current local
+declarations. LSF v2 also removes addresses from mathematical records, so a
+compatible rebuild that only relocates code/data preserves the surface fingerprint.
+Duplicate binding names/references are rejected. Changing a physical meaning
+requires a new name; type equality alone is not compatibility evidence.
+The LSF v1-to-v2 transition changes the fingerprint. An existing v1 release policy
+will reject a v2 package as incompatible; use coordinated provisioning for this
+format transition, not a claim of transparent OTA compatibility.
 
 Unattended updates require preserved exported handles and meanings, compatible
 wire behavior, and rollback-compatible persistent data. Packaging compares actual
 surface dumps; a developer's compatibility flag is insufficient. The signing
 pipeline must also establish that those dumps belong to the supplied binaries.
-If compatibility cannot be established, automatic deployment needs a future
-rebind/invalidation mechanism that rejects stale references at the receiver.
+If compatibility cannot be established, automatic deployment still needs a future
+migration/invalidation mechanism. Stable references do not authorize incompatible
+type, operation or physical-behavior changes.
 Empty-appliance boot fixtures do not establish this for arbitrary appliances or
 provide installed-program migration.
 
@@ -255,8 +272,9 @@ continues to feed the watchdog. This watchdog does not impose a call deadline or
 prove that arbitrary hardware functions eventually return. The separate local USB
 boot fixture keeps explicit confirmation to exercise unconfirmed reversion.
 
-The Nordic loader arms WDT after its full-slot swap and before trial entry. It
-uses the persistent resulting boot state, because `prepare_boot` reports entry
+Both ports require successful reconstruction of saved program definitions before
+the common kernel confirms a trial. The Nordic loader arms WDT after its full-slot
+swap and before trial entry. It uses the persistent resulting boot state, because `prepare_boot` reports entry
 state even after reversion. The peripheral remains enabled until reset. The C6
 loader hands off RTC WDT and the port rearms it at initialization. **C6 has a known
 handoff gap:** esp-hal 1.1.2 disables watchdogs inside `esp_hal::init`, before the
@@ -265,8 +283,8 @@ directly after HAL initialization/resource setup. Exact watchdog configuration
 belongs to the [Nordic](../src/port/nrf52840/boot/README.md) and
 [C6](../src/port/esp32c6/boot/README.md) boot notes.
 
-Watchdog-capable loaders require provisioning even though layout-2 boundaries are
-unchanged. Application packages cannot install those loaders. Factory Nordic
+Watchdog-capable loaders require provisioning, and layout 3 additionally changes
+the configuration reservations. Application packages cannot install those loaders. Factory Nordic
 recovery and C6 ROM recovery remain available; provisioning changes no eFuses.
 
 ## Validation scope and remaining work

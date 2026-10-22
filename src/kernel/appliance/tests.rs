@@ -19,8 +19,8 @@ impl<const I: usize> State for Input<I> {
         }
     }
 }
-static A: StateHandle<Device> = StateHandle::new::<Input<0>>();
-static B: StateHandle<Device> = StateHandle::new::<Input<1>>();
+static A: StateHandle<Device> = StateHandle::new::<Input<0>>("a");
+static B: StateHandle<Device> = StateHandle::new::<Input<1>>("b");
 static TRUE: Definition<Device> = Definition {
     body: Expr::Constant(Value::boolean(true)),
     arguments: &[],
@@ -51,16 +51,13 @@ impl StateTransformer for Set {
         Err(()) // An actual change survives a hardware error.
     }
 }
-static SET: TransformerHandle<Device, ()> = TransformerHandle::new::<Set>();
+static SET: TransformerHandle<Device, ()> = TransformerHandle::new::<Set>("set");
 static SURFACE: Surface<Device, ()> = Surface {
     states: &[&A, &B],
     transformers: &[&SET],
     axioms: &[],
     invariants: &[],
 };
-fn reference<T>(p: &T) -> u64 {
-    ptr::from_ref(p) as usize as u64
-}
 fn owner() -> (TaskContext, &'static Appliance<Device, ()>) {
     crate::port::test_port_reset();
     super::super::change::reset();
@@ -97,7 +94,7 @@ fn acquisition_transitions() {
         for (state, raw) in [&A, &B].into_iter().zip(physical) {
             let expected = (raw != 0).then_some(Value::boolean(raw == 2));
             assert_eq!(
-                owner.read(&context, reference(state.definition())),
+                owner.read(&context, state.reference()),
                 StateReadResult::Value {
                     sequence: before + changes,
                     value: expected
@@ -117,19 +114,24 @@ fn native_admission() {
             &[Value::boolean(true)][..],
             InvokeStatus::UnknownTransformer,
         ),
-        (reference(&SET), &[][..], InvokeStatus::Arguments),
         (
-            reference(&SET),
+            ptr::from_ref(&SET) as usize as u64,
+            &[Value::boolean(true)][..],
+            InvokeStatus::UnknownTransformer,
+        ),
+        (SET.reference(), &[][..], InvokeStatus::Arguments),
+        (
+            SET.reference(),
             &[Value::integer(crate::ir::Integer::U8, 1).unwrap()][..],
             InvokeStatus::Arguments,
         ),
         (
-            reference(&SET),
+            SET.reference(),
             &[Value::boolean(true)][..],
             InvokeStatus::Invoked,
         ),
         (
-            reference(&SET),
+            SET.reference(),
             &[Value::boolean(false)][..],
             InvokeStatus::ApplianceError,
         ),
@@ -142,7 +144,7 @@ fn native_admission() {
     );
     assert!(!super::super::change::pending());
     assert_eq!(
-        owner.read(&context, reference(&SET)),
+        owner.read(&context, SET.reference()),
         StateReadResult::UnknownAttribute
     );
     // Only the short acquisition lock excludes another acquisition/read, not
@@ -150,9 +152,41 @@ fn native_admission() {
     owner.with(&context, |_| {
         owner.acquire(&context);
         assert!(matches!(
-            owner.read(&context, reference(A.definition())),
+            owner.read(&context, A.reference()),
             StateReadResult::Value { .. }
         ));
     });
     super::super::change::reset();
+}
+
+#[test]
+fn binding_resolution() {
+    let mut reference = None;
+    for index in [0, 1] {
+        let handle = std::boxed::Box::leak(std::boxed::Box::new(if index == 0 {
+            StateHandle::new::<Input<0>>("input")
+        } else {
+            StateHandle::new::<Input<1>>("input")
+        }));
+        let surface = std::boxed::Box::leak(std::boxed::Box::new(Surface::<Device, ()> {
+            states: std::boxed::Box::leak(std::boxed::Box::new([&*handle])),
+            transformers: &[],
+            axioms: &[],
+            invariants: &[],
+        }));
+        crate::port::test_port_reset();
+        let context = unsafe { TaskContext::assume() };
+        let owner = std::boxed::Box::leak(std::boxed::Box::new(Appliance::new(surface)));
+        owner.initialize(&context, Device([AtomicU8::new(2), AtomicU8::new(1)]));
+        owner.acquire(&context);
+        let saved = *reference.get_or_insert(handle.reference());
+        assert_eq!(saved, handle.reference());
+        assert!(
+            matches!(owner.read(&context, saved), StateReadResult::Value { value: Some(v), .. } if v == Value::boolean(index == 0))
+        );
+        assert_eq!(
+            owner.read(&context, ptr::from_ref(handle.definition()) as usize as u64),
+            StateReadResult::UnknownAttribute
+        );
+    }
 }

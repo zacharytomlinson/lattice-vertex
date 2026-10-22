@@ -1,6 +1,6 @@
 //! Encode bounded reads of this appliance's immutable IR surface.
 //! No reader, transformer, or IR expression is executed. References identify
-//! original local declarations; no entity IDs or remote-surface catalog is built.
+//! durable native bindings or inline mathematical records. No remote catalog is built.
 
 use crate::{
     ir::{self, Binary, Expr, Type, Unary},
@@ -14,6 +14,7 @@ pub(crate) enum EncodeError {
     TooLarge,
     TooDeep,
     Full,
+    DuplicateBinding,
 }
 
 trait Encode: Sync {
@@ -65,6 +66,19 @@ impl Description {
 
     pub(crate) fn len(&self) -> u16 {
         self.length
+    }
+
+    pub(crate) fn identity(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        let mut part = [0; 64];
+        let mut offset = 0;
+        while offset < self.length {
+            let n = self.encode_part(offset, &mut part);
+            hash.update(&part[..n]);
+            offset += n as u16;
+        }
+        hash.finalize().into()
     }
 
     pub(crate) fn encode_part(&self, offset: u16, output: &mut [u8]) -> usize {
@@ -127,8 +141,13 @@ impl Writer<'_> {
                 .to_le_bytes(),
         )
     }
-    fn reference<T>(&mut self, object: &T) -> Result<(), EncodeError> {
-        self.bytes(&(core::ptr::from_ref(object) as usize as u64).to_le_bytes())
+    fn reference(&mut self, reference: u64) -> Result<(), EncodeError> {
+        self.bytes(&reference.to_le_bytes())
+    }
+    fn inline_reference(&mut self) -> Result<(), EncodeError> {
+        // Mathematical bodies are already inline. Their location in the encoded
+        // description identifies this occurrence without any firmware address.
+        self.reference(self.position as u64)
     }
     fn ty(&mut self, ty: Type) -> Result<(), EncodeError> {
         self.byte(super::frame::type_tag(ty))
@@ -141,7 +160,7 @@ impl Writer<'_> {
         Ok(())
     }
     fn attribute<A>(&mut self, attribute: &ir::Attribute<Read<A>>) -> Result<(), EncodeError> {
-        self.reference(attribute)?;
+        self.reference(attribute.location.reference())?;
         self.ty(attribute.ty)
     }
     fn attributes<A>(&mut self, attrs: &[&ir::Attribute<Read<A>>]) -> Result<(), EncodeError> {
@@ -156,7 +175,7 @@ impl Writer<'_> {
         definition: &ir::Definition<'_, '_, Read<A>>,
         depth: u8,
     ) -> Result<(), EncodeError> {
-        self.reference(definition)?;
+        self.inline_reference()?;
         self.types(definition.arguments)?;
         self.types(definition.inputs)?;
         self.expression(&definition.body, depth)
@@ -299,8 +318,11 @@ fn encode_surface<A: 'static, E>(
     axioms: impl Iterator<Item = &'static crate::surface::Predicate<A>> + Clone,
     writer: &mut Writer<'_>,
 ) -> Result<(), EncodeError> {
-    writer.bytes(b"LSF\x01")?;
-    writer.byte(usize::BITS as u8)?;
+    if writer.counting && !surface.unique_bindings() {
+        return Err(EncodeError::DuplicateBinding);
+    }
+    writer.bytes(b"LSF\x02")?;
+    writer.byte(64)?; // Binding-reference width, independent of CPU pointer width.
     for count in [
         surface.states.len() + states.clone().count(),
         surface.transformers.len(),
@@ -316,7 +338,7 @@ fn encode_surface<A: 'static, E>(
         writer.attribute(state)?;
     }
     for transformer in surface.transformers {
-        writer.reference(*transformer)?;
+        writer.reference(transformer.reference())?;
         let definition = transformer.definition();
         writer.predicate(&definition.precondition)?;
         writer.types(definition.effect.arguments)?;
@@ -328,15 +350,15 @@ fn encode_surface<A: 'static, E>(
         }
     }
     for predicate in surface.axioms {
-        writer.reference(*predicate)?;
+        writer.inline_reference()?;
         writer.predicate(predicate)?;
     }
     for predicate in axioms {
-        writer.reference(predicate)?;
+        writer.inline_reference()?;
         writer.predicate(predicate)?;
     }
     for predicate in surface.invariants {
-        writer.reference(*predicate)?;
+        writer.inline_reference()?;
         writer.predicate(predicate)?;
     }
     Ok(())
@@ -361,7 +383,7 @@ mod tests {
             panic!("exposure must not read hardware")
         }
     }
-    static ON: StateHandle<Switch> = StateHandle::new::<On>();
+    static ON: StateHandle<Switch> = StateHandle::new::<On>("on");
     static TRUE: Definition<Switch> = Definition {
         body: Expr::Constant(ir::Value::boolean(true)),
         arguments: &[],
@@ -401,7 +423,7 @@ mod tests {
             panic!("exposure must not invoke hardware")
         }
     }
-    static TOGGLE: TransformerHandle<Switch, ()> = TransformerHandle::new::<Toggle>();
+    static TOGGLE: TransformerHandle<Switch, ()> = TransformerHandle::new::<Toggle>("toggle");
     static SURFACE: Surface<'static, Switch, ()> = Surface {
         states: &[&ON],
         transformers: &[&TOGGLE],
@@ -409,31 +431,34 @@ mod tests {
         invariants: &[&INVARIANT],
     };
 
-    fn reference<T>(out: &mut Vec<u8>, value: &T) {
-        out.extend_from_slice(&(core::ptr::from_ref(value) as usize as u64).to_le_bytes());
+    fn reference(out: &mut Vec<u8>, value: u64) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    fn inline(out: &mut Vec<u8>) {
+        reference(out, out.len() as u64);
     }
 
     #[test]
-    fn mathematical_surface_matches_wire_vector_across_fragment_boundaries() {
-        let mut expected = Vec::from(&b"LSF\x01"[..]);
-        expected.extend_from_slice(&[usize::BITS as u8, 1, 0, 1, 0, 1, 0, 1, 0]);
-        reference(&mut expected, ON.definition());
+    fn range_encoding() {
+        let mut expected = Vec::from(&b"LSF\x02"[..]);
+        expected.extend_from_slice(&[64, 1, 0, 1, 0, 1, 0, 1, 0]);
+        reference(&mut expected, ON.reference());
         expected.push(0); // Boolean state
-        reference(&mut expected, &TOGGLE);
-        reference(&mut expected, &TRUE);
+        reference(&mut expected, TOGGLE.reference());
+        inline(&mut expected);
         expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 1, 0, 0]); // signatures, true literal, no bound inputs
         expected.extend_from_slice(&[0, 0, 1, 0]); // effect arguments and one input
-        reference(&mut expected, ON.definition());
+        reference(&mut expected, ON.reference());
         expected.extend_from_slice(&[0, 1, 0]);
-        reference(&mut expected, ON.definition());
+        reference(&mut expected, ON.reference());
         expected.extend_from_slice(&[0, 1, 0, 4, 3, 0, 0]); // one output, Not(Input(0))
-        reference(&mut expected, &AXIOM);
-        reference(&mut expected, &TRUE);
+        inline(&mut expected);
+        inline(&mut expected);
         expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 1, 0, 0]);
-        reference(&mut expected, &INVARIANT);
-        reference(&mut expected, &REFERENCE);
+        inline(&mut expected);
+        inline(&mut expected);
         expected.extend_from_slice(&[0, 0, 0, 0, 10]);
-        reference(&mut expected, &TRUE);
+        inline(&mut expected);
         expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 1, 0, 0]);
         let description = Description::new(&SURFACE).unwrap();
         assert_eq!(description.len() as usize, expected.len());
@@ -450,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn literal_width_signedness_and_expression_control_remain_explicit() {
+    fn scalar_encoding() {
         for (value, expected) in [
             (ir::Value::boolean(false), &[0, 0, 0][..]),
             (
@@ -479,7 +504,7 @@ mod tests {
             &Expr::Input(3),
         );
         let mut expected = Vec::from(&[9, 1][..]);
-        reference(&mut expected, ON.definition());
+        reference(&mut expected, ON.reference());
         expected.extend_from_slice(&[0, 2, 2, 0, 3, 3, 0]);
         let mut bytes = [0; 64];
         let mut w = Writer {
@@ -494,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_rejects_unbounded_definitions_before_transmitting() {
+    fn encoding_bounds() {
         static CYCLE: Definition<Switch> = Definition {
             body: Expr::Reference(&CYCLE),
             arguments: &[],
@@ -511,9 +536,9 @@ mod tests {
             invariants: &[],
         };
         static BIG: Surface<'static, Switch, ()> = Surface {
-            states: &[&ON; 8192],
+            states: &[],
             transformers: &[],
-            axioms: &[],
+            axioms: &[&AXIOM; 4096],
             invariants: &[],
         };
         assert!(matches!(Description::new(&BAD), Err(EncodeError::TooDeep)));
@@ -521,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn range_reads_can_repeat_or_start_at_any_offset_without_retained_progress() {
+    fn range_bounds() {
         let description = Description::new(&SURFACE).unwrap();
         let mut whole = self::std::vec![0; description.len() as usize];
         assert_eq!(description.encode_part(0, &mut whole), whole.len());
@@ -537,5 +562,77 @@ mod tests {
             description.encode_part(description.len() + 1, &mut [0; 19]),
             0
         );
+    }
+
+    #[test]
+    fn binding_uniqueness() {
+        use self::std::boxed::Box;
+        for (states, transformers, valid) in [
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+        ] {
+            // Distinct declarations with the same durable name must not alias.
+            let on = Box::leak(Box::new(StateHandle::new::<On>("on")));
+            let toggle = Box::leak(Box::new(TransformerHandle::new::<Toggle>("toggle")));
+            let surface = Box::leak(Box::new(Surface {
+                states: if states {
+                    Box::leak(Box::new([&ON, &*on]))
+                } else {
+                    SURFACE.states
+                },
+                transformers: if transformers {
+                    Box::leak(Box::new([&TOGGLE, &*toggle]))
+                } else {
+                    SURFACE.transformers
+                },
+                axioms: &[],
+                invariants: &[],
+            }));
+            assert_eq!(
+                Description::new(surface).map(|_| ()),
+                if valid {
+                    Ok(())
+                } else {
+                    Err(EncodeError::DuplicateBinding)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn relocation_identity() {
+        use self::std::boxed::Box;
+        let mut previous = None;
+        for _ in 0..2 {
+            // Separately allocated native declarations and mathematical nodes.
+            // Relocation changes their addresses, never the encoded definition.
+            let on = Box::leak(Box::new(StateHandle::new::<On>("on")));
+            let toggle = Box::leak(Box::new(TransformerHandle::new::<Toggle>("toggle")));
+            let definition = Box::leak(Box::new(Definition {
+                arguments: &[],
+                inputs: &[],
+                body: Expr::Read(on.definition()),
+            }));
+            let axiom = Box::leak(Box::new(Predicate {
+                definition,
+                inputs: &[],
+            }));
+            let surface = Box::leak(Box::new(Surface {
+                states: Box::leak(Box::new([&*on])),
+                transformers: Box::leak(Box::new([&*toggle])),
+                axioms: Box::leak(Box::new([&*axiom])),
+                invariants: &[],
+            }));
+            let description = Description::new(surface).unwrap();
+            let mut bytes = self::std::vec![0; description.len() as usize];
+            description.encode_part(0, &mut bytes);
+            if let Some((address, old_bytes)) = previous {
+                assert_ne!(address, core::ptr::from_ref(on));
+                assert_eq!(old_bytes, bytes);
+            }
+            previous = Some((core::ptr::from_ref(on), bytes));
+        }
     }
 }

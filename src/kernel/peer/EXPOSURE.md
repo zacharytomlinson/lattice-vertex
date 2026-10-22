@@ -87,8 +87,9 @@ This identity is for immutable reads, not an exactly-once execution mechanism.
 
 Arrival and owner discovery now cross relays within the same eight-link bound.
 Channel formation remains link-local. Probabilistic delivery scoring, broadcast
-coverage optimization, content-addressed sharing, and installed-fragment delivery
-remain later extensions.
+coverage optimization and content-addressed sharing remain later extensions.
+[Program installation](../program/README.md) now shares owner routing; forward
+evaluation/activation delivery remains unimplemented.
 The network tag and matching responses are not authentication credentials.
 Startup arrival/query tags use local tick values, not durable boot identities.
 A rapid restart or reused token may be suppressed by retained history. Retries
@@ -159,13 +160,12 @@ not the advertised descriptions or a record for every vertex in the network.
 ## Mathematical description encoding
 
 `exposure.rs` encodes the pinned `lattice-ir` vocabulary. Numbers are little-endian;
-no native Rust struct layout is copied. A reference is the original declaration's
-address zero-extended to `u64`, scoped by the sending peer and firmware image.
-These are opaque remote references, never pointers to dereference locally and
-never proof of permission to invoke an operation. Native reader/invocation function
-pointers and current appliance values are not serialized.
+no native Rust struct layout is copied. Native state and transformer references
+are durable `u64` bindings scoped by the sending peer. They are not addresses or
+permission to invoke an operation. Native function pointers, binding-name strings
+and current appliance values are not serialized.
 
-The header is `4c 53 46 01` (`LSF`, version 1), sender pointer width in bits (`u8`),
+The header is `4c 53 46 02` (`LSF`, version 2), reference width (`u8`, always 64),
 then four `u16` counts: states, transformers, axioms, invariants. Records follow
 in that order, retaining the surface's declaration order:
 
@@ -173,15 +173,48 @@ in that order, retaining the surface's declaration order:
 | --- | --- |
 | State/attribute reference | Declaration reference, scalar type |
 | Transformer | Native handle reference, precondition predicate, effect |
-| Axiom/invariant | Predicate declaration reference, predicate |
+| Axiom/invariant | Inline predicate reference, predicate |
 | Predicate | Definition, list of bound input attributes |
 | Definition | Definition reference, argument-type list, symbolic-input-type list, body expression |
 | Effect | Argument-type list, input-attribute list, output-attribute list, result-expression list |
 
 Every list begins with its `u16` count. Attribute references include their types,
-including those reached through predicates/effects. Shared definition references
-retain their declaration address and include the referenced body inline. There
-is no assigned-ID table, copied local state, or allocated serialization graph.
+including those reached through predicates/effects. Mathematical definition and
+predicate references equal the byte offset of their own reference field within
+this description. Their bodies remain inline; repeated occurrences get their own
+offsets. These offsets identify encoded occurrences, not callable or persistent
+appliance bindings. No pointer or assigned-ID table is needed. The native binding
+references and complete encoded bytes survive address relocation; reordering
+declarations or changing mathematics can still change the description/fingerprint.
+LSF v1 consumers must be updated to v2. Radio LVT v7 and host v4 envelopes retain
+their layouts; old address-based native requests no longer select these bindings.
+
+### Durable declaration names
+
+Declare hardware bindings with permanent names, for example
+`StateHandle::new::<Power>("power")` and
+`TransformerHandle::new::<SetPower>("set-power")`. These constructor arguments
+are evaluated at compile time in static declarations; only the resulting eight
+bytes are retained. Renaming a Rust type or moving a declaration does not change
+the binding. Repurposing it for another physical meaning requires a new name.
+There is no global naming registry; names belong to one appliance owner.
+
+The reference's upper two bits distinguish native state (1), transformer (2) and
+retained state (3). Its lower 62 bits are FNV-1a-64 over the UTF-8 name, one NUL
+separator, and a little-endian `u16` member. Native members are zero. A retained
+definition supplies its own permanent name; sample members are their ages and
+the result member is `65535`, independent of capacity. The all-ones reference is
+reserved and maps to all-ones minus one. Empty names and embedded NULs reject
+construction. This is identity encoding, not authentication or a security hash.
+
+References are stored with the state/function declaration. Native reads, calls
+and deltas use that same value. Duplicate references, including hash collisions,
+are rejected before startup or retained-state installation; no ambiguous first
+match is allowed. Existing type checks still apply. Stable identity does not prove
+that new firmware implements the same mathematics, and persistent program
+reconstruction remains separate work.
+
+### Expression vocabulary
 
 Scalar types: 0 Boolean; 1–4 unsigned 8/16/32/64; 5–8 signed 8/16/32/64. A literal
 contains its scalar type then its value: Boolean 0/1 in one byte, or the integer's

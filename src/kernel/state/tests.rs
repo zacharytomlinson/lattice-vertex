@@ -34,8 +34,8 @@ impl State for Level {
         a.get()
     }
 }
-static SOURCE: StateHandle<Device> = StateHandle::new::<Level>();
-static ALIAS: StateHandle<Device> = StateHandle::new::<Level>();
+static SOURCE: StateHandle<Device> = StateHandle::new::<Level>("source");
+static ALIAS: StateHandle<Device> = StateHandle::new::<Level>("alias");
 static INPUTS: [&ir::Attribute<Read<Device>>; 1] = [SOURCE.definition()];
 static SURFACE: Surface<Device, ()> = Surface {
     states: &[&SOURCE],
@@ -59,8 +59,8 @@ fn leak<T>(v: T) -> &'static T {
 fn difference(h: &History<u8, 2>) -> Option<i16> {
     Some(i16::from(h.value(0)?) - i16::from(h.value(1)?))
 }
-fn reference<T>(v: &T) -> u64 {
-    ptr::from_ref(v) as usize as u64
+fn reference(v: &ir::Attribute<Read<Device>>) -> u64 {
+    v.location.reference()
 }
 fn value(v: u8) -> Option<Value> {
     Some(v.into_value())
@@ -78,7 +78,7 @@ impl Fixture {
         Self {
             context: unsafe { TaskContext::assume() },
             owner: leak(Appliance::new(&SURFACE)),
-            state: leak(RetainedState::new(&SOURCE)),
+            state: leak(RetainedState::new("history", &SOURCE)),
         }
     }
     fn initialize(&self) {
@@ -198,17 +198,26 @@ fn installation_admission() {
     }
     let f = Fixture::new();
     f.initialize();
-    let hidden = leak(RetainedState::new(&ALIAS));
+    let hidden = leak(RetainedState::new("hidden", &ALIAS));
     assert_eq!(
         f.owner.install_state(&f.context, hidden, difference, &RULE),
         Err(InstallError::UnknownSource)
     );
-    let wrong = leak(RetainedState::<Device, i16, i16, 2>::new(&SOURCE));
+    let wrong = leak(RetainedState::<Device, i16, i16, 2>::new("wrong", &SOURCE));
     assert_eq!(
         f.owner.install_state(&f.context, wrong, |_| None, &RULE),
         Err(InstallError::Type)
     );
     assert_eq!(f.owner.installations().count(), 0);
+    f.install().unwrap();
+    let duplicate = leak(RetainedState::new("history", &SOURCE));
+    assert_eq!(
+        f.owner
+            .install_state(&f.context, duplicate, difference, &RULE),
+        Err(InstallError::DuplicateBinding)
+    );
+    assert!(duplicate.node().is_none());
+    assert_eq!(f.owner.installations().count(), 1);
 }
 
 #[test]
@@ -270,7 +279,7 @@ fn instance_ownership() {
     let f = Fixture::new();
     f.initialize();
     f.install().unwrap();
-    let second = leak(RetainedState::new(&SOURCE));
+    let second = leak(RetainedState::new("second", &SOURCE));
     f.owner
         .install_state(&f.context, second, difference, &RULE)
         .unwrap();

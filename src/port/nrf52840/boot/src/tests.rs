@@ -11,7 +11,8 @@ const LAYOUT: Layout = Layout {
     active_start: 0x3000,
     dfu_start: 0x6000,
     journal_start: 0xa000,
-    end: 0xc000,
+    configuration_start: 0xc000,
+    end: 0xe000,
 };
 
 #[derive(Clone)]
@@ -115,7 +116,7 @@ fn original(flash: &Flash) -> Vec<u8> {
 #[test]
 fn layout_and_staging_boundaries() {
     assert!(layout::XIAO.valid());
-    assert_eq!(layout::XIAO.image_capacity(), 372 * 1024);
+    assert_eq!(layout::XIAO.image_capacity(), 364 * 1024);
     for (valid, crc, length, allowed) in [
         (1u16, 0x1234u16, 2804u32, true),
         (1, 0x1234, 0x8000, true),
@@ -178,6 +179,8 @@ fn layout_and_staging_boundaries() {
 fn trial_confirmation_and_reversion() {
     for confirm in [false, true] {
         let flash = Flash::new();
+        flash.0.borrow_mut().bytes[LAYOUT.configuration_start as usize..LAYOUT.end as usize]
+            .fill(0x5a);
         let old = original(&flash);
         let bytes = image(0xa5);
         let mut storage = stage(flash.clone(), &bytes);
@@ -192,6 +195,11 @@ fn trial_confirmation_and_reversion() {
         assert_eq!(&flash.active()[..bytes.len()], &bytes);
         let mut trial = ImageStorage::new(flash.clone(), LAYOUT).unwrap();
         assert_eq!(trial.begin(128), Err(Error::TrialPending));
+        let mut config = trial.configuration().unwrap();
+        let mut retained = [0; 4];
+        config.read(0, &mut retained).unwrap();
+        assert_eq!(retained, [0x5a; 4]);
+        assert!(config.erase(0, PAGE_SIZE).is_err());
         if confirm {
             trial.confirm().unwrap();
         }
@@ -203,7 +211,38 @@ fn trial_confirmation_and_reversion() {
         } else {
             assert_eq!(flash.active(), old);
         }
+        assert!(
+            flash.0.borrow().bytes[LAYOUT.configuration_start as usize..LAYOUT.end as usize]
+                .iter()
+                .all(|b| *b == 0x5a)
+        );
     }
+}
+
+#[test]
+fn configuration_region() {
+    let flash = Flash::new();
+    let mut storage = ImageStorage::new(flash.clone(), LAYOUT).unwrap();
+    storage.journal_erase(0).unwrap();
+    assert_eq!(storage.journal_erase(2), Err(Error::Bounds));
+    let before = flash.0.borrow().bytes.clone();
+    let mut region = storage.configuration().unwrap();
+    let mut config = lattice_storage::configuration::Configuration::open(&mut region).unwrap();
+    config.begin(4).unwrap();
+    while !config.erase_next_page(&mut region).unwrap() {}
+    config.write(&mut region, 0, b"data").unwrap();
+    config.commit(&mut region).unwrap();
+    drop(storage);
+    let mut storage = ImageStorage::new(flash.clone(), LAYOUT).unwrap();
+    let mut region = storage.configuration().unwrap();
+    let config = lattice_storage::configuration::Configuration::open(&mut region).unwrap();
+    let mut bytes = [0; 4];
+    config.read(&mut region, 0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"data");
+    assert_eq!(
+        &flash.0.borrow().bytes[..LAYOUT.configuration_start as usize],
+        &before[..LAYOUT.configuration_start as usize]
+    );
 }
 
 #[test]

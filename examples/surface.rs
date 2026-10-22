@@ -33,8 +33,8 @@ impl State for Level {
     }
 }
 
-static POWER: StateHandle<Lamp> = StateHandle::new::<Power>();
-static LEVEL: StateHandle<Lamp> = StateHandle::new::<Level>();
+static POWER: StateHandle<Lamp> = StateHandle::new::<Power>("power");
+static LEVEL: StateHandle<Lamp> = StateHandle::new::<Level>("level");
 const ZERO: Value = match Value::integer(Integer::U8, 0) {
     Ok(value) => value,
     Err(_) => panic!("invalid literal"),
@@ -119,7 +119,7 @@ impl StateTransformer for Set {
     }
 }
 
-static SET: TransformerHandle<Lamp, InvalidSetting> = TransformerHandle::new::<Set>();
+static SET: TransformerHandle<Lamp, InvalidSetting> = TransformerHandle::new::<Set>("set");
 static SURFACE: Surface<'static, Lamp, InvalidSetting> = Surface {
     states: &[&POWER, &LEVEL],
     transformers: &[&SET],

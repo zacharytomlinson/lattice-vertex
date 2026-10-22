@@ -1,6 +1,6 @@
 # Native invocation and observed state
 
-This is the basic installation path: an ordinary tablet daemon peer addresses an
+In the basic vertices-and-tablet tier, an ordinary tablet daemon peer addresses an
 appliance's exposed native transformer; the kernel invokes it and communicates
 subsequent established state changes. No nucleus, solver, IR interpreter, learned
 surface, or compiled-fragment runtime is required. Any peer can also read one
@@ -11,10 +11,11 @@ The host event buffer is bounded and reports oldest-event eviction separately
 from command results; it does not guarantee RF delivery or retain state history.
 
 This is native control, not distributed program installation. The callback-based
-fragment prototype and its transport buffer have been removed. The compiler's
-resident predicates, upstream/conditional edges and per-traversal storage remain
-[design work](../../../docs/KERNEL_DIRECTION.md#immediate-design-work).
-Experimental LVT v7 opcodes 19/20 and result statuses 6/7 are retired and rejected;
+fragment prototype and its transport buffer have been removed. Resident records
+now load and wire through the [program component](../program/README.md); upstream
+activation, forward execution and per-traversal storage remain
+[execution work](../../../docs/KERNEL_DIRECTION.md#next-implementation-milestone).
+Experimental LVT v7 opcodes 19/20 and native invocation result statuses 6/7 are retired and rejected;
 do not reuse them for different semantics within this wire version. Native
 invocation opcodes 8/9, statuses 0–5, and host-v4 encoding are unchanged.
 

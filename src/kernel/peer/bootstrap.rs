@@ -79,6 +79,8 @@ fn consider(content: Content<'_>, proposal: &mut Option<Network>) -> Option<Netw
             None
         }
         Content::Discover
+        | Content::Program { .. }
+        | Content::ProgramResult { .. }
         | Content::ReadSurface { .. }
         | Content::SurfacePart { .. }
         | Content::FindOwners { .. }

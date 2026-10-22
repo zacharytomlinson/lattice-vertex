@@ -16,7 +16,7 @@ use embassy_boot::{AlignedBuffer, BlockingFirmwareState, BootLoader, BootLoaderC
 use embassy_embedded_hal::flash::partition::BlockingPartition;
 use embassy_sync::blocking_mutex::{raw::NoopRawMutex, Mutex};
 use embedded_storage::nor_flash::{NorFlash, NorFlashError, NorFlashErrorKind};
-use lattice_image_storage::{Candidate, Error as StorageError};
+use lattice_storage::{Candidate, Error as StorageError};
 use layout::{Layout, PAGE_SIZE, WRITE_SIZE};
 
 pub use embassy_boot::State as BootState;
@@ -210,7 +210,23 @@ impl<F: NorFlash> ImageStorage<F> {
             .map_err(Into::into)
     }
     pub fn journal_capacity(&self) -> u32 {
-        self.layout.end - self.layout.journal_start
+        self.layout.configuration_start - self.layout.journal_start
+    }
+    /// Borrow the protected region through the existing flash owner. Boot swap,
+    /// image staging and transfer-journal methods never address this region.
+    pub fn configuration(&mut self) -> Result<lattice_storage::region::Region<'_, F>, Error> {
+        let read_only = self.selected || self.boot == State::Swap;
+        let region = lattice_storage::region::Region::new(
+            self.flash.get_mut().get_mut(),
+            self.layout.configuration_start,
+            self.layout.end - self.layout.configuration_start,
+        )
+        .map_err(Error::Flash)?;
+        Ok(if read_only {
+            region.read_only()
+        } else {
+            region
+        })
     }
     pub fn journal_read(&mut self, offset: u32, data: &mut [u8]) -> Result<(), Error> {
         if offset

@@ -14,6 +14,7 @@ pub struct Layout {
     pub active_start: u32,
     pub dfu_start: u32,
     pub journal_start: u32,
+    pub configuration_start: u32,
     pub end: u32,
 }
 
@@ -27,14 +28,17 @@ impl Layout {
             && self.state_start < self.active_start
             && self.active_start < self.dfu_start
             && self.dfu_start < self.journal_start
-            && self.journal_start < self.end
+            && self.journal_start < self.configuration_start
+            && self.configuration_start < self.end
             && self.end <= FLASH_END
             && self.loader_start.is_multiple_of(PAGE_SIZE)
             && self.state_start.is_multiple_of(PAGE_SIZE)
             && self.active_start.is_multiple_of(PAGE_SIZE)
             && self.dfu_start.is_multiple_of(PAGE_SIZE)
             && self.journal_start.is_multiple_of(PAGE_SIZE)
+            && self.configuration_start.is_multiple_of(PAGE_SIZE)
             && self.end.is_multiple_of(PAGE_SIZE)
+            && (self.end - self.configuration_start).is_multiple_of(2 * PAGE_SIZE)
             && self.journal_start - self.dfu_start >= self.image_capacity() + PAGE_SIZE
             && (2 + 4 * (self.image_capacity() / PAGE_SIZE)) * WRITE_SIZE as u32
                 <= self.active_start - self.state_start
@@ -55,15 +59,39 @@ impl Layout {
 }
 
 /// Preserve the factory MBR/SoftDevice below 0x27000 and recovery/storage at 0xED000.
-/// Loader 32 KiB, boot state 4 KiB, active 372 KiB, DFU 376 KiB, update journal 8 KiB.
+/// Layout 3: loader 32 KiB, boot state 4 KiB, active 364 KiB, DFU 368 KiB,
+/// update journal 8 KiB, protected local configuration 16 KiB.
 pub const XIAO: Layout = Layout {
     loader_start: 0x27000,
     state_start: 0x2f000,
     active_start: 0x30000,
-    dfu_start: 0x8d000,
-    journal_start: 0xeb000,
+    dfu_start: 0x8b000,
+    journal_start: 0xe7000,
+    configuration_start: 0xe9000,
     end: 0xed000,
 };
+
+/// Immutable loader descriptor at a fixed location. The application checks it
+/// before flash access; an old loader could otherwise swap through configuration.
+pub const DESCRIPTOR_ADDRESS: u32 = XIAO.state_start - 64;
+pub const DESCRIPTOR: [u32; 16] = [
+    0x54414c4c,
+    3,
+    XIAO.loader_start,
+    XIAO.state_start,
+    XIAO.active_start,
+    XIAO.dfu_start,
+    XIAO.journal_start,
+    XIAO.configuration_start,
+    XIAO.end,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
 
 /// The factory loader checks this many bytes from 0x27000 on every reset.
 /// Only a valid application with a disabled CRC or an immutable-loader-only

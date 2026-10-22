@@ -36,6 +36,8 @@ pub enum InstallError {
     Type,
     /// The supplied mathematical predicate has an invalid input signature.
     Definition,
+    /// Two exposed states have the same durable binding reference.
+    DuplicateBinding,
 }
 
 /// Static storage for an appliance's native state and mathematical surface.
@@ -62,6 +64,7 @@ unsafe impl<A: Send + Sync, E> Sync for Appliance<A, E> {}
 impl<A: Send + Sync, E> Appliance<A, E> {
     /// Reserve native storage without an allocator or caller-supplied mutex.
     pub const fn new(surface: &'static Surface<'static, A, E>) -> Self {
+        assert!(surface.unique_bindings(), "duplicate appliance binding");
         assert!(
             surface.states.len() <= crate::configLATTICE_NATIVE_STATES,
             "native state capacity"
@@ -211,6 +214,19 @@ impl<A: Send + Sync, E> Appliance<A, E> {
             {
                 return Err(InstallError::UnknownSource);
             }
+            for (index, candidate) in state.states().enumerate() {
+                let reference = candidate.location.reference();
+                if self
+                    .state_definitions()
+                    .any(|s| s.location.reference() == reference && !ptr::eq(s, candidate))
+                    || state
+                        .states()
+                        .take(index)
+                        .any(|s| s.location.reference() == reference)
+                {
+                    return Err(InstallError::DuplicateBinding);
+                }
+            }
             let next = unsafe { self.installed.load(Ordering::Acquire).as_ref() };
             let node = state.install(
                 ptr::from_ref(appliance).cast_mut(),
@@ -308,9 +324,42 @@ pub(crate) trait Native: Sync {
     fn owns(&self, instance: *const (), attribute: u64) -> bool;
     fn read(&self, context: &TaskContext, attribute: u64) -> StateReadResult;
     fn invoke(&self, context: &TaskContext, transformer: u64, arguments: &[Value]) -> InvokeStatus;
+    fn state_binding(
+        &self,
+        _reference: u64,
+    ) -> Option<(crate::ir::Type, &core::sync::atomic::AtomicU16)> {
+        None
+    }
+    fn transformer_signature(&self, _reference: u64) -> Option<&[crate::ir::Type]> {
+        None
+    }
+    fn clear_dependencies(&self) {}
 }
 
 impl<A: Send + Sync, E> Native for Appliance<A, E> {
+    fn state_binding(
+        &self,
+        reference: u64,
+    ) -> Option<(crate::ir::Type, &core::sync::atomic::AtomicU16)> {
+        self.state_definitions()
+            .find(|s| s.location.reference() == reference)
+            .map(|s| (s.ty, &s.location.dependencies))
+    }
+    fn transformer_signature(&self, reference: u64) -> Option<&[crate::ir::Type]> {
+        self.surface
+            .transformers
+            .iter()
+            .find(|t| t.reference() == reference)
+            .map(|t| t.definition().effect.arguments)
+    }
+    fn clear_dependencies(&self) {
+        for state in self.state_definitions() {
+            state
+                .location
+                .dependencies
+                .store(u16::MAX, Ordering::Release);
+        }
+    }
     fn ready(&self) -> bool {
         self.ready.load(Ordering::Acquire) & 2 == 2
     }
@@ -321,7 +370,7 @@ impl<A: Send + Sync, E> Native for Appliance<A, E> {
         self.instance.load(Ordering::Acquire).cast_const() == instance
             && self
                 .state_definitions()
-                .any(|s| ptr::from_ref(s) as usize as u64 == attribute)
+                .any(|s| s.location.reference() == attribute)
     }
     fn acquire(&self, context: &TaskContext) {
         self.sample(context);
@@ -334,7 +383,7 @@ impl<A: Send + Sync, E> Native for Appliance<A, E> {
             .surface
             .states
             .iter()
-            .position(|s| ptr::from_ref(s.definition()) as usize as u64 == attribute)
+            .position(|s| s.reference() == attribute)
         {
             let Some(samples) = self.observations().try_lock(context) else {
                 return StateReadResult::Busy;
@@ -347,7 +396,7 @@ impl<A: Send + Sync, E> Native for Appliance<A, E> {
         let Some(state) = self
             .installations()
             .flat_map(|i| i.states())
-            .find(|s| ptr::from_ref(*s) as usize as u64 == attribute)
+            .find(|s| s.location.reference() == attribute)
         else {
             return StateReadResult::UnknownAttribute;
         };
@@ -369,7 +418,7 @@ impl<A: Send + Sync, E> Native for Appliance<A, E> {
             .surface
             .transformers
             .iter()
-            .find(|h| ptr::from_ref(**h) as usize as u64 == transformer)
+            .find(|h| h.reference() == transformer)
         else {
             return InvokeStatus::UnknownTransformer;
         };

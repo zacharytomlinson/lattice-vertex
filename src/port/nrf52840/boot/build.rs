@@ -10,9 +10,11 @@ fn main() {
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     let l = layout::XIAO;
     std::fs::write(out.join("memory.x"), format!(
-        "MEMORY {{ FLASH : ORIGIN = {:#x}, LENGTH = {:#x}\nRAM : ORIGIN = {:#x}, LENGTH = 256K }}\n_stack_start = ORIGIN(RAM) + LENGTH(RAM);\n",
-        l.loader_start, l.state_start - l.loader_start, layout::RAM_START,
+        "MEMORY {{ FLASH : ORIGIN = {:#x}, LENGTH = {:#x}\nLAYOUT : ORIGIN = {:#x}, LENGTH = 64\nRAM : ORIGIN = {:#x}, LENGTH = 256K }}\n_stack_start = ORIGIN(RAM) + LENGTH(RAM);\n",
+        l.loader_start, layout::DESCRIPTOR_ADDRESS - l.loader_start, layout::DESCRIPTOR_ADDRESS, layout::RAM_START,
     )).unwrap();
+    std::fs::write(out.join("layout.x"), "SECTIONS { .lattice_layout : { KEEP(*(.lattice_layout)); } > LAYOUT } INSERT AFTER .rodata;\n").unwrap();
     println!("cargo:rustc-link-search={}", out.display());
     println!("cargo:rustc-link-arg-bin=lattice-nrf52840-loader=-Tlink.x");
+    println!("cargo:rustc-link-arg-bin=lattice-nrf52840-loader=-Tlayout.x");
 }

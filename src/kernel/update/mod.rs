@@ -12,7 +12,6 @@ pub mod package;
 ))]
 pub(crate) mod runtime;
 pub(crate) mod staging;
-mod startup;
 #[cfg(any(
     all(feature = "port-nrf52840", feature = "nrf52840-update"),
     all(feature = "port-esp32c6", feature = "esp32c6-update")
@@ -51,7 +50,8 @@ pub trait Storage {
 /// expanding this shared format to other page sizes requires an explicit revision.
 pub const PAGE_BYTES: u32 = 4096;
 
-/// Fingerprint the supplied firmware definitions, including their local handles.
+/// Fingerprint the supplied mathematical definitions and durable native bindings.
+/// Compatible relocation preserves this value; definition order remains encoded.
 /// Packaging must preserve this surface in the candidate for this initial ABI.
 /// Appliances with installed state must use `appliance_surface_identity` to
 /// include that state in the fingerprint checked at startup.
@@ -77,20 +77,11 @@ pub fn appliance_surface_identity<A: Send + Sync + 'static, E: 'static>(
 }
 
 fn description_identity(description: crate::kernel::peer::exposure::Description) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut hash = Sha256::new();
-    let mut part = [0; 64];
-    let mut offset = 0;
-    while offset < description.len() {
-        let n = description.encode_part(offset, &mut part);
-        hash.update(&part[..n]);
-        offset += n as u16;
-    }
-    hash.finalize().into()
+    description.identity()
 }
 
 pub struct Receiver<S: Storage> {
-    storage: S,
+    pub(crate) storage: S,
     policy: Policy,
     header: Option<Header>,
     phase: Phase,

@@ -44,7 +44,7 @@ host-link = ["lattice-peer-wire/host", "use-mutexes"]
 # Port storage/boot integration, optionally consumed by the common signed updater.
 nrf52840-update = ["port-nrf52840", "dep:lattice-nrf52840-boot"]
 esp32c6-update = ["port-esp32c6", "dep:lattice-c6-boot", "dep:esp-storage", "dep:esp-bootloader-esp-idf"]
-firmware-update = ["dep:ed25519-dalek", "dep:sha2", "dep:lattice-image-storage", "dep:embedded-storage"]
+firmware-update = ["dep:ed25519-dalek"]
 
 # Architecture width for BaseType_t, UBaseType_t, StackType_t
 arch-32bit = []
@@ -125,9 +125,9 @@ tickless-idle = []            # configUSE_TICKLESS_IDLE
 
 [dependencies]
 ed25519-dalek = { version = "=2.2.0", default-features = false, optional = true }
-sha2 = { version = "=0.10.9", default-features = false, optional = true }
-lattice-image-storage = { path = "src/kernel/update/storage", optional = true }
-embedded-storage = { version = "=0.3.1", optional = true }
+sha2 = { version = "=0.10.9", default-features = false }
+lattice-storage = { path = "src/kernel/storage" }
+embedded-storage = { version = "=0.3.1" }
 lattice-peer-wire = { path = "src/kernel/peer/wire" }
 lattice-nrf52840-boot = { path = "src/port/nrf52840/boot", optional = true }
 lattice-c6-boot = { path = "src/port/esp32c6/boot", optional = true }

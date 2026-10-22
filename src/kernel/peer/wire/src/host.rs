@@ -58,6 +58,16 @@ impl Arguments {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Packet {
+    Program {
+        token: u32,
+        owner: u64,
+        data: Bytes<{ crate::program::transfer::REQUEST_BYTES }>,
+    },
+    ProgramResult {
+        token: u32,
+        owner: u64,
+        data: Bytes<{ crate::program::transfer::REPLY_BYTES }>,
+    },
     UpdateControl {
         token: u32,
         action: crate::update::Control,
@@ -157,6 +167,8 @@ impl Packet {
         match self {
             Self::Changed { .. } | Self::ChangesLost { .. } => 0,
             Self::Status { token }
+            | Self::Program { token, .. }
+            | Self::ProgramResult { token, .. }
             | Self::UpdateControl { token, .. }
             | Self::UpdateControlResult { token, .. }
             | Self::Update { token, .. }
@@ -177,6 +189,7 @@ impl Packet {
         matches!(
             self,
             Self::Status { .. }
+                | Self::Program { .. }
                 | Self::UpdateControl { .. }
                 | Self::Update { .. }
                 | Self::ReadLinks { .. }
@@ -191,6 +204,18 @@ impl Packet {
         body[0] = VERSION;
         body[2..6].copy_from_slice(&self.token().to_le_bytes());
         let len = match self {
+            Self::Program { owner, data, .. } => {
+                body[1] = 7;
+                body[6..14].copy_from_slice(&owner.to_le_bytes());
+                body[14..14 + data.as_slice().len()].copy_from_slice(data.as_slice());
+                14 + data.as_slice().len()
+            }
+            Self::ProgramResult { owner, data, .. } => {
+                body[1] = 0x87;
+                body[6..14].copy_from_slice(&owner.to_le_bytes());
+                body[14..14 + data.as_slice().len()].copy_from_slice(data.as_slice());
+                14 + data.as_slice().len()
+            }
             Self::UpdateControl { action, .. } => {
                 body[1] = 6;
                 body[6] = action as u8;
@@ -461,6 +486,22 @@ fn decode_body(b: &[u8]) -> Option<Packet> {
     let token = u32::from_le_bytes(b[2..6].try_into().ok()?);
     let value = |at| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
     Some(match (b[1], b.len()) {
+        (7, 15..=70) => {
+            crate::program::transfer::Request::decode(&b[14..])?;
+            Packet::Program {
+                token,
+                owner: value(6),
+                data: Bytes::new(&b[14..])?,
+            }
+        }
+        (0x87, 26..=74) => {
+            crate::program::transfer::Reply::decode(&b[14..])?;
+            Packet::ProgramResult {
+                token,
+                owner: value(6),
+                data: Bytes::new(&b[14..])?,
+            }
+        }
         (6, 7) => Packet::UpdateControl {
             token,
             action: crate::update::Control::decode(b[6])?,
@@ -638,7 +679,30 @@ mod tests {
             data: &[255; crate::update::DATA_BYTES],
         }
         .encode(&mut update);
+        let mut program = [0; crate::program::transfer::REQUEST_BYTES];
+        let pn = crate::program::transfer::Request::Data {
+            transfer: 1,
+            offset: 0,
+            bytes: &[0xff; crate::program::transfer::DATA_BYTES],
+        }
+        .encode(&mut program);
+        let mut result = [0; crate::program::transfer::REPLY_BYTES];
+        let rn = crate::program::transfer::Reply {
+            bytes: &[0xff; crate::program::transfer::DATA_BYTES],
+            ..crate::program::transfer::Reply::status(crate::program::transfer::Status::Ok)
+        }
+        .encode(&mut result);
         let records = [
+            Packet::Program {
+                token: 10,
+                owner: 19,
+                data: Bytes::new(&program[..pn]).unwrap(),
+            },
+            Packet::ProgramResult {
+                token: 10,
+                owner: 19,
+                data: Bytes::new(&result[..rn]).unwrap(),
+            },
             Packet::Update {
                 token: 9,
                 owner: 19,

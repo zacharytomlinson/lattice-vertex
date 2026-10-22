@@ -17,6 +17,10 @@ pub fn image_storage(
         return Err(Error::Layout);
     }
     if layout == self::layout::XIAO {
+        let descriptor = unsafe { &*(self::layout::DESCRIPTOR_ADDRESS as *const [u32; 16]) };
+        if *descriptor != self::layout::DESCRIPTOR {
+            return Err(Error::Layout);
+        }
         // Adafruit/Seeed settings: bank validity, CRC16, padding, image length.
         // Refuse writes while factory CRC still covers mutable application data.
         let settings = unsafe { &*(0xff000 as *const [u8; 12]) };

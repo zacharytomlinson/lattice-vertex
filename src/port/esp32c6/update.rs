@@ -30,6 +30,7 @@ pub fn image_storage(flash: esp_hal::peripherals::FLASH<'_>) -> Result<ImageStor
     let mut images = [None; 2];
     let mut ota_data = None;
     let mut journal = None;
+    let mut configuration = None;
     for (i, entry) in table.iter().enumerate() {
         let end = entry
             .offset()
@@ -44,7 +45,12 @@ pub fn image_storage(flash: esp_hal::peripherals::FLASH<'_>) -> Result<ImageStor
                 return Err(Error::Layout);
             }
         }
-        let destination = if entry.label_as_str() == "lattice_update" {
+        let destination = if entry.label_as_str() == "lattice_config" {
+            if entry.raw_type() != 1 || entry.raw_subtype() != 0x41 {
+                return Err(Error::Layout);
+            }
+            &mut configuration
+        } else if entry.label_as_str() == "lattice_update" {
             if entry.raw_type() != 1 || entry.raw_subtype() != 0x40 {
                 return Err(Error::Layout);
             }
@@ -68,6 +74,7 @@ pub fn image_storage(flash: esp_hal::peripherals::FLASH<'_>) -> Result<ImageStor
     }
     let layout = Layout {
         journal,
+        configuration: Some(configuration.ok_or(Error::Layout)?),
         ota_data: ota_data.ok_or(Error::Layout)?,
         images: [
             images[0].ok_or(Error::Layout)?,

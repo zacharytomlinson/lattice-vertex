@@ -6,7 +6,7 @@ selection records. It contains no vendor RTOS, radio, or bootloader copy. The
 OTA slots and metadata reservation, and identifies the running slot through the
 MMU mapping. Flash encryption is not supported by this first backend.
 
-The common [storage crate](../../../kernel/update/storage/README.md) owns chunk
+The common [storage crate](../../../kernel/storage/README.md) owns chunk
 writes and incremental SHA-256 checking. `verify_step` bounds image bytes per call;
 `verify_image` is its synchronous convenience wrapper. Selection reuses the
 completed digest while the candidate region remains unchanged. Resume, erases
@@ -45,6 +45,11 @@ capture details and timings are preserved in the external lab.
 The API is local boot machinery. The optional `kernel::update` service adds signed
 packages, download resume, and radio transfer above it. Its validated partition
 table reservation `lattice_update` (data subtype `0x40`) supplies the 8 KiB journal.
+Layout 3 adds `lattice_config` (data subtype `0x41`), 16 KiB at `0x212000`.
+The port validates its bounds/disjointness and lends it through `configuration()`;
+unconfirmed trials and selected updates receive a read-only view. Image selection,
+staging and journal writes cannot reach it. Host checks cover the reservation and
+committed-copy storage; this layout has not yet been provisioned on hardware.
 The common updater now applies measured-cost, local-activity and neighbor deferral
 before automatic activation. Startup confirmation and hardware watchdog recovery
 are now implemented, with the documented esp-hal initialization handoff gap.
@@ -57,7 +62,8 @@ cargo +stable test --lib --locked
 
 Watchdog handoff and automatic local startup confirmation now use the common
 [updater startup path](../../../../docs/FIRMWARE_UPDATES.md#watchdog-backed-startup-confirmation).
-Provision the new loader before relying on trial-entry protection. No flash
-boundaries change. The port reserves its watchdog, and kernel task progress
+Provision the loader and layout-3 partition table together. OTA image boundaries
+remain unchanged; the new configuration partition lies beyond the journal.
+The port reserves its watchdog, and kernel task progress
 reloads it after startup; no tick ISR or appliance callback needs to feed it.
 A confirmed image remains confirmed after a later watchdog reset.

@@ -6,6 +6,10 @@ use std::{cell::RefCell, rc::Rc, vec, vec::Vec};
 
 const LAYOUT: Layout = Layout {
     journal: None,
+    configuration: Some(Region {
+        offset: 0x32000,
+        length: 0x2000,
+    }),
     ota_data: Region {
         offset: 0xe000,
         length: 0x2000,
@@ -39,6 +43,7 @@ impl Flash {
             }
         }
         bytes[0x10000..0x20000].fill(0x55); // running-image sentinel
+        bytes[0x32000..0x34000].fill(0x5a); // configuration sentinel
         Self(Rc::new(RefCell::new(Memory {
             bytes,
             writes: 0,
@@ -176,6 +181,11 @@ fn pending_trial_cannot_destroy_rollback_and_confirmation_updates_only_running_r
     ));
     let mut storage = ImageStorage::new(flash.clone(), LAYOUT, 1).unwrap();
     assert_eq!(storage.begin(521), Err(Error::TrialPending));
+    let mut config = storage.configuration().unwrap();
+    let mut retained = [0; 4];
+    config.read(0, &mut retained).unwrap();
+    assert_eq!(retained, [0x5a; 4]);
+    assert!(config.erase(0, SECTOR_SIZE).is_err());
     assert_eq!(flash.0.borrow().bytes, before);
     storage.confirm().unwrap();
     assert_eq!(storage.boot_state(), BootState::Valid);
@@ -244,6 +254,9 @@ fn staging_bounds_duplicates_and_image_validation() {
     assert!(flash.0.borrow().bytes[0x10000..0x20000]
         .iter()
         .all(|&b| b == 0x55));
+    assert!(flash.0.borrow().bytes[0x32000..0x34000]
+        .iter()
+        .all(|b| *b == 0x5a));
     for index in [0, 1, 12, 23] {
         let mut bad = image();
         bad[index] = 0xff;
@@ -261,4 +274,39 @@ fn staging_bounds_duplicates_and_image_validation() {
         ImageStorage::new(Flash::new([valid(1), None]), overlapping, 0),
         Err(Error::Layout)
     ));
+    for (offset, length) in [
+        (0xe000, 0x2000),
+        (0x10000, 0x2000),
+        (0x20000, 0x2000),
+        (0x31000, 0x1000),
+        (0x3f000, 0x2000),
+    ] {
+        let bad = Layout {
+            configuration: Some(Region { offset, length }),
+            ..LAYOUT
+        };
+        assert!(!bad.valid(0x40000));
+    }
+}
+
+#[test]
+fn configuration_region() {
+    let flash = Flash::new([valid(1), None]);
+    let before = flash.0.borrow().bytes.clone();
+    let mut storage = ImageStorage::new(flash.clone(), LAYOUT, 0).unwrap();
+    let mut region = storage.configuration().unwrap();
+    let mut config = lattice_storage::configuration::Configuration::open(&mut region).unwrap();
+    config.begin(4).unwrap();
+    while !config.erase_next_page(&mut region).unwrap() {}
+    config.write(&mut region, 0, b"data").unwrap();
+    config.commit(&mut region).unwrap();
+    drop(storage);
+    let mut storage = ImageStorage::new(flash.clone(), LAYOUT, 0).unwrap();
+    let mut region = storage.configuration().unwrap();
+    let config = lattice_storage::configuration::Configuration::open(&mut region).unwrap();
+    let mut bytes = [0; 4];
+    config.read(&mut region, 0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"data");
+    assert_eq!(&flash.0.borrow().bytes[..0x32000], &before[..0x32000]);
+    assert_eq!(&flash.0.borrow().bytes[0x34000..], &before[0x34000..]);
 }

@@ -6,7 +6,7 @@ Each document has one owner and purpose:
 | --- | --- |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Canonical system semantics, ownership, interfaces and architectural requirements |
 | [KERNEL_DIRECTION.md](KERNEL_DIRECTION.md) | Current implementation map, capability gaps and immediate next work |
-| [PROGRAM_DESIGN.md](PROGRAM_DESIGN.md) | Pending interface/layout choices and a worked installation/traversal; proposals, not implemented APIs |
+| [PROGRAM_DESIGN.md](PROGRAM_DESIGN.md) | Remaining execution integration and its worked traversal; implemented loader/ABI details live beside the component |
 | [AGENTS.md](../AGENTS.md) | Collaboration, code organization, test discipline and review procedure |
 | [FIRMWARE_UPDATES.md](FIRMWARE_UPDATES.md) | Implemented updater behavior, wire/storage boundaries and remaining limits |
 | Component notes beside source | Current APIs, protocols and maintained usage/validation procedures |
@@ -27,7 +27,8 @@ Useful component entry points:
   [transport checks](../src/kernel/radio/TESTING.md).
 - [Hardware checks](../src/port/TESTING.md), including port-owned build/upload recipes.
 - [Package/transfer tools](../tools/README.md) and
-  [shared image storage](../src/kernel/update/storage/README.md).
+  [shared flash storage](../src/kernel/storage/README.md).
+- [Resident program records and installation](../src/kernel/program/README.md).
 
 Historical run logs, device-specific captures and superseded investigations live
 in the external local lab. They are not kernel dependencies. Maintained procedures

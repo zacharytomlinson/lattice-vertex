@@ -102,8 +102,9 @@ Image transfer itself is over radio.
 Both OTA fixture tasks use the existing kernel stack-overflow guard. No fixture
 keys, generated images, captures, or vendor comparison firmware belong in source.
 
-The OTA layout is revision 2: active `0x30000..0x8D000`, DFU plus swap page
-`0x8D000..0xEB000`, journal `0xEB000..0xED000`. Old revision-1 fixtures require
+The OTA layout is revision 3: active `0x30000..0x8B000`, DFU plus swap page
+`0x8B000..0xE7000`, journal `0xE7000..0xE9000`, protected configuration
+`0xE9000..0xED000`. Earlier fixtures require
 reprovisioning with both generated factory DFU packages before OTA. For an OTA
 fixture already running, use the 1200-baud/DTR sequence for factory recovery; it
 does not implement the older diagnostic `dfu` command.
@@ -121,7 +122,7 @@ validation limits. Build these options with this port's `prepare --ota`, then us
 the provisioning procedure above. The separate local `update` image deliberately
 retains explicit confirmation so it can exercise both boot outcomes.
 
-Nordic layout 2 requires `--swap-bytes 380928` for cost measurement and
+Nordic layout 3 requires `--swap-bytes 372736` for cost measurement and
 `--minimum-recovery-seconds 65` for the watchdog runner. The whole active slot is
 swapped, regardless of candidate length. Physical interruption during a swap has
 host fault-injection coverage but remains an unperformed hardware check.

@@ -67,12 +67,12 @@ name = "lattice-c6-boot"
 version = "0.1.0"
 dependencies = [
  "embedded-storage",
- "lattice-image-storage",
+ "lattice-storage",
  "sha2",
 ]
 
 [[package]]
-name = "lattice-image-storage"
+name = "lattice-storage"
 version = "0.1.0"
 dependencies = [
  "embedded-storage",

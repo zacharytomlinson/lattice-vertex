@@ -79,7 +79,7 @@ impl NorFlash for Flash {
 }
 struct Backend {
     flash: Flash,
-    candidate: Option<lattice_image_storage::Candidate<Flash>>,
+    candidate: Option<lattice_storage::Candidate<Flash>>,
 }
 impl Backend {
     fn new(flash: Flash) -> Self {
@@ -110,14 +110,9 @@ impl Storage for Backend {
         self.flash.write(o, b).map_err(|_| ())
     }
     fn resume(&mut self, n: u32, o: u32) -> Result<(), ()> {
-        let mut c = lattice_image_storage::Candidate::new(
-            &self.flash,
-            8192,
-            8192,
-            n,
-            n.div_ceil(4096) * 4096,
-        )
-        .map_err(|_| ())?;
+        let mut c =
+            lattice_storage::Candidate::new(&self.flash, 8192, 8192, n, n.div_ceil(4096) * 4096)
+                .map_err(|_| ())?;
         c.resume(o).map_err(|_| ())?;
         self.candidate = Some(c);
         Ok(())

@@ -141,7 +141,7 @@ def main():
         "--swap-bytes",
         type=int,
         default=0,
-        help="actual bootloader swap extent; Nordic XIAO revision 2 is 380928",
+        help="actual bootloader swap extent; Nordic XIAO revision 3 is 372736",
     )
     parser.add_argument("--margin-percent", type=int, default=125)
     args = parser.parse_args()

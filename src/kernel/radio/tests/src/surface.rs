@@ -33,11 +33,11 @@ impl State for Level {
         Some(a.level.load(Relaxed))
     }
 }
-static POWER: StateHandle<Controls> = StateHandle::new::<Power>();
-static LEVEL: StateHandle<Controls> = StateHandle::new::<Level>();
+static POWER: StateHandle<Controls> = StateHandle::new::<Power>("power");
+static LEVEL: StateHandle<Controls> = StateHandle::new::<Level>("level");
 // Native fixture history: the adapter only changes hardware-backed values.
 // Kernel acquisition owns detection, history maintenance and delta publication.
-static LEVEL_HISTORY: RetainedState<Controls, u8, i16, 4> = RetainedState::new(&LEVEL);
+static LEVEL_HISTORY: RetainedState<Controls, u8, i16, 4> = RetainedState::new("level-history", &LEVEL);
 static LEVEL_DIFFERENCE: Definition<Controls> = Definition {
     body: Expr::Binary(
         Binary::Equal,
@@ -165,8 +165,8 @@ impl StateTransformer for SetLevel {
         Ok(())
     }
 }
-static SET_POWER: TransformerHandle<Controls, ()> = TransformerHandle::new::<SetPower>();
-static SET_LEVEL: TransformerHandle<Controls, ()> = TransformerHandle::new::<SetLevel>();
+static SET_POWER: TransformerHandle<Controls, ()> = TransformerHandle::new::<SetPower>("set-power");
+static SET_LEVEL: TransformerHandle<Controls, ()> = TransformerHandle::new::<SetLevel>("set-level");
 pub static SWITCH: Surface<'static, Controls, ()> = Surface {
     states: &[&POWER],
     transformers: &[&SET_POWER],

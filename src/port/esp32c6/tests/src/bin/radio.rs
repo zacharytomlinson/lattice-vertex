@@ -78,8 +78,14 @@ fn main() -> ! {
     {
         let appliance = lattice_radio_test::surface::appliance(
             &context,
-            esp_hal::efuse::base_mac_address().as_bytes()[5] & 0x40 != 0,
+            cfg!(feature = "program-test") || esp_hal::efuse::base_mac_address().as_bytes()[5] & 0x40 != 0,
         );
+        #[cfg(feature = "program-test")]
+        {
+            let storage = port::esp32c6::update::image_storage(p.FLASH).unwrap();
+            lattice_vertex::kernel::start_with_storage(context, radio, appliance, storage)
+        }
+        #[cfg(not(feature = "program-test"))]
         lattice_vertex::kernel::start(context, radio, appliance)
     }
     #[cfg(not(any(feature = "radio-probe", feature = "peer-observer")))]

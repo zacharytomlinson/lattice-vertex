@@ -4,6 +4,7 @@ pub use lattice_ir::{Integer, Type, Value};
 pub mod cost;
 #[cfg(feature = "host")]
 pub mod host;
+pub mod program;
 pub mod scalar;
 pub mod update;
 pub const CALL_ARGUMENT_BYTES: usize = 61;
