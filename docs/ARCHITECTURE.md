@@ -327,7 +327,7 @@ Local work uses RTOS tasks with statically bounded storage and independent
 traversal values. Task creation/reuse is a kernel implementation concern, never
 appliance firmware responsibility or a global graph scheduler. Radio waiting must
 not hold the appliance lock. Existing IRQ-driven radio task wakeups are a foundation;
-installed-program dispatch still needs implementation.
+installed-program dispatch uses this same task machinery.
 
 ### The read and write head
 
@@ -350,21 +350,20 @@ supply its operands, including short-circuit paths. The existing native-call pay
 does not define this head ABI. General concurrent joins require an explicit bounded design
 and are not implied by serial predicate branching.
 
-### Retained history and derived state
+### Historical inputs and current calculations
 
-Some programs need bounded observations or calculated state that survives a traversal. Its
-definition identifies the source states, maintenance calculation, triggering deltas and
-retention bound. Inputs remain grounded in actual exposed capabilities or commissioned
-context. The appliance firmware qualifies its own observations; the kernel retains
-registered changes rather than every sample or tick. No mandatory time-length history is
-imposed. Empty/unavailable observations remain distinct from false or zero.
+Typed calculations over current exposed states and the head's temporary working values
+are ordinary program work. Historical inputs require a separate declared retention
+capability. Installing an automation must not silently add history getters to an
+appliance's surface or make its correctness depend on a volatile buffer that disappears
+after reboot. Automation-authored history maintenance is deferred.
 
-Retained state and the head's temporary working values have different ownership. The
-program supplies retained-state definitions after firmware compilation; appliance authors
-must not precompile each automation's history/calculation. Installed derived values must
-have mathematical definitions available to the compiler. State maintenance uses captured
-observations before dependent evaluation; reading a previous computed result does not
-itself subscribe that updater to its own output as a new change source.
+An optional recording vertex may retain qualified network deltas and expose historical
+information through its own surface. That does not require every appliance to record raw
+hardware samples or invent observations at a fixed sampling interval. Missing information
+cannot be substituted with zero or false. A public receive call log is deferred as well;
+it is not required for addressed dependent delivery and does not establish a historical
+query service.
 
 ### Mutation and continuation
 
@@ -409,6 +408,18 @@ addresses a particular binding, possibly through multiple peers. A vector is not
 of direct radio adjacency. Established relay bindings make its path explicit without
 requiring the compiler to precompute route permutations.
 
+Delivery responsibility follows actual installed dependencies and other explicitly
+addressed recipients. Each registered source change activates its own resident dependency
+links; it does not require every vertex to receive a copy of that change. Other vertices
+do not maintain a global dependency table or infer relevance from overheard traversal.
+The source must transmit a change notification along each affected program's upstream
+path. The current implementation calls this addressed notification an upstream activation.
+If it does not reach the next remote evaluation owner, that owner cannot continue toward
+the head. This is outward delta propagation; local registration alone is insufficient.
+The separate best-effort `StateChanged` broadcast carries an attribute/value notice for
+observation. Distinguishing these wire classes must not be mistaken for independence
+from change notification or from its delivery guarantee.
+
 The same delivery protocol applies to upstream change activation, forward predicate
 traversal, action traversal, installation control, and safety traffic. Evaluation is not
 an unreliable exception that may silently disappear after the head receives an activation.
@@ -418,7 +429,7 @@ receipt proves.
 | **Logical message** | **Meaning** |
 |----|----|
 | DELIVER | Addressed work for a target binding and phase, with the traversal identity, revision, bounded payload, and any retained operand. |
-| RECEIVED | The named target accepted the specified delivery. Relays may propagate this receipt to suppress outstanding copies. |
+| RECEIVED | The named target accepted the specified delivery; its correlated receipt establishes acceptance of this handoff. |
 | COMPLETE | A declared unit of work has finished, including any child work covered by its accounting contract. This is stronger than receipt. |
 | FAULT | A declared execution, availability, resource, or safety condition failed, with the scope and response defined by the binding contract. |
 | HEALTH | Fresh evidence for an active safety dependency and protection instance, not merely evidence that a processor is alive. |
@@ -429,31 +440,66 @@ opcodes. Several may share an envelope or fit in one fixed-size frame. The wire 
 specify identity, target, message class, revision, payload bounds, authentication,
 integrity checks, and fragmentation where necessary.
 
-### Receipts and duplicate suppression
+### Continuous native control
 
-Duplicate suppression is local recognition of a delivery already accepted within the
-retained identity window. A duplicate need not repeat the predicate or mutation, but can
-elicit the same receipt so that an earlier lost acknowledgement does not force unnecessary
-work. Network redundancy suppression is the related process of stopping other copies after
-learning that the intended target accepted the delivery. A relay's receipt alone does not
-prove that the semantic target received it.
+Continuous scalar control is a required core kernel communication primitive. A peer
+such as the tablet can maintain an addressed control relationship with an existing
+native transformer and send successive typed arguments while receiving state feedback.
+Dragging a dimmer slider is the immediate use case. It needs no installed automation,
+nucleus, appliance-specific stream handler or change to the current traversal model.
 
-No network-wide vote or exclusive forwarding authority is required before a recipient
-progresses. High-priority receipt dissemination can suppress redundant forwarding
-promptly. Storage for outstanding work is bounded. Under pressure, accepted traversals
-remain owned by their current holder; a receiver without capacity returns Busy so the
-sender retains and retries the same work with capped backoff. An unavailable peer may
-therefore occupy bounded execution capacity until delivery can proceed. Incomplete,
-unaccepted reservations and completed-delivery receipts can expire under explicit
-identity rules; their expiry must never turn a retransmission into another invocation.
-Uncertain acceptance after lost receipt history is reported rather than re-created as
-new work. No unbounded dynamic cache is introduced.
+The caller supplies the destination, native handle and argument. The kernel owns binary
+framing, correlation, ordering, bounded flow control, delivery recovery and dispatch to
+the native hardware function. The relationship reuses established bindings and routes;
+it must not require surface discovery or a new connection for each slider movement.
+Feedback belongs to the participating peers rather than a guarantee that every vertex
+receives every update. Receipt, native-call completion and observed physical state retain
+their distinct meanings. The final selected value needs an established outcome or an
+explicitly unconfirmed result, rather than silent loss when the gesture ends.
 
-The identity must distinguish a new registered change from another copy of the same change
-and distinguish separate legitimate visits where a graph branches or recurs. Reusing only
-a program identifier would incorrectly collapse real work. Reusing only a packet
-identifier without a boot or slot incarnation would allow delayed traffic to address a
-different object. Exact fields and wrap bounds remain to be specified.
+The performance goal is a short path from a compact numeric handle/argument message to
+native dispatch, with no text or per-value IR interpretation. Minimize buffer copies
+where port ownership permits reuse, but do not assume RDMA, shared MCU addresses or a
+zero-copy path that the implementation has not demonstrated. Measure input-to-dispatch
+and input-to-observed-state latency; radio airtime, contention, retries and finite native
+execution still contribute. A hard latency bound requires those costs to be bounded.
+
+Streaming does not authorize cancellation or supersession of accepted work, or merging
+actual registered appliance deltas. Any combining of unsent UI samples is a separate,
+explicit input policy. Ordering, the outstanding-update bound and disconnect/reconnect
+behavior must be decided before implementation; no particular stream ABI is fixed here.
+
+### Dependent delivery and acceptance receipts
+
+The source owner knows its local dependent entries from the installed graph. Activation
+follows their upstream links toward the head; forward evaluation follows the selected
+successors. A transport relay forwards toward the named owner without interpreting the
+predicate or deciding whether the change matters. The destination validates and accepts
+its own bound work. Observing another traversal is not substituted for that receipt.
+
+The current holder retains each handoff until the named evaluation owner accepts it.
+Transport-hop acknowledgment proves only frame reception at that hop. After accepting
+work, the next evaluation owner is responsible for its own onward handoffs. Neither the
+origin nor a relay needs a network-wide recipient list. Reaching the head is acceptance
+there, not proof that the tail has executed or every other dependent has received work.
+
+Requests and receipts have stable correlation across retries. A lost request is retried;
+a lost acceptance receipt is answered from retained acceptance evidence without repeating
+processing. Receipts do not require another chain of receipt acknowledgments. The current
+Release operation frees retained evidence after the sender has learned acceptance; a lost
+Release does not revoke acceptance or block the receiver's admitted work.
+
+Fixed capacity remains explicit. Busy leaves work with its sender for later retry. Accepted
+work is not evicted to make room for another visit. Distinct local changes remain distinct
+causes; the existing bounded local-cause overflow report is not a lossless-delivery claim.
+Reboot and reused-storage identities prevent stale tickets from becoming new invocations;
+uncertain acceptance is reported rather than guessed. These rules do not guarantee
+exactly-once physical effects across arbitrary crashes.
+
+Universal delta dissemination and a standardized public receive call log are deferred.
+They must not become prerequisites for this addressed delivery path. A future explicit
+consumer of observations would need its own receiving relationship and delivery policy;
+the existing best-effort broadcasts do not silently provide reliable subscriptions.
 
 ### Completion and uncertain outcomes
 
@@ -494,6 +540,11 @@ additively along a path. Packet overhead and retries contribute to measured serv
 cost; unknown cost remains unknown. The [wire component](../src/kernel/peer/wire/README.md#communication-cost)
 owns its representation and measurement rules. Choosing which relay relationships
 to retain under scarce storage is a separate policy from measuring path cost.
+
+Local elapsed measurements provide cost evidence without globally synchronized clocks.
+If send/receive timestamps are exposed in future diagnostics, their different clock domains
+and uncertainty must be retained when estimating one-way latency. Public log inspection is
+not required to measure marginal communication cost.
 
 A relay weight reflects the benefit of retaining a particular connection under scarce
 local capacity. Useful evidence includes delivery success, traversal latency,

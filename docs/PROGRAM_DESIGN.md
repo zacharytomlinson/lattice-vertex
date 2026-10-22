@@ -70,8 +70,12 @@ deadline path after computing their next boundary. Unanchored time remains unava
 
 ## Integration still required
 
-- Retained/derived maintenance needs externally installed calculations and bounded
-  storage. The firmware-bound history helper is not that loader.
+- Delivery assurance follows installed dependencies and explicitly addressed
+  recipients through the existing acceptance/retry path. Universal dissemination
+  and public receive-log inspection are deferred; relays need no dependency census.
+- Historical inputs and automation-authored retained-state maintenance are deferred.
+  Current calculations do not require them. The firmware-bound history helper does
+  not justify modifying an appliance surface to satisfy an automation's history query.
 - Replacement, head relocation, revision cutover, drain evidence and storage
   reclamation remain absent. Occupied definition extents are not reused.
 - Reboot recovery currently initiates independent upstream activations from restored

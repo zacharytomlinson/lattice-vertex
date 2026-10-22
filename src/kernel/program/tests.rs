@@ -818,11 +818,26 @@ fn handoff_admission() {
 }
 
 #[test]
-fn distributed_branch_execution() {
+fn dependent_delivery() {
     use super::traversal::Traversals;
     use crate::kernel::appliance::execution;
     use lattice_peer_wire::program::execution::Request as E;
-    for truth in [false, true] {
+    // Each handoff phase can lose either its request or its reply. The same
+    // accepted causes must still produce one invocation each on the true path.
+    for (truth, loss) in [
+        (false, None),
+        (true, None),
+        (true, Some((9, false))),  // session request
+        (true, Some((9, true))),   // session reply
+        (true, Some((10, false))), // reserve request
+        (true, Some((10, true))),  // reservation reply
+        (true, Some((11, false))), // data request
+        (true, Some((11, true))),  // data reply
+        (true, Some((12, false))), // commit request
+        (true, Some((12, true))),  // acceptance reply
+        (true, Some((13, false))), // release request
+        (true, Some((13, true))),  // release reply
+    ] {
         crate::port::test_port_reset();
         execution::reset();
         crate::kernel::change::reset();
@@ -877,8 +892,14 @@ fn distributed_branch_execution() {
         }
         let mut wire = [0; lattice_peer_wire::program::transfer::REQUEST_BYTES];
         let mut data = [0; DATA_BYTES];
+        let mut dropped = false;
         crate::kernel::change::bind(native_a);
         for now in (10..=10_000).step_by(10) {
+            if let Some((index, _, _, sent)) = ta.awaiting() {
+                if now - sent >= 2_000 {
+                    ta.retry(index, now);
+                }
+            }
             if now == 330 {
                 let admitted = ta.statistics.admitted;
                 let batch = crate::kernel::change::batch();
@@ -901,8 +922,14 @@ fn distributed_branch_execution() {
             if let Some((index, owner, n)) = ta.outgoing(now, &mut wire) {
                 assert_eq!(owner, 2);
                 ta.sent(index, now as u16, now);
-                let r = tb.receive(&b, 1, E::decode(&wire[..n]).unwrap(), now, &mut data);
-                ta.reply(index, r, now);
+                let omit = !dropped && loss.is_some_and(|(opcode, _)| opcode == wire[0]);
+                dropped |= omit;
+                if !omit || loss.unwrap().1 {
+                    let r = tb.receive(&b, 1, E::decode(&wire[..n]).unwrap(), now, &mut data);
+                    if !omit {
+                        ta.reply(index, r, now);
+                    }
+                }
             }
             execution::run_ready(&context);
         }
@@ -910,6 +937,9 @@ fn distributed_branch_execution() {
         assert_eq!((ta.statistics.faults, tb.statistics.faults), (0, 0));
         assert!(a.initial().is_none());
         assert_eq!(super::activation::overflow(), 0);
+        assert_eq!(dropped, loss.is_some(), "loss partition {loss:?}");
+        assert!(!super::activation::pending());
+        assert!(!ta.pending(), "sender retained completed work: {loss:?}");
         crate::kernel::change::reset();
         execution::reset();
     }

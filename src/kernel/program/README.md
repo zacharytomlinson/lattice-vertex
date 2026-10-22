@@ -239,6 +239,18 @@ forward path. True/false successors encode short-circuit control. Local arithmet
 uses the shared IR's declared-width semantics. Independent visits own independent
 values, including while waiting for a native function's return.
 
+Delivery obligations follow these installed dependents, not every vertex in the
+network. Relays route to the named owner without interpreting the program. An
+observed traversal is not a substitute for the owner's correlated acceptance.
+An upstream activation is the addressed notification of a source delta. Its first
+remote delivery is necessary for the receiving vertex to continue traversal;
+local registration is not a substitute for getting that notification across the radio.
+The `dependent_delivery` boundary table drops one request or reply at each handoff
+phase of a forward transfer and checks invocation count, retained progress and
+independence from `StateChanged` broadcast eviction. It does not separately inject
+loss into a remote upstream activation. These host checks do not establish crash
+recovery or arbitrary multi-hop radio delivery.
+
 A foreign handoff first reserves a receiver context and working extent. Ordered
 chunks are acknowledged without evaluation; identical duplicates are harmless and
 conflicting bytes are rejected. Commit checks completeness, digest and typed Entry
