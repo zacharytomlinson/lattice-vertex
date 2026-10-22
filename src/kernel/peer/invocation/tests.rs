@@ -87,6 +87,26 @@ fn replay_identity() {
 }
 #[test]
 fn admission_bounds() {
+    for count in [
+        0,
+        lattice_peer_wire::MAX_CALL_ARGUMENTS,
+        crate::configLATTICE_PROGRAM_ARGUMENTS,
+        crate::configLATTICE_PROGRAM_ARGUMENTS + 1,
+    ] {
+        let (context, native, _) = setup(InvokeStatus::Invoked);
+        let values =
+            std::vec![Value::integer(crate::ir::Integer::U64,u64::MAX as i128).unwrap();count];
+        let result = execution::submit_values(native, &context, CALL.transformer, &values);
+        if count > crate::configLATTICE_PROGRAM_ARGUMENTS {
+            assert_eq!(result, Err(InvokeStatus::Arguments));
+        } else {
+            let ticket = result.unwrap();
+            assert_eq!(native.1.load(Relaxed), 0);
+            execution::run_ready(&context);
+            assert_eq!(execution::take_result(ticket), Some(InvokeStatus::Invoked));
+            assert_eq!(native.1.load(Relaxed), 1);
+        }
+    }
     for args in [
         &[][..],
         &[1, 0][..],

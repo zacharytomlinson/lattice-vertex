@@ -1,7 +1,10 @@
 //! Persistent owner-local program definitions and native dependency wiring.
 //! Installation is distinct from admission of a distributed traversal.
 
+pub(crate) mod activation;
+mod evaluation;
 pub(crate) mod runtime;
+mod traversal;
 mod validation;
 
 use super::appliance::Native;
@@ -16,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 const CAPACITY: usize = 8192;
 const PREFIX: usize = 24;
-const MAGIC: [u8; 4] = *b"LPG\x01";
+const MAGIC: [u8; 4] = *b"LPG\x02";
 
 #[derive(Clone, Copy)]
 struct Part<'a> {
@@ -35,7 +38,7 @@ fn parts(bytes: &[u8]) -> impl Iterator<Item = Result<Part<'_>, Status>> {
         let result = (|| {
             let prefix = bytes.get(at..at + PREFIX).ok_or(Status::Invalid)?;
             let length = u16::from_le_bytes(prefix[..2].try_into().unwrap()) as usize;
-            if length < PREFIX || prefix[2..4] != [0, 0] || prefix[20..24] != [0, 0, 0, 0] {
+            if length < PREFIX || prefix[2] & !3 != 0 || prefix[3] != 0 {
                 return Err(Status::Invalid);
             }
             let generation = u32::from_le_bytes(prefix[4..8].try_into().unwrap());
@@ -87,6 +90,11 @@ struct Pending {
     phase: Phase,
     digest: Option<[u8; 32]>,
 }
+#[derive(Clone, Copy)]
+struct Checkpoint {
+    target: Option<(u16, bool, u32)>,
+    phase: Phase,
+}
 
 pub(crate) struct Programs {
     bytes: [u8; CAPACITY],
@@ -94,6 +102,8 @@ pub(crate) struct Programs {
     used: u16,
     store: Option<Configuration>,
     pending: Option<Pending>,
+    checkpoint_pending: Option<Checkpoint>,
+    initial_pending: bool,
     last_activity: u32,
     state: Status,
 }
@@ -105,6 +115,8 @@ impl Programs {
             used: 0,
             store: None,
             pending: None,
+            checkpoint_pending: None,
+            initial_pending: false,
             last_activity: 0,
             state: Status::Unsupported,
         }
@@ -117,6 +129,8 @@ impl Programs {
     ) -> Result<(), Status> {
         native.clear_dependencies();
         self.pending = None;
+        self.checkpoint_pending = None;
+        self.initial_pending = false;
         self.state = Status::Storage;
         let store = Configuration::open(flash).map_err(|_| Status::Storage)?;
         let used = store.current().map_or(4, |i| i.length() as usize);
@@ -132,13 +146,25 @@ impl Programs {
         }
         self.used = used as u16;
         self.store = Some(store);
-        if self.bytes[..4] != MAGIC {
+        let legacy = self.bytes[..4] == *b"LPG\x01";
+        if self.bytes[..4] != MAGIC && !legacy {
             self.state = Status::Invalid;
             return Err(self.state);
         }
         let result = (|| {
             for part in parts(&self.bytes[..used]) {
-                validation::validate(part?.definition.bytes(), native, surface).map_err(status)?;
+                let part = part?;
+                if self.bytes[part.offset as usize + 2] & 2 != 0 {
+                    return Err(Status::Invalid);
+                }
+                if legacy
+                    && (self.bytes[part.offset as usize + 2..part.offset as usize + 4] != [0, 0]
+                        || self.bytes[part.offset as usize + 20..part.offset as usize + 24]
+                            != [0; 4])
+                {
+                    return Err(Status::Invalid);
+                }
+                validation::validate(part.definition.bytes(), native, surface).map_err(status)?;
             }
             Ok(())
         })();
@@ -147,6 +173,9 @@ impl Programs {
             return Err(error);
         }
         self.wire(native);
+        // Header/prefix lengths and every distributed reference remain unchanged.
+        // The startup checkpoint commits this one-way metadata migration.
+        self.bytes[..4].copy_from_slice(&MAGIC);
         self.state = Status::Ok;
         Ok(())
     }
@@ -242,6 +271,9 @@ impl Programs {
         if self.state != Status::Ok {
             return self.progress(self.state);
         }
+        if let Request::Execution(request) = request {
+            return self.admission(request);
+        }
         if let Request::Dependencies { state, after } = request {
             let Some((_, head)) = native.state_binding(state) else {
                 return Reply::status(Status::Binding);
@@ -293,6 +325,9 @@ impl Programs {
             | Request::Abort { transfer } => transfer,
             _ => unreachable!(),
         };
+        if self.checkpoint_pending.is_some() {
+            return Reply::status(Status::Busy);
+        }
         if transfer == 0 || caller == 0 || caller == u64::MAX {
             return self.progress(Status::Invalid);
         }
@@ -449,7 +484,9 @@ impl Programs {
         self.progress(result)
     }
     pub(crate) fn pending_write(&self) -> bool {
-        self.pending.is_some_and(|p| p.phase != Phase::Receiving) && self.state == Status::Ok
+        (self.checkpoint_pending.is_some()
+            || self.pending.is_some_and(|p| p.phase != Phase::Receiving))
+            && self.state == Status::Ok
     }
     pub(crate) fn expire(&mut self, now: u32) {
         if self.pending.is_some_and(|p| p.phase == Phase::Receiving)
@@ -463,6 +500,9 @@ impl Programs {
         flash: &mut F,
         native: &dyn Native,
     ) -> Result<(), Status> {
+        if self.checkpoint_pending.is_some() {
+            return self.poll_checkpoint(flash);
+        }
         let Some(mut p) = self.pending else {
             return Ok(());
         };
@@ -514,6 +554,235 @@ impl Programs {
         Ok(())
     }
 }
+
+impl Programs {
+    fn part(&self, offset: u16, generation: u32) -> Result<Part<'_>, Status> {
+        if self.state != Status::Ok {
+            return Err(self.state);
+        }
+        parts(&self.bytes[..self.used as usize])
+            .filter_map(Result::ok)
+            .find(|p| p.offset == offset && p.generation == generation)
+            .ok_or(Status::Binding)
+    }
+    fn enabled(&self, offset: u16) -> bool {
+        self.bytes[offset as usize + 2] & 1 != 0
+    }
+    fn epoch(&self) -> u64 {
+        self.store
+            .as_ref()
+            .and_then(|s| s.current())
+            .map_or(0, |i| i.generation())
+    }
+    fn checkpoint(&mut self, target: Option<(u16, bool, u32)>) -> Result<(), Status> {
+        if self.checkpoint_pending.is_some() || self.pending.is_some() {
+            return Err(Status::Busy);
+        }
+        if self.state != Status::Ok {
+            return Err(self.state);
+        }
+        self.store
+            .as_mut()
+            .ok_or(Status::Unsupported)?
+            .begin(self.used as u32)
+            .map_err(|_| Status::Storage)?;
+        self.checkpoint_pending = Some(Checkpoint {
+            target,
+            phase: Phase::Erasing,
+        });
+        Ok(())
+    }
+    fn admission(
+        &mut self,
+        request: lattice_peer_wire::program::execution::Request<'_>,
+    ) -> Reply<'_> {
+        use lattice_peer_wire::program::execution::Request as E;
+        let (offset, generation) = match request {
+            E::State {
+                definition,
+                generation,
+            }
+            | E::Enable {
+                definition,
+                generation,
+                ..
+            } => (definition, generation),
+            _ => return Reply::status(Status::Unsupported),
+        };
+        let part = match self.part(offset, generation) {
+            Ok(p) => p,
+            Err(e) => return Reply::status(e),
+        };
+        if part.definition.head().is_none() {
+            return Reply::status(Status::Binding);
+        }
+        if matches!(request, E::Enable { enabled: true, .. })
+            && traversal::fits(part.definition).is_err()
+        {
+            return Reply::status(Status::Bounds);
+        }
+        let revision = u32::from_le_bytes(
+            self.bytes[offset as usize + 20..offset as usize + 24]
+                .try_into()
+                .unwrap(),
+        );
+        let enabled = self.enabled(offset);
+        let mut status = if enabled {
+            Status::Enabled
+        } else {
+            Status::Disabled
+        };
+        if let E::Enable {
+            revision: expected,
+            enabled: desired,
+            ..
+        } = request
+        {
+            if self.checkpoint_pending.is_some() || self.pending.is_some() {
+                status = Status::Busy;
+            } else if expected == revision && desired != enabled {
+                status = match revision.checked_add(1) {
+                    Some(next) => match self.checkpoint(Some((offset, desired, next))) {
+                        Ok(()) => Status::Persisting,
+                        Err(e) => e,
+                    },
+                    None => Status::Bounds,
+                };
+            } else if !((expected == revision || expected.checked_add(1) == Some(revision))
+                && desired == enabled)
+            {
+                status = Status::Conflict;
+            }
+        }
+        self.reply[..4].copy_from_slice(&revision.to_le_bytes());
+        Reply {
+            offset,
+            generation,
+            bytes: &self.reply[..4],
+            ..Reply::status(status)
+        }
+    }
+    fn poll_checkpoint<F: NorFlash>(&mut self, flash: &mut F) -> Result<(), Status> {
+        let mut control = self.checkpoint_pending.unwrap();
+        let result: Result<bool, lattice_storage::Error> = (|| {
+            let store = self.store.as_mut().unwrap();
+            match control.phase {
+                Phase::Erasing => {
+                    if store.erase_next_page(flash)? {
+                        control.phase = Phase::Writing(0)
+                    }
+                }
+                Phase::Writing(offset) => {
+                    let end = (offset as usize + 256).min(self.used as usize);
+                    let mut bytes = [0; 256];
+                    canonical_range(
+                        &self.bytes[..self.used as usize],
+                        offset as usize,
+                        &mut bytes[..end - offset as usize],
+                    );
+                    if let Some((target, enabled, revision)) = control.target {
+                        for (at, value) in core::iter::once((target as usize + 2, enabled as u8))
+                            .chain(
+                                revision
+                                    .to_le_bytes()
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(i, v)| (target as usize + 20 + i, v)),
+                            )
+                        {
+                            if at >= offset as usize && at < end {
+                                bytes[at - offset as usize] = value;
+                            }
+                        }
+                    }
+                    store.write(flash, offset as u32, &bytes[..end - offset as usize])?;
+                    control.phase = if end == self.used as usize {
+                        Phase::Committing
+                    } else {
+                        Phase::Writing(end as u16)
+                    };
+                    return Ok(false);
+                }
+                Phase::Committing => {
+                    store.commit(flash)?;
+                    return Ok(true);
+                }
+                Phase::Receiving => unreachable!(),
+            }
+            Ok(false)
+        })();
+        match result {
+            Err(_) => {
+                self.state = Status::Storage;
+                Err(Status::Storage)
+            }
+            Ok(false) => {
+                self.checkpoint_pending = Some(control);
+                Ok(())
+            }
+            Ok(true) => {
+                if let Some((target, enabled, revision)) = control.target {
+                    self.bytes[target as usize + 2] = if enabled { 3 } else { 0 };
+                    self.initial_pending |= enabled;
+                    self.bytes[target as usize + 20..target as usize + 24]
+                        .copy_from_slice(&revision.to_le_bytes());
+                }
+                self.checkpoint_pending = None;
+                Ok(())
+            }
+        }
+    }
+    fn initial(&mut self) -> Option<lattice_peer_wire::program::execution::Entry> {
+        if !self.initial_pending {
+            return None;
+        }
+        let entry = parts(&self.bytes[..self.used as usize])
+            .filter_map(Result::ok)
+            .find_map(|p| {
+                (self.bytes[p.offset as usize + 2] & 2 != 0).then(|| {
+                    lattice_peer_wire::program::execution::Entry {
+                        definition: p.offset,
+                        generation: p.generation,
+                        record: p.definition.head().unwrap(),
+                    }
+                })
+            });
+        self.initial_pending = entry.is_some();
+        entry
+    }
+    fn recovery(&self, after: u16) -> Option<(u16, lattice_peer_wire::program::execution::Entry)> {
+        use lattice_peer_wire::program::execution::Entry;
+        for p in parts(&self.bytes[..self.used as usize]).filter_map(Result::ok) {
+            if p.definition.sources().next().is_none() && p.offset > after && self.enabled(p.offset)
+            {
+                if let Some(record) = p.definition.head() {
+                    return Some((
+                        p.offset,
+                        Entry {
+                            definition: p.offset,
+                            generation: p.generation,
+                            record,
+                        },
+                    ));
+                }
+            }
+            for s in p.definition.sources() {
+                let at = p.offset + PREFIX as u16 + s.offset;
+                if at > after {
+                    return Some((
+                        at,
+                        Entry {
+                            definition: p.offset,
+                            generation: p.generation,
+                            record: s.entry,
+                        },
+                    ));
+                }
+            }
+        }
+        None
+    }
+}
 fn canonical_digest(definition: Definition<'_>) -> [u8; 32] {
     let mut hash = Sha256::new();
     let bytes = definition.bytes();
@@ -534,6 +803,10 @@ fn canonical_range(image: &[u8], offset: usize, output: &mut [u8]) {
         let Ok(part) = part else {
             break;
         };
+        let flags = part.offset as usize + 2;
+        if flags >= offset && flags - offset < output.len() {
+            output[flags - offset] &= 1;
+        }
         for source in part.definition.sources() {
             let link = part.offset as usize + PREFIX + source.offset as usize + 10;
             for at in link..link + 2 {

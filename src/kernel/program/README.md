@@ -1,4 +1,4 @@
-# Resident program loading and wiring
+# Resident programs
 
 This component receives previously unknown local program definitions, validates
 them, commits them to protected storage, and attaches their source relationships
@@ -6,12 +6,11 @@ to the appliance's owned states. Startup rebuilds those links from committed
 definitions against the current native bindings. Firmware supplies no automation
 callback, installation loop, storage policy, or message handler.
 
-**Installed means locally committed, validated and wired, but inactive.** This
-implementation does not yet admit upstream activations, execute primitive records,
-carry traversal values, or enable a distributed program. It also does not install
-new retained-state maintenance or time/solar resources. Unknown record kinds are
-rejected. The agreed evaluation-on-enable/recovery behavior belongs to the next
-execution integration; it is not inferred from an installation receipt.
+**Installed means committed, validated and wired, but inactive.** A separate durable
+head-admission command enables execution. The kernel follows upstream activation
+links, evaluates the installed local records, transfers complete visits and invokes
+native functions in existing RTOS tasks. Firmware supplies no evaluator callback.
+Time/solar and externally installed retained-state maintenance remain unsupported.
 
 ## Ownership and publication
 
@@ -24,7 +23,9 @@ without storage still forwards program traffic and reports `Unsupported` locally
 
 The loader runs in the resident radio/peer task. It reconstructs before PHY
 formation, using the task stack rather than the board entry stack. Trial firmware
-cannot confirm startup if its saved program definitions fail reconstruction.
+cannot confirm startup until its definitions reconstruct and a new receiver incarnation
+commits. One configuration checkpoint per boot gives new receiver tickets an epoch
+that cannot alias tickets issued before restart. This is not a mutation journal.
 Confirmed firmware can still expose a reconstruction error for recovery without
 inventing a physical mutation. Nothing invokes a native getter or transformer
 merely to validate/install its declaration.
@@ -87,8 +88,8 @@ Each operation record begins with its complete byte length (`u16`) and kind
 
 The invoke record describes continuation on the returned native result. It does
 not infer physical completion or encode an acceptance-only continuation. A
-physical completion dependency belongs to an observed state. Execution of these
-records is not implemented by the loader.
+physical completion dependency belongs to an observed state. The existing native task returns its result before that visit follows either edge;
+other visits, acquisition and radio service can continue meanwhile.
 
 Lists start with their `u8` count. Operands are a tag followed by their data:
 constant (0: existing typed scalar encoding), carried location (1: scalar type
@@ -113,16 +114,18 @@ represents `&&`/`||`; neither needs an accumulator or a dedicated opcode.
 
 Validation permits at most 128 local records, using bounded temporary analysis
 storage. Carried/scratch capacities describe the compiled layout; this loader
-does not allocate traversal contexts or promise execution capacity. That admission
-belongs to the execution layer. Firmware callbacks cannot substitute for missing
-record kinds.
+does not allocate traversal contexts. Enablement and incoming visits check execution
+capacity separately. Firmware callbacks cannot substitute for missing record kinds.
 
 ## Persistent image
 
-The committed payload starts with `LPG`, version byte 1, followed by local
+The committed payload starts with `LPG`, version byte 2, followed by local
 definitions. Each has a 24-byte prefix: total prefix-plus-definition length
-(`u16`), reserved zero (`u16`), generation (`u32`), installing caller (`u64`),
-transfer nonce (`u32`), and four reserved zero bytes. Definitions append to this
+(`u16`), enabled flag (`u8`, 0 or 1), reserved zero (`u8`), generation (`u32`),
+installing caller (`u64`), transfer nonce (`u32`), and admission revision (`u32`).
+LPG v1 is read as disabled with admission revision zero; the startup checkpoint
+upgrades its header and preserves every definition offset and generation. Runtime
+source links and the pending-initial-evaluation flag are excluded from saved/read bytes. Definitions append to this
 image; there is no deletion, live replacement or reuse of occupied extents yet.
 Generations do not wrap. The immutable caller/nonce and canonical definition
 digest distinguish a repeated commit from conflicting work after a lost reply or
@@ -163,17 +166,96 @@ end of list. They enumerate the actual reconstructed native dependency chain.
 
 Receiving, persisting and installed are distinct statuses. Other results report
 busy, unsupported, invalid, bounds, binding, compatibility, storage or conflict.
+Execution adds Enabled (12), Disabled (13), Accepted (14), Stale (15), and Unavailable
+(16); an Accepted visit receipt does not claim that its native operation has finished.
 Data ranges are ordered; an identical duplicate is acknowledged without another
 copy. Conflicting bytes/digests fail. Persisting/installed receipts are idempotent
 for the same caller/nonce/definition. An abandoned incomplete reservation cannot
 occupy installation capacity indefinitely. This is structural admission and
 transport integrity, not a new authentication or FSPS proof mechanism.
 
+## Admission and execution
+
+The same LVT program route and host envelope carry execution control. Read tokens
+are allocated jointly by the host endpoint and resident executor. Routing remains
+owner-directed through the existing peer paths; neither tablet nor compiler owns
+runtime forwarding.
+
+| Command | Fields after command byte |
+| --- | --- |
+| 7 admission state | Definition offset `u16`, definition generation `u32` |
+| 8 set admission | Same reference, expected admission revision `u32`, enabled `u8` |
+| 9 receiver session | None |
+| 10 reserve visit | Receiver epoch `u64`, sender epoch `u64`, sender sequence `u32`, entry reference (definition `u16`, generation `u32`, record `u16`), upstream `u8`, carried length `u16`, cause (owner `u64`, epoch `u64`, sequence `u32`) |
+| 11 visit data | Receiver ticket (epoch `u64`, slot `u16`, generation `u32`), offset `u16`, byte count `u8`, 1–38 bytes |
+| 12 commit visit | Receiver ticket, SHA256 of the carried bytes |
+| 13 release receipt | Receiver ticket |
+| 14 execution statistics | None |
+
+Admission replies identify the definition and include its current revision as four
+bytes. Enabling/disabling is a compare-and-set against that revision. Persistence
+completes before admission changes; repeating the accepted request cannot start a
+second enablement evaluation. Initial enablement schedules one fresh activation.
+Disablement stops admission at the head and does not cancel previously admitted
+forward visits. Distributed fragment/interface readiness remains the authoring
+peer's responsibility; a local enable receipt does not prove remote readiness.
+
+Session replies contain the durable epoch (`u64`), working-byte capacity (`u16`),
+visit count (`u16`) and native argument capacity (`u16`). Current kernel build
+bounds are four independent visits, one 4096-byte working arena, 32 pending local
+causes and 32 typed native arguments per call. Each visit reserves only its
+declared carried-plus-scratch extent in that arena; no heap is used. The manual
+call codec's 61-byte limit does not constrain program arguments or carried data.
+A local Entry starts with empty scratch and its declared carried inputs. Only
+current, established native observations are read; unavailable values are neither
+false nor zero. A visit waiting for an unavailable input retains its progress.
+
+Native observation/history publication records each cause separately from the
+outward eight-entry delta ring. After the batch commits, each pending source cursor
+advances only when its dependent activation is admitted. Full local cause storage
+increments the explicit overflow counter without evicting older work. An upstream
+visit follows Entry links without testing predicates; the enabled head starts the
+forward path. True/false successors encode short-circuit control. Local arithmetic
+uses the shared IR's declared-width semantics. Independent visits own independent
+values, including while waiting for a native function's return.
+
+A foreign handoff first reserves a receiver context and working extent. Ordered
+chunks are acknowledged without evaluation; identical duplicates are harmless and
+conflicting bytes are rejected. Commit checks completeness, digest and typed Entry
+inputs before admitting the visit. The acceptance receipt is retained separately
+from the running visit. Repeating Commit returns the same acceptance without
+re-evaluation. Sender ownership ends on acceptance; Release only frees the receipt.
+Losing Release does not cancel the receiver's work.
+
+Receiver tickets include boot incarnation and slot generation. An expired/reused
+or pre-reboot ticket cannot invoke again. A sender may restart an expired partial
+transfer before Commit, but an uncertain Commit is never restarted under a new
+ticket. Stale evidence at that point becomes an explicit uncertain outcome. Partial
+reservations expire after 30 seconds without accepted data; acceptance receipts
+expire after 60 seconds or Release. Neither expiry discards an admitted visit.
+An ordinary request waits two seconds for a response and uses capped exponential
+retry delays of 100–1600 ms. Busy retains the sender's work. Persistent unavailability
+can occupy fixed visit capacity; it does not allocate more memory or silently drop
+that visit. One outgoing exchange is in flight per radio service; local/native
+visits still overlap.
+
+Statistics replies contain five `u32` counters (admitted local visits, completed
+local visits, faults, uncertain handoffs, local-cause overflow), followed by the
+last fault status (`u8`), definition (`u16`) and record (`u16`). Local completion
+includes stopped paths and accepted onward handoffs; it is not whole-program or
+physical completion. These diagnostics remain available through the ordinary peer
+service. Reboot recovery walks restored source bindings upstream and can cause
+repeated evaluations across returning participants; coordinated reconciliation is
+explicitly deferred.
+
 ## Maintained checks
 
 Host checks enforce declaration bounds, typing, initialization, publication after
 commit, duplicate/conflict behavior, reservation expiry and reconstruction against
-fresh native storage. Shared transport checks include the new message family.
+fresh native storage. Execution checks cover declared-width arithmetic, location
+bounds, commit-before-admission, independent activations despite transport eviction,
+conditional cross-owner execution, partial handoffs, duplicate commits and capacity.
+Shared transport checks cover the command and message boundaries.
 Both ports' existing radio fixture has a `program-test` feature that starts with
 storage and an ordinary test appliance without a signing policy. It contains no
 installed automation. Build with `--bin radio --features program-test`; the port's
@@ -182,4 +264,4 @@ installed automation. Build with `--bin radio --features program-test`; the port
 existing layout-3 provisioning procedure with those artifacts before a physical
 test. This mode needs no release public key. Signed-update builds use
 the same service. Build/host checks do not establish a live radio installation or
-program execution.
+physical program execution.

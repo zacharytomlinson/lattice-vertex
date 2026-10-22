@@ -11,6 +11,10 @@ use core::{
 use lattice_peer_wire::{scalar::decode_arguments, CALL_ARGUMENT_BYTES, MAX_CALL_ARGUMENTS};
 
 const COUNT: usize = crate::configLATTICE_NATIVE_TASKS;
+const _: () = assert!(
+    crate::configLATTICE_PROGRAM_ARGUMENTS >= MAX_CALL_ARGUMENTS
+        && crate::configLATTICE_PROGRAM_ARGUMENTS <= u8::MAX as usize
+);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Ticket {
     slot: usize,
@@ -26,8 +30,9 @@ enum Phase {
 struct Call {
     native: &'static dyn Native,
     transformer: u64,
-    bytes: [u8; CALL_ARGUMENT_BYTES],
+    values: [Value; crate::configLATTICE_PROGRAM_ARGUMENTS],
     length: usize,
+    valid: bool,
     #[cfg(feature = "firmware-update")]
     _hold: crate::kernel::update::UpdateHold,
 }
@@ -70,16 +75,42 @@ pub(crate) fn submit(
     if arguments.len() > CALL_ARGUMENT_BYTES {
         return Err(InvokeStatus::Arguments);
     }
+    let mut values = [Value::boolean(false); MAX_CALL_ARGUMENTS];
+    match decode_arguments(arguments, &mut values) {
+        Some(values) => submit_prepared(native, context, transformer, values, true),
+        None => submit_prepared(native, context, transformer, &[], false),
+    }
+}
+
+pub(crate) fn submit_values(
+    native: &'static dyn Native,
+    context: &TaskContext,
+    transformer: u64,
+    arguments: &[Value],
+) -> Result<Ticket, InvokeStatus> {
+    submit_prepared(native, context, transformer, arguments, true)
+}
+fn submit_prepared(
+    native: &'static dyn Native,
+    context: &TaskContext,
+    transformer: u64,
+    arguments: &[Value],
+    valid: bool,
+) -> Result<Ticket, InvokeStatus> {
+    if arguments.len() > crate::configLATTICE_PROGRAM_ARGUMENTS {
+        return Err(InvokeStatus::Arguments);
+    }
     #[cfg(feature = "firmware-update")]
     let hold = crate::kernel::update::hold_updates(context).map_err(|_| InvokeStatus::Busy)?;
     let _ = context;
-    let mut bytes = [0; CALL_ARGUMENT_BYTES];
-    bytes[..arguments.len()].copy_from_slice(arguments);
+    let mut values = [Value::boolean(false); crate::configLATTICE_PROGRAM_ARGUMENTS];
+    values[..arguments.len()].copy_from_slice(arguments);
     let mut call = Some(Call {
         native,
         transformer,
-        bytes,
+        values,
         length: arguments.len(),
+        valid,
         #[cfg(feature = "firmware-update")]
         _hold: hold,
     });
@@ -135,10 +166,11 @@ fn run_one(index: usize, context: &TaskContext) -> bool {
     }) else {
         return false;
     };
-    let mut values = [Value::boolean(false); MAX_CALL_ARGUMENTS];
-    let result = match decode_arguments(&call.bytes[..call.length], &mut values) {
-        Some(values) => call.native.invoke(context, call.transformer, values),
-        None => InvokeStatus::Arguments,
+    let result = if call.valid {
+        call.native
+            .invoke(context, call.transformer, &call.values[..call.length])
+    } else {
+        InvokeStatus::Arguments
     };
     // Finish all hardware work before making the context reusable. The update
     // hold covers admission through execution, including a delayed task start.

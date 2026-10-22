@@ -518,3 +518,8 @@ pub const configLATTICE_NATIVE_STACK_WORDS: usize = 1024;
 pub const configLATTICE_ACQUISITION_STACK_WORDS: usize = 1024;
 /// Fallback hardware acquisition interval; unchanged samples emit no deltas.
 pub const configLATTICE_ACQUISITION_MS: u32 = 10;
+/// Fixed execution resources, advertised by the resident program service.
+pub const configLATTICE_TRAVERSALS: usize = 4;
+pub const configLATTICE_TRAVERSAL_BYTES: usize = 4096;
+pub const configLATTICE_ACTIVATIONS: usize = 32;
+pub const configLATTICE_PROGRAM_ARGUMENTS: usize = 32;

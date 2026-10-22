@@ -88,8 +88,9 @@ This identity is for immutable reads, not an exactly-once execution mechanism.
 Arrival and owner discovery now cross relays within the same eight-link bound.
 Channel formation remains link-local. Probabilistic delivery scoring, broadcast
 coverage optimization and content-addressed sharing remain later extensions.
-[Program installation](../program/README.md) now shares owner routing; forward
-evaluation/activation delivery remains unimplemented.
+[Program installation and execution](../program/README.md) share owner routing.
+Execution reserves receiver storage and commits complete visits above this route;
+its admission receipts are distinct from immutable-read replies and MAC ACKs.
 The network tag and matching responses are not authentication credentials.
 Startup arrival/query tags use local tick values, not durable boot identities.
 A rapid restart or reused token may be suppressed by retained history. Retries

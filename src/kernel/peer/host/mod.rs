@@ -168,7 +168,6 @@ struct Pending {
     started: u32,
 }
 pub(super) struct Host {
-    next_token: Option<u16>,
     next_call: u32,
     calls_seeded: bool,
     call_ids: [(u32, u32); 8],
@@ -179,7 +178,6 @@ pub(super) struct Host {
 impl Host {
     pub(super) const fn new() -> Self {
         Self {
-            next_token: None,
             next_call: 0,
             calls_seeded: false,
             call_ids: [(0, 0); 8],
@@ -438,8 +436,7 @@ impl Host {
                     },
                 );
             } else {
-                let radio_token = self.next_token.map_or(token as u16, |n| n.wrapping_add(1));
-                self.next_token = Some(radio_token);
+                let radio_token = forwarder.request_token(token as u16);
                 let read = ProgramRead {
                     reader: local,
                     owner,
@@ -484,8 +481,7 @@ impl Host {
                     },
                 );
             } else {
-                let radio_token = self.next_token.map_or(token as u16, |n| n.wrapping_add(1));
-                self.next_token = Some(radio_token);
+                let radio_token = forwarder.request_token(token as u16);
                 let read = UpdateRead {
                     reader: local,
                     owner,
@@ -557,8 +553,7 @@ impl Host {
         // A reboot must not deliberately reuse read 1 while another resident
         // still holds that caller/token. Seed once from the host's random token,
         // then keep one monotonic namespace across read kinds and USB sessions.
-        let radio_token = self.next_token.map_or(token as u16, |n| n.wrapping_add(1));
-        self.next_token = Some(radio_token);
+        let radio_token = forwarder.request_token(token as u16);
         let read = match request {
             Packet::ReadLinks { after, via, .. } => ReadRequest::Links(LinkRead {
                 reader: local,

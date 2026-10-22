@@ -440,9 +440,14 @@ prove that the semantic target received it.
 
 No network-wide vote or exclusive forwarding authority is required before a recipient
 progresses. High-priority receipt dissemination can suppress redundant forwarding
-promptly. Missing receipts must nevertheless have bounded consequences; they cannot
-justify immortal retry entries. Ring slots, retry limits, identity windows, and eviction
-are part of the protocol contract, not an unbounded dynamic cache.
+promptly. Storage for outstanding work is bounded. Under pressure, accepted traversals
+remain owned by their current holder; a receiver without capacity returns Busy so the
+sender retains and retries the same work with capped backoff. An unavailable peer may
+therefore occupy bounded execution capacity until delivery can proceed. Incomplete,
+unaccepted reservations and completed-delivery receipts can expire under explicit
+identity rules; their expiry must never turn a retransmission into another invocation.
+Uncertain acceptance after lost receipt history is reported rather than re-created as
+new work. No unbounded dynamic cache is introduced.
 
 The identity must distinguish a new registered change from another copy of the same change
 and distinguish separate legitimate visits where a graph branches or recurs. Reusing only
@@ -650,10 +655,18 @@ inserted expected-starting-state guard. A later legitimate automation activation
 change the peripheral again.
 
 Initial enablement likewise admits one fresh evaluation before ordinary delta-driven
-operation. After a reboot, a restored enabled head evaluates current conditions once
-its required local state/time are available. This is a new traversal with current
-inputs, never replay of an interrupted traversal or mutation. Repeated delivery of
-the same enable request must not manufacture additional enablement evaluations.
+operation. Repeated delivery of the same enable request must not manufacture additional
+enablement evaluations.
+
+Reboot recovery temporarily uses fresh activations once the restored local state/time
+are available. Recovery at a dependency-bearing binding follows its ordinary upstream
+relationships; it cannot rely on the head also rebooting. The enabled head admits the
+resulting forward evaluation with current inputs, never by replaying an interrupted
+mutation. These independently originated recovery activations can produce repeated
+evaluations of the same program as its participants return. A single head does not
+deduplicate them, and ordinary delivery duplicate suppression does not merge them.
+Coordinated reconciliation after an outage remains deferred. This temporary policy
+does not establish once-per-program recovery across a network restart.
 
 The ordering of an explicit disable or delete against an already admitted traversal needs
 a precise lifecycle contract. Ordinary state-change supersession is excluded regardless of
@@ -835,12 +848,12 @@ installed-binding storage, bounded temporary operands, and the configured relay 
 Capacity accounting is local and concrete. This does not require a general dynamic cache
 or distributed object allocator.
 
-The full-buffer policy is still a design obligation. An implementation must distinguish
-work not yet accepted from work it has already acknowledged. Possible mechanisms include
-upstream retry, reserved critical traffic capacity, explicit rejection, and scoped fault
-escalation; the final combination must be selected and tested rather than silently
-assumed. Physical state changes can arrive faster than an overloaded link drains, so
-backpressure alone cannot make arbitrary arrival rates lossless.
+The admission policy preserves accepted work. A receiver without free execution capacity
+returns Busy before accepting a visit; its sender retains that visit for retry. The
+bounded local-change buffer reports overflow when full rather than evicting earlier
+pending activations. This is distinct from the outward observation transport ring's
+existing hard eviction. Physical state changes can arrive faster than an overloaded
+link drains, so backpressure alone cannot make arbitrary arrival rates lossless.
 
 This architecture treats separately registered changes as distinct activations. An
 implementation that coalesces them under pressure changes that semantic contract and needs

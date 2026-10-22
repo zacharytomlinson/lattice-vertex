@@ -183,9 +183,11 @@ published records, while its existing receive/TX completion rules remain intact.
 
 Each accepted delta can cross eight links. Relays retain eight recent owner/sequence
 keys for 10 seconds, suppressing transport duplicates without merging distinct
-changes. Remote deltas never overwrite the local hardware adapter. Resident upstream
-activation and forward program traversal remain unimplemented. Sequence numbers
-restart on reboot; loss, eviction and restart do not imply automatic recovery.
+changes. Remote deltas never overwrite the local hardware adapter. Local committed
+changes separately activate installed [program sources](../program/README.md#admission-and-execution).
+Their bounded pending storage is independent of this transport ring. Program
+handoffs have receiver-reservation and acceptance semantics; these broadcast
+sequence numbers still restart on reboot and do not themselves repair missed events.
 
 ### Retained native state
 

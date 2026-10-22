@@ -65,6 +65,9 @@ pub(crate) fn record(instance: *const (), attribute: u64, value: Option<Value>) 
             return false;
         }
         out.sequence = out.sequence.wrapping_add(1);
+        if let Some((_, head)) = out.native.and_then(|n| n.state_binding(attribute)) {
+            super::program::activation::record(head.load(core::sync::atomic::Ordering::Acquire));
+        }
         if out.count == CAPACITY {
             out.records[out.first] = None;
             out.first = (out.first + 1) % CAPACITY;
@@ -112,6 +115,9 @@ impl Drop for Batch {
 pub(crate) fn pending() -> bool {
     access(|out| out.count != 0 && out.batches == 0)
 }
+pub(crate) fn committed() -> bool {
+    access(|out| out.batches == 0)
+}
 
 /// Latest registered local change, including records already sent or evicted.
 /// Sample with the observation-cache lock when pairing this watermark with state.
@@ -137,6 +143,7 @@ pub(crate) fn evicted() -> u32 {
 #[cfg(test)]
 pub(crate) fn reset() {
     access(|out| *out = Outgoing::new());
+    super::program::activation::reset();
 }
 
 #[cfg(all(test, feature = "port-test"))]

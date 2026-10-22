@@ -385,3 +385,440 @@ fn reservation_expiry() {
         assert!(p.store.as_ref().unwrap().current().is_none());
     }
 }
+
+fn install(bytes: &[u8], native: &dyn Native, flash: &mut Flash) -> Programs {
+    let mut p = Programs::new();
+    p.restore(flash, native, &SURFACE).unwrap();
+    assert_eq!(
+        p.receive(
+            5,
+            Request::Begin {
+                transfer: 1,
+                length: bytes.len() as u16
+            },
+            native,
+            &SURFACE
+        )
+        .status,
+        Status::Receiving
+    );
+    for (i, b) in bytes.chunks(DATA_BYTES).enumerate() {
+        assert_eq!(
+            p.receive(
+                5,
+                Request::Data {
+                    transfer: 1,
+                    offset: (i * DATA_BYTES) as u16,
+                    bytes: b
+                },
+                native,
+                &SURFACE
+            )
+            .status,
+            Status::Receiving
+        );
+    }
+    assert_eq!(
+        p.receive(
+            5,
+            Request::Commit {
+                transfer: 1,
+                digest: Sha256::digest(bytes).into()
+            },
+            native,
+            &SURFACE
+        )
+        .status,
+        Status::Persisting
+    );
+    while p.pending_write() {
+        p.poll(flash, native).unwrap();
+    }
+    p
+}
+#[test]
+fn admission_commit() {
+    use lattice_peer_wire::program::execution::Request as E;
+    for steps in 0..=5 {
+        let native = Device::new();
+        let mut flash = Flash::new();
+        let mut p = install(&definition(true), &native, &mut flash);
+        let enable = E::Enable {
+            definition: 4,
+            generation: 1,
+            revision: 0,
+            enabled: true,
+        };
+        assert_eq!(p.admission(enable).status, Status::Persisting);
+        assert!(!p.enabled(4));
+        assert!(p.initial().is_none());
+        for _ in 0..steps {
+            p.poll(&mut flash, &native).unwrap();
+        }
+        let committed = p.enabled(4);
+        let mut restored = Programs::new();
+        restored.restore(&mut flash, &native, &SURFACE).unwrap();
+        assert_eq!(restored.enabled(4), committed);
+        assert!(restored.initial().is_none()); // Recovery has its own source walk.
+        if committed {
+            let before = flash.0.clone();
+            for _ in 0..2 {
+                assert_eq!(p.admission(enable).status, Status::Enabled);
+            }
+            assert_eq!(flash.0, before);
+            assert!(!p.pending_write());
+            assert_eq!(p.initial().unwrap().record, 60);
+            p.bytes[6] &= 1;
+            assert_eq!(p.admission(enable).status, Status::Enabled);
+            assert!(p.initial().is_none());
+            let disable = E::Enable {
+                definition: 4,
+                generation: 1,
+                revision: 1,
+                enabled: false,
+            };
+            assert_eq!(p.admission(disable).status, Status::Persisting);
+            while p.pending_write() {
+                p.poll(&mut flash, &native).unwrap();
+            }
+            assert_eq!(p.admission(enable).status, Status::Conflict);
+        }
+    }
+    // A definition outside this build's execution capacity remains inspectable
+    // and disableable; only admission to execution requires the working extent.
+    let native = Device::new();
+    let mut flash = Flash::new();
+    let mut bytes = definition(true);
+    bytes[4..6].copy_from_slice(&(crate::configLATTICE_TRAVERSAL_BYTES as u16).to_le_bytes());
+    let mut p = install(&bytes, &native, &mut flash);
+    assert_eq!(
+        p.admission(E::State {
+            definition: 4,
+            generation: 1
+        })
+        .status,
+        Status::Disabled
+    );
+    for (enabled, expected) in [(true, Status::Bounds), (false, Status::Disabled)] {
+        assert_eq!(
+            p.admission(E::Enable {
+                definition: 4,
+                generation: 1,
+                revision: 0,
+                enabled
+            })
+            .status,
+            expected
+        );
+    }
+}
+
+#[test]
+fn configuration_versions() {
+    for version in [1, 2, 3] {
+        let native = Device::new();
+        let mut flash = Flash::new();
+        let mut p = install(&definition(true), &native, &mut flash);
+        p.bytes[3] = version;
+        p.checkpoint(None).unwrap();
+        while p.pending_write() {
+            p.poll(&mut flash, &native).unwrap();
+        }
+        let mut restored = Programs::new();
+        let result = restored.restore(&mut flash, &native, &SURFACE);
+        assert_eq!(result.is_ok(), version <= 2);
+        if version <= 2 {
+            assert_eq!(&restored.bytes[..4], &MAGIC);
+            assert_eq!(restored.part(4, 1).unwrap().definition.head(), Some(60));
+            let before = restored.epoch();
+            restored.checkpoint(None).unwrap();
+            while restored.pending_write() {
+                restored.poll(&mut flash, &native).unwrap();
+            }
+            assert!(restored.epoch() > before);
+            let mut again = Programs::new();
+            again.restore(&mut flash, &native, &SURFACE).unwrap();
+            assert_eq!(&again.bytes[..4], &MAGIC);
+        }
+    }
+}
+
+struct Running {
+    binding: Device,
+    value: core::sync::atomic::AtomicBool,
+    calls: core::sync::atomic::AtomicU32,
+}
+impl Native for Running {
+    fn ready(&self) -> bool {
+        true
+    }
+    fn owns(&self, instance: *const (), attribute: u64) -> bool {
+        instance == core::ptr::from_ref(self).cast() && attribute == STATE
+    }
+    fn read(&self, _: &TaskContext, reference: u64) -> StateReadResult {
+        assert_eq!(reference, STATE);
+        StateReadResult::Value {
+            sequence: 0,
+            value: Some(crate::ir::Value::boolean(
+                self.value.load(Ordering::Relaxed),
+            )),
+        }
+    }
+    fn invoke(&self, _: &TaskContext, reference: u64, args: &[crate::ir::Value]) -> InvokeStatus {
+        assert_eq!(reference, CALL);
+        assert_eq!(args, &[crate::ir::Value::boolean(true)]);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        InvokeStatus::Invoked
+    }
+    fn state_binding(&self, r: u64) -> Option<(Type, &AtomicU16)> {
+        self.binding.state_binding(r)
+    }
+    fn transformer_signature(&self, r: u64) -> Option<&[Type]> {
+        self.binding.transformer_signature(r)
+    }
+    fn clear_dependencies(&self) {
+        self.binding.clear_dependencies();
+    }
+}
+fn running(value: bool) -> &'static Running {
+    std::boxed::Box::leak(std::boxed::Box::new(Running {
+        binding: Device::new(),
+        value: core::sync::atomic::AtomicBool::new(value),
+        calls: core::sync::atomic::AtomicU32::new(0),
+    }))
+}
+fn terminal(length: u16) -> Vec<u8> {
+    let mut b = vec![0; 48];
+    b[..4].copy_from_slice(b"LPD\x01");
+    b[4..6].copy_from_slice(&length.to_le_bytes());
+    b[10..12].fill(0xff);
+    b[12..14].copy_from_slice(&48u16.to_le_bytes());
+    b[16..48].copy_from_slice(&SURFACE);
+    b.extend_from_slice(&[6, 0, 0, 0, 0, 0]);
+    b
+}
+#[test]
+fn handoff_admission() {
+    use super::traversal::Traversals;
+    use lattice_peer_wire::program::execution::{Cause, Entry, Request as E, Ticket, CHUNK_BYTES};
+    crate::port::test_port_reset();
+    let context = unsafe { TaskContext::assume() };
+    let native = running(true);
+    for length in [
+        0,
+        1,
+        CHUNK_BYTES,
+        CHUNK_BYTES + 1,
+        2 * CHUNK_BYTES,
+        crate::configLATTICE_TRAVERSAL_BYTES,
+    ] {
+        let mut flash = Flash::new();
+        let mut p = install(&terminal(length as u16), native, &mut flash);
+        let mut t = Traversals::new();
+        t.epoch = 7;
+        t.local = 2;
+        let entry = Entry {
+            definition: 4,
+            generation: 1,
+            record: 48,
+        };
+        let reserve = E::Reserve {
+            epoch: 7,
+            sender_epoch: 3,
+            sequence: 1,
+            cause: Cause {
+                owner: 1,
+                epoch: 3,
+                sequence: 1,
+            },
+            entry,
+            upstream: false,
+            length: length as u16,
+        };
+        let mut out = [0; DATA_BYTES];
+        let r = t.receive(&p, 1, reserve, 0, &mut out);
+        assert_eq!(r.status, Status::Receiving);
+        let ticket = Ticket {
+            epoch: 7,
+            slot: r.offset,
+            generation: r.generation,
+        };
+        let bytes = vec![42; length];
+        let commit = E::Commit {
+            ticket,
+            digest: Sha256::digest(&bytes).into(),
+        };
+        if length != 0 {
+            assert_eq!(
+                t.receive(&p, 1, commit, 1, &mut out).status,
+                Status::Invalid
+            );
+        }
+        for (i, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
+            let data = E::Data {
+                ticket,
+                offset: (i * CHUNK_BYTES) as u16,
+                bytes: chunk,
+            };
+            for _ in 0..2 {
+                assert_eq!(
+                    t.receive(&p, 1, data, 2, &mut out).status,
+                    Status::Receiving
+                );
+            }
+        }
+        t.poll(&mut p, native, &context, 3);
+        assert_eq!(t.statistics.admitted, 0);
+        for _ in 0..2 {
+            assert_eq!(
+                t.receive(&p, 1, commit, 4, &mut out).status,
+                Status::Accepted
+            );
+        }
+        assert_eq!(t.statistics.admitted, 1);
+        for _ in 0..crate::configLATTICE_TRAVERSALS {
+            t.poll(&mut p, native, &context, 5);
+        }
+        assert_eq!(t.statistics.completed, 1);
+        assert_eq!(
+            t.receive(&p, 1, commit, 6, &mut out).status,
+            Status::Accepted
+        );
+        assert_eq!(
+            t.receive(&p, 1, E::Release { ticket }, 7, &mut out).status,
+            Status::Ok
+        );
+        assert_eq!(t.receive(&p, 1, commit, 8, &mut out).status, Status::Stale);
+        assert_eq!(
+            t.receive(&p, 1, reserve, 9, &mut out).status,
+            Status::Receiving
+        );
+        assert_eq!(t.receive(&p, 1, commit, 10, &mut out).status, Status::Stale);
+        t.epoch = 8;
+        assert_eq!(
+            t.receive(&p, 1, reserve, 11, &mut out).status,
+            Status::Stale
+        );
+    }
+    // Busy never steals an existing context.
+    let mut flash = Flash::new();
+    let mut p = install(&definition(true), native, &mut flash);
+    let mut t = Traversals::new();
+    t.epoch = 1;
+    t.local = 1;
+    let entry = Entry {
+        definition: 4,
+        generation: 1,
+        record: 60,
+    };
+    for _ in 0..crate::configLATTICE_TRAVERSALS {
+        assert_eq!(t.activate(&p, entry), Ok(()));
+    }
+    assert_eq!(t.activate(&p, entry), Err(Status::Busy));
+    assert_eq!(
+        t.statistics.admitted,
+        crate::configLATTICE_TRAVERSALS as u32
+    );
+    for _ in 0..crate::configLATTICE_TRAVERSALS {
+        t.poll(&mut p, native, &context, 0);
+    }
+    assert_eq!(t.statistics.faults, 0);
+}
+
+#[test]
+fn distributed_branch_execution() {
+    use super::traversal::Traversals;
+    use crate::kernel::appliance::execution;
+    use lattice_peer_wire::program::execution::Request as E;
+    for truth in [false, true] {
+        crate::port::test_port_reset();
+        execution::reset();
+        crate::kernel::change::reset();
+        let context = unsafe { TaskContext::assume() };
+        let native_a = running(truth);
+        let native_b = running(truth);
+        let mut head = definition(true)[..86].to_vec();
+        head[4..6].copy_from_slice(&1u16.to_le_bytes());
+        head[6..8].fill(0);
+        head[79] = 1;
+        head.extend_from_slice(&[25, 0, 5, 1, 0, 0, 0, 2]);
+        head.extend_from_slice(&2u64.to_le_bytes());
+        head.extend_from_slice(&4u16.to_le_bytes());
+        head.extend_from_slice(&1u32.to_le_bytes());
+        head.extend_from_slice(&48u16.to_le_bytes());
+        head.push(0);
+        head[56..58].copy_from_slice(&111u16.to_le_bytes());
+        head.extend_from_slice(&[8, 0, 0, 1, 60, 0, 0, 0]);
+        let mut tail = terminal(1);
+        tail.truncate(48);
+        tail.extend_from_slice(&[12, 0, 0, 0, 1, 1, 0, 0, 0, 1, 60, 0]);
+        tail.extend_from_slice(&[18, 0, 6]);
+        tail.extend_from_slice(&CALL.to_le_bytes());
+        tail.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0]);
+        let mut flash_a = Flash::new();
+        let mut flash_b = Flash::new();
+        let mut a = install(&head, native_a, &mut flash_a);
+        let mut b = install(&tail, native_b, &mut flash_b);
+        let mut ta = Traversals::new();
+        ta.local = 1;
+        ta.epoch = 10;
+        let mut tb = Traversals::new();
+        tb.local = 2;
+        tb.epoch = 20;
+        // Finish boot's disabled recovery before enabling this newly installed head.
+        for _ in 0..8 {
+            ta.poll(&mut a, native_a, &context, 0);
+            tb.poll(&mut b, native_b, &context, 0);
+        }
+        assert_eq!(
+            a.admission(E::Enable {
+                definition: 4,
+                generation: 1,
+                revision: 0,
+                enabled: true
+            })
+            .status,
+            Status::Persisting
+        );
+        while a.pending_write() {
+            a.poll(&mut flash_a, native_a).unwrap();
+        }
+        let mut wire = [0; lattice_peer_wire::program::transfer::REQUEST_BYTES];
+        let mut data = [0; DATA_BYTES];
+        crate::kernel::change::bind(native_a);
+        for now in (10..=10_000).step_by(10) {
+            if now == 330 {
+                let admitted = ta.statistics.admitted;
+                let batch = crate::kernel::change::batch();
+                for sequence in 0..10 {
+                    crate::kernel::change::record(
+                        core::ptr::from_ref(native_a).cast(),
+                        STATE,
+                        Some(crate::ir::Value::boolean((sequence % 2 == 1) == truth)),
+                    );
+                }
+                runtime::admit_changes(&a, &mut ta);
+                ta.poll(&mut a, native_a, &context, now);
+                assert_eq!(ta.statistics.admitted, admitted);
+                assert_eq!(crate::kernel::change::evicted(), 2);
+                drop(batch);
+            }
+            runtime::admit_changes(&a, &mut ta);
+            ta.poll(&mut a, native_a, &context, now);
+            tb.poll(&mut b, native_b, &context, now);
+            if let Some((index, owner, n)) = ta.outgoing(now, &mut wire) {
+                assert_eq!(owner, 2);
+                ta.sent(index, now as u16, now);
+                let r = tb.receive(&b, 1, E::decode(&wire[..n]).unwrap(), now, &mut data);
+                ta.reply(index, r, now);
+            }
+            execution::run_ready(&context);
+        }
+        assert_eq!(native_b.calls.load(Ordering::Relaxed), 11 * truth as u32, "a admitted={} completed={} faults={} last={} pending={}; b admitted={} completed={} faults={} last={} pending={}; causes={} awaiting={:?}", ta.statistics.admitted,ta.statistics.completed,ta.statistics.faults,ta.statistics.last_status,ta.pending(),tb.statistics.admitted,tb.statistics.completed,tb.statistics.faults,tb.statistics.last_status,tb.pending(),super::activation::pending(),ta.awaiting());
+        assert_eq!((ta.statistics.faults, tb.statistics.faults), (0, 0));
+        assert!(a.initial().is_none());
+        assert_eq!(super::activation::overflow(), 0);
+        crate::kernel::change::reset();
+        execution::reset();
+    }
+}

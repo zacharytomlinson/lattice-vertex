@@ -234,6 +234,7 @@ impl ChangeNotice {
 /// wire validation excludes them. Call paths retain exact arguments for replay
 /// comparison; no foreign IR or appliance-state mirror is retained.
 pub(super) struct Forwarder {
+    next_request: Option<u16>,
     local: u64,
     network: Network,
     links: Links,
@@ -282,6 +283,7 @@ impl Forwarder {
     }
     pub(super) const fn new(local: u64, network: Network) -> Self {
         Self {
+            next_request: None,
             local,
             network,
             links: Links::new(),
@@ -499,7 +501,6 @@ impl Forwarder {
         })
     }
 
-    #[cfg(feature = "host-link")]
     fn originate_read_path(&mut self, request: ReadRequest, now: u32) -> Option<Option<u64>> {
         let reader = request.reader();
         let owner = request.owner();
@@ -616,7 +617,6 @@ impl Forwarder {
         }
     }
 
-    #[cfg(feature = "host-link")]
     pub(super) fn originate_program<'a>(
         &mut self,
         read: ProgramRead,
@@ -714,7 +714,6 @@ impl Forwarder {
         }
     }
 
-    #[cfg(feature = "host-link")]
     pub(super) fn complete_read<'a>(
         &mut self,
         incoming: Message<'a>,
@@ -764,13 +763,18 @@ impl Forwarder {
         (previous == self.local).then_some(incoming)
     }
 
-    #[cfg(feature = "host-link")]
     pub(super) fn cancel_read(&mut self, request: ReadRequest) {
         for path in &mut self.reads {
             if path.read == request && request.reader() == self.local {
                 *path = ReadPath::EMPTY;
             }
         }
+    }
+
+    pub(super) fn request_token(&mut self, seed: u16) -> u16 {
+        let next = self.next_request.map_or(seed, |n| n.wrapping_add(1));
+        self.next_request = Some(next);
+        next
     }
 
     #[cfg(feature = "host-link")]

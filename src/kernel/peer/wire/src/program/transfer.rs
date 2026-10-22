@@ -19,9 +19,15 @@ pub enum Status {
     Compatibility = 9,
     Storage = 10,
     Conflict = 11,
+    Enabled = 12,
+    Disabled = 13,
+    Accepted = 14,
+    Stale = 15,
+    Unavailable = 16,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request<'a> {
+    Execution(super::execution::Request<'a>),
     Info,
     Begin {
         transfer: u32,
@@ -50,6 +56,7 @@ pub enum Request<'a> {
 impl Request<'_> {
     pub fn encode(self, out: &mut [u8; REQUEST_BYTES]) -> usize {
         match self {
+            Self::Execution(request) => request.encode(out),
             Self::Dependencies { state, after } => {
                 out[0] = 6;
                 out[1..9].copy_from_slice(&state.to_le_bytes());
@@ -100,6 +107,9 @@ impl Request<'_> {
 }
 impl<'a> Request<'a> {
     pub fn decode(b: &'a [u8]) -> Option<Self> {
+        if b.first().is_some_and(|tag| *tag >= 7) {
+            return super::execution::Request::decode(b).map(Self::Execution);
+        }
         Some(match (b.first().copied()?, b.len()) {
             (0, 1) => Self::Info,
             (1, 7) => Self::Begin {
@@ -179,6 +189,11 @@ impl<'a> Reply<'a> {
             9 => Status::Compatibility,
             10 => Status::Storage,
             11 => Status::Conflict,
+            12 => Status::Enabled,
+            13 => Status::Disabled,
+            14 => Status::Accepted,
+            15 => Status::Stale,
+            16 => Status::Unavailable,
             _ => return None,
         };
         Some(Self {
@@ -197,7 +212,67 @@ mod tests {
     use super::*;
     #[test]
     fn record_bounds() {
+        use super::super::execution::{Cause, Entry, Request as E, Ticket, CHUNK_BYTES};
+        let ticket = Ticket {
+            epoch: 1,
+            slot: 2,
+            generation: 3,
+        };
         for (request, length) in [
+            (
+                Request::Execution(E::State {
+                    definition: 4,
+                    generation: 1,
+                }),
+                7,
+            ),
+            (
+                Request::Execution(E::Enable {
+                    definition: 4,
+                    generation: 1,
+                    revision: 0,
+                    enabled: true,
+                }),
+                12,
+            ),
+            (Request::Execution(E::Session), 1),
+            (
+                Request::Execution(E::Reserve {
+                    epoch: 1,
+                    sender_epoch: 2,
+                    sequence: 3,
+                    cause: Cause {
+                        owner: 4,
+                        epoch: 5,
+                        sequence: 6,
+                    },
+                    entry: Entry {
+                        definition: 4,
+                        generation: 1,
+                        record: 60,
+                    },
+                    upstream: true,
+                    length: 0,
+                }),
+                52,
+            ),
+            (
+                Request::Execution(E::Data {
+                    ticket,
+                    offset: 0,
+                    bytes: &[9; CHUNK_BYTES],
+                }),
+                REQUEST_BYTES,
+            ),
+            (
+                Request::Execution(E::Commit {
+                    ticket,
+                    digest: [7; 32],
+                }),
+                47,
+            ),
+            (Request::Execution(E::Release { ticket }), 15),
+            (Request::Execution(E::Statistics), 1),
             (Request::Info, 1),
             (
                 Request::Begin {
@@ -261,7 +336,7 @@ mod tests {
             for end in 0..n {
                 assert!(Reply::decode(&bytes[..end]).is_none());
             }
-            bytes[0] = 12;
+            bytes[0] = 17;
             assert!(Reply::decode(&bytes[..n]).is_none());
         }
     }

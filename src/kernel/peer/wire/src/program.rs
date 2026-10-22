@@ -2,6 +2,7 @@
 //! or an expression tree. The kernel validates bindings before publication.
 
 use crate::{scalar, Type, Value};
+pub mod execution;
 pub mod transfer;
 pub use lattice_ir::{Binary, Unary};
 

@@ -13,11 +13,11 @@ protocol manual, test diary or history of completed milestones.
 | State and native operations | Passive shared HAL, kernel getter acquisition, observed-value cache, registered deltas and history maintenance | Fallback sampling is implemented; direct device-event acquisition bindings remain optional port work |
 | Native call execution | Static FreeRTOS call tasks, asynchronous RF/USB completion, pending-call deduplication and update holds | Execution capacity is bounded; caller/route timeouts do not cancel a call or guarantee late result delivery |
 | Durable appliance bindings | Named declarations become owner-local numeric references; native lookup/deltas and LSF v2 use them; duplicate bindings are rejected | Loader reconstruction uses these references; changed physical meanings/types remain compatibility changes |
-| Program loading and wiring | Ordinary peer/USB installation, typed LPD records, durable commit, native dependency chains and reconstruction before formation | Definitions install inactive; activation, traversal and native program execution remain unimplemented |
+| Resident programs | Durable installation/enablement, upstream activation, typed local evaluation, receiver-reserved handoffs and asynchronous native invocation | Time/solar and externally installed retained-state operations remain absent; no physical execution validation yet |
 | Protected configuration storage | Both ports reserve 16 KiB; one kernel flash owner serves program storage and optional signed updates | Layout 3 requires coordinated provisioning; host checks do not establish physical power-loss recovery |
 | Retained state | Static native-width history, native updater, mathematical enumeration and ordinary reads/deltas | Firmware-bound before startup; not externally authored program storage |
 | Communication | Kernel-owned 802.15.4 framing, formation, maintained links, owner-directed forwarding and bounded MAC delivery | Concrete C6/Nordic backends; portable public hardware interface still missing |
-| Surface and native access | Read surfaces/current state, invoke native functions, forward observations | Upstream activation and predicate traversal still need execution integration |
+| Surface and native access | Read surfaces/current state, invoke native functions, forward observations | Program activation has separate bounded storage; outward observation publication remains lossy |
 | Host participation | Optional USB companion endpoint and shared numeric codec | Host clients live in `lattice-tools`; tablet consumes that library |
 | Firmware updates | Signed whole-image staging, durable resume, local deferral, startup confirmation and watchdog recovery | Combined-image replacement is accepted for now; independent kernel updates are deferred |
 
@@ -29,7 +29,7 @@ The firmware-local `observation::Dependent`/report API and its callback example
 have been removed and archived. The native updater accepted by
 `Appliance::install_state` remains a pre-start history helper, not the compiler's
 program interface. Resident records now install through the common peer service.
-Traversal execution remains absent.
+Native-state programs can now be enabled and executed after installation.
 
 ## Implementation map
 
@@ -54,7 +54,7 @@ flowchart TB
     abi["Independent kernel updates / binary interface: deferred"]
     monitor["appliance::execution: acquisition and finite native-call tasks"]
     programs["program: validated resident records and native source links"]
-    traversal["Upstream activation, local evaluation and traversal heads: to implement"]
+    traversal["program/traversal: independent visits, typed evaluation and complete handoffs"]
     installer["program/runtime: reception, commit and reconstruction"]
     time["Commissioned local time/solar predicates: to implement"]
 
@@ -84,11 +84,11 @@ flowchart TB
     monitor --> appliance
     monitor --> observation
     peer --> installer
-    observation -.-> traversal
+    observation -->|committed local causes| traversal
     programs --> appliance
-    traversal -.-> programs
-    traversal -.-> peer
-    traversal -.-> monitor
+    traversal --> programs
+    traversal <--> peer
+    traversal --> monitor
     installer --> programs
     installer -.-> history
     installer --> storage
@@ -96,47 +96,42 @@ flowchart TB
     time -.-> ports
 
     classDef planned stroke-dasharray: 5 5;
-    class adapters,abi,traversal,time planned;
+    class adapters,abi,time planned;
 ```
 
 ## Next implementation milestone
 
-[Program loading](../src/kernel/program/README.md) now receives definitions after
-firmware startup, validates their native bindings and local dataflow, commits them,
-and rebuilds state-to-program links on restart. Received bytes are never firmware
-callbacks or downloaded function pointers. The host client has upload, read and
-inspection commands. Installed definitions remain **inactive**; this is not yet an
-executing distributed program.
+The [resident program component](../src/kernel/program/README.md) now executes
+installed native-state definitions: committed observations activate upstream,
+enabled heads admit independent forward visits, primitive records select branches
+and calculate values, and native calls run in the existing RTOS tasks. Head
+admission changes commit before becoming effective. Accepted visits retain their
+storage under pressure; remote Busy produces retry, and local activation overflow
+is separately reported.
 
-Next, connect those resident records to execution:
+Host checks exercise installed records across two execution owners, including
+backward activation, conditional forwarding, independent causes, native invocation,
+partial handoffs, duplicate receipts and bounded storage. Both ports build. This
+is not yet a physical-radio execution result. The next concrete validation is to
+install and enable a native-state program on layout-3 boards, mutate its source,
+and observe the resulting native operation and registered change.
 
-1. Activate dependencies at the observation/history commit boundary, independently
-   of the transport ring's oldest-entry eviction. Follow their upstream references
-   to an enabled head without evaluating predicates on the upstream trip.
-2. Supply bounded per-traversal carried/scratch storage and run the installed local
-   primitives, following authored true/false links and reducing values greedily.
-   Invoke native functions through the existing RTOS call tasks. The manual-call
-   codec's payload limit is not the program head's capacity.
-3. Add admission/enablement and its persistent state. Enablement and recovery of an
-   enabled head each start one fresh evaluation when required local inputs are
-   available. Repeated requests do not create extra enablement evaluations; old
-   mutations are never replayed. Subsequent deltas remain independent activations.
-4. Bind local time/solar deadlines and externally authored retained-state maintenance
-   through the same source mechanism. Their unsupported record kinds are currently
-   rejected, not substituted with precompiled appliance functions.
+Time/solar deadlines and externally installed retained-state maintenance remain
+execution extensions. The [remaining program design](PROGRAM_DESIGN.md) identifies
+them in its worked example. Their absent record kinds are rejected. Replacement,
+delete/reclamation, head relocation and revision cutover remain separate lifecycle
+work; occupied definition extents are not reused.
 
-The [remaining program design](PROGRAM_DESIGN.md) keeps the worked distributed
-example and integration gaps. New definitions currently append to fixed storage;
-replacement, deletion/reclamation and old-work drainage need their own concrete
-implementation before those operations are offered. Do not imply that a local
-installation receipt establishes remote readiness or complete program execution.
+Reboot recovery currently initiates upstream activations from restored source
+bindings. Multiple returning participants can re-evaluate the same program;
+coordinated outage reconciliation is explicitly deferred. Receiver reservations
+and receipt retention prevent a repeated handoff from becoming a fresh invocation;
+loss of that evidence produces an uncertain outcome, not automatic replay.
 
-The one physical flash owner supports both configuration-only startup and signed
-updates. Trial confirmation now also requires successful program reconstruction.
-The loader runs on the resident task stack before PHY formation; it does not wait
-for a peer. Hardware validation still requires layout-3 provisioning. Host checks
-and builds establish storage/typing/wiring behavior, not live radio installation
-or physical execution.
+One physical flash owner supports configuration and signed updates. Startup commits
+a fresh receiver incarnation before execution and trial confirmation. The checkpoint
+also upgrades LPG v1 metadata without moving definitions or changing their references.
+Builds and host checks do not establish physical power-loss behavior.
 
 ## Deferred work
 
@@ -162,7 +157,7 @@ for preserving local configuration through combined-image updates.
 
 Both MCU targets have kernel/peer builds and selected hardware evidence for native
 calls, observed state and update lifecycle behavior. Those checks do not establish
-resident program execution, all multi-hop paths, physical appliance convergence
+physical resident program execution, all multi-hop paths, appliance convergence
 or loss-free RF. Test commands and their scope belong beside the owners above.
 RF range/PHY investigation remains parked; historical captures and pre-cleanup
 source snapshots are archived outside the repository.

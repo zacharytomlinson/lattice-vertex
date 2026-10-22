@@ -136,7 +136,9 @@ that does not validate every current multi-hop path or physical actuator.
 The resident transport provides [receive turns and MAC delivery](../radio/TESTING.md#receive-turns-in-the-resident-peer)
 for ordinary peer traffic. Native mutation results and observed state remain
 distinct; neither a transmitted frame nor an ACK proves physical convergence.
-Externally installed program traversal is still unimplemented.
+Externally installed native-state programs now execute through the
+[resident program component](../program/README.md). Its host checks exercise
+cross-owner execution; live radio program execution remains unverified.
 
 Historical captures, superseded wire-version runs, and RF comparisons are retained
 in the external lab. They are not test dependencies or current reliability bounds.

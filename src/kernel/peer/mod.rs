@@ -187,6 +187,37 @@ fn participate(
         let now = tasks::xTaskGetTickCount();
         let milliseconds = ((now as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
         forwarder.expire(milliseconds);
+        crate::kernel::program::runtime::poll_work(local, &context, milliseconds);
+        if let Some((index, request, owner, sent)) = crate::kernel::program::runtime::awaiting() {
+            if milliseconds.wrapping_sub(sent) >= 2_000 {
+                forwarder.cancel_read(forwarding::ReadRequest::Program(frame::ProgramRead {
+                    reader: local,
+                    owner,
+                    request,
+                }));
+                crate::kernel::program::runtime::retry(index, milliseconds);
+            }
+        }
+        let mut program_bytes = [0; lattice_peer_wire::program::transfer::REQUEST_BYTES];
+        if let Some((index, owner, length)) =
+            crate::kernel::program::runtime::outgoing(milliseconds, &mut program_bytes)
+        {
+            let read = frame::ProgramRead {
+                reader: local,
+                owner,
+                request: forwarder.request_token(milliseconds as u16),
+            };
+            if let Some(message) =
+                forwarder.originate_program(read, &program_bytes[..length], milliseconds)
+            {
+                crate::kernel::program::runtime::sent(index, read.request, milliseconds);
+                if !send(radio, message, &mut sequence, &mut outgoing_buffer) {
+                    forwarder.transmit_failed(&message);
+                }
+            } else {
+                crate::kernel::program::runtime::retry(index, milliseconds);
+            }
+        }
         if let Some(done) = invocations.take_completion() {
             for previous in done.previous.into_iter().filter(|p| *p != 0) {
                 let reply = Message {
@@ -293,6 +324,27 @@ fn participate(
                 | Content::LinkEntry { network: n, .. } if n == network)
             {
                 crate::kernel::update::activation::activity();
+            }
+            if let Content::ProgramResult {
+                network: n,
+                read,
+                bytes,
+                ..
+            } = message.content
+            {
+                if n == network && read.reader == local {
+                    if let Some((index, request, owner, _)) =
+                        crate::kernel::program::runtime::awaiting()
+                    {
+                        if read.request == request && read.owner == owner {
+                            if forwarder.complete_read(message, measured_at).is_some() {
+                                forwarder.cancel_read(forwarding::ReadRequest::Program(read));
+                                crate::kernel::program::runtime::reply(index, bytes, measured_at);
+                            }
+                            continue;
+                        }
+                    }
+                }
             }
             #[cfg(feature = "host-link")]
             if matches!(message.content, Content::InvocationResult { call, .. } if call.caller == local)

@@ -9,8 +9,10 @@ behavior from remaining work.
 
 The loader accepts new definitions after firmware startup, commits them in the
 protected configuration region, and reconstructs their state-to-program links.
-They remain inactive. The following example describes the intended execution of
-those records; current installation tests do not establish that execution.
+Definitions install inactive and can then be enabled. Native-state predicates,
+primitive arithmetic, upstream activation, forward handoffs and native calls execute
+from those records. The time predicate in the following example remains unimplemented;
+the full example is a design, not a claimed running automation.
 
 ## Worked installation and traversal
 
@@ -67,29 +69,20 @@ deadline path after computing their next boundary. Unanchored time remains unava
 
 ## Integration still required
 
-- Observation/history commit activates the owned state's dependency links. The
-  eight-entry change ring is a lossy transport buffer; consuming it alone cannot
-  define graph activation admission.
-- An upstream activation finds the enabled head. Forward visits use independent,
-  compiler-sized carried values and visit-local scratch. Neither primitive tests
-  nor the read/write head require an IR expression-tree interpreter.
-- Complete incoming visits must be assembled before evaluation. Preserve their
-  identity across forwarding and handle incomplete handoffs explicitly. A MAC ACK
-  alone is not evidence of program admission or physical execution.
-- Native program invocations use kernel RTOS tasks and their normal hardware
-  synchronization. Preserve independent deltas, overlapping traversals and already
-  admitted work. No later state change cancels an earlier visit.
-- Enablement and recovery of an enabled head each admit one fresh evaluation once
-  required local state/time are available. They do not replay an old invocation.
-- Time/solar records use local deadlines at their assigned evaluation owner;
-  deadline expiry follows its upstream link. No per-second program scan or special
-  clock vertex is introduced. Commissioned time still needs reacquisition after
-  lost counter continuity.
-- Retained/derived state maintenance needs externally installed calculations and
-  bounded storage. The existing firmware-bound history helper is not that loader.
-- New-definition installation does not implement head relocation, revision cutover,
-  drain evidence or storage reclamation. Those lifecycle operations remain absent;
-  occupied definition extents are not silently reused.
+- Time/solar records need local deadlines at their assigned evaluation owner;
+  expiry follows the ordinary upstream activation path. There is no per-second
+  program scan or special clock vertex. Time needs reacquisition after lost
+  counter continuity.
+- Retained/derived maintenance needs externally installed calculations and bounded
+  storage. The firmware-bound history helper is not that loader.
+- Replacement, head relocation, revision cutover, drain evidence and storage
+  reclamation remain absent. Occupied definition extents are not reused.
+- Reboot recovery currently initiates independent upstream activations from restored
+  source bindings. Multiple returning participants can cause repeated evaluations;
+  coordinated outage reconciliation is deferred.
+
+The implemented execution bounds, reservation/receipt protocol and admission commands
+belong in the [program component](../src/kernel/program/README.md), not a second ABI here.
 
 The appliance boundary remains the implemented passive HAL: getters and finite
 native hardware operations. It gains no automation, networking, reporting loop or
