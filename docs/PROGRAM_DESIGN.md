@@ -11,8 +11,9 @@ The loader accepts new definitions after firmware startup, commits them in the
 protected configuration region, and reconstructs their state-to-program links.
 Definitions install inactive and can then be enabled. Native-state predicates,
 primitive arithmetic, upstream activation, forward handoffs and native calls execute
-from those records. The time predicate in the following example remains unimplemented;
-the full example is a design, not a claimed running automation.
+from those records. Installed local time/solar predicates now use the same source
+and traversal paths. The full three-owner example below remains a layout exercise,
+not a claimed hardware run.
 
 ## Worked installation and traversal
 
@@ -27,8 +28,8 @@ if A.occupied && B.lux < 120 && B.time_in_window(20:00, 22:00):
     C.SetLevel(u8(((120u16 - B.lux) * 200u16) / 120u16))
 ```
 
-This is a layout exercise, not a claimed physical lighting model. The time basis
-is UTC for this example; it does not choose a civil-time/DST policy. The true lux
+This is a layout exercise, not a claimed physical lighting model. The window uses
+commissioned local civil time, including DST. The true lux
 branch makes subtraction safe and the intermediate is at most 24,000, so u16
 arithmetic followed by explicit narrowing suffices. Read lux once for that visit's
 test/calculation; this does not snapshot other vertices.
@@ -69,10 +70,6 @@ deadline path after computing their next boundary. Unanchored time remains unava
 
 ## Integration still required
 
-- Time/solar records need local deadlines at their assigned evaluation owner;
-  expiry follows the ordinary upstream activation path. There is no per-second
-  program scan or special clock vertex. Time needs reacquisition after lost
-  counter continuity.
 - Retained/derived maintenance needs externally installed calculations and bounded
   storage. The firmware-bound history helper is not that loader.
 - Replacement, head relocation, revision cutover, drain evidence and storage
@@ -88,3 +85,7 @@ The appliance boundary remains the implemented passive HAL: getters and finite
 native hardware operations. It gains no automation, networking, reporting loop or
 program callbacks when these pieces are connected. Independent kernel/appliance
 OTA remains deferred.
+
+Time/solar mechanics, recurring-rule limits, clock reference messages and deadline
+semantics now belong to [kernel/time](../src/kernel/time/README.md). Jarvis's pure
+solar/date mathematics was reused; its entity graph and host database remain there.

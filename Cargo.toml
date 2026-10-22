@@ -124,6 +124,7 @@ tickless-idle = []            # configUSE_TICKLESS_IDLE
 # mini-list-item = []  # configUSE_MINI_LIST_ITEM optimization
 
 [dependencies]
+libm = "=0.2.16"
 ed25519-dalek = { version = "=2.2.0", default-features = false, optional = true }
 sha2 = { version = "=0.10.9", default-features = false }
 lattice-storage = { path = "src/kernel/storage" }

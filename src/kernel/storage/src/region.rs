@@ -32,6 +32,10 @@ impl<'a, F: NorFlash> Region<'a, F> {
         self.writable = false;
         self
     }
+    /// The port can temporarily prohibit mutation while an image is on trial.
+    pub fn is_writable(&self) -> bool {
+        self.writable
+    }
     fn address(&self, offset: u32, length: usize) -> Result<u32, NorFlashErrorKind> {
         if length > u32::MAX as usize
             || offset

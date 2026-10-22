@@ -121,3 +121,12 @@ C6 selects slots in place: omit `--swap-bytes` and use the watchdog runner's
 default 25-second minimum. The [HAL watchdog handoff gap](../../../../docs/FIRMWARE_UPDATES.md#watchdog-backed-startup-confirmation)
 remains uncovered. Physical interruption during a flash write/metadata commit is
 not established by the host fault-injection checks.
+
+## Installed-program check
+
+Add `--appliance` to `prepare --ota` to bind the existing native dimmer fixture
+(power, u8 level, SetLevel and retained level observations) to the binary USB peer.
+The release policy is fingerprinted from that actual surface. No automation is
+compiled into this image: definitions and enablement arrive after boot through
+ordinary program messages. Use `lattice-tools` for installation and inspection.
+The fixture exercises MCU dispatch and registered state, not a physical lamp.

@@ -1,6 +1,7 @@
 //! Numeric transport definitions; no radio driver, RTOS, interpreter, or allocator.
 #![no_std]
 pub use lattice_ir::{Integer, Type, Value};
+pub mod clock;
 pub mod cost;
 #[cfg(feature = "host")]
 pub mod host;

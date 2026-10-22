@@ -196,12 +196,14 @@ fn trial_confirmation_and_reversion() {
         let mut trial = ImageStorage::new(flash.clone(), LAYOUT).unwrap();
         assert_eq!(trial.begin(128), Err(Error::TrialPending));
         let mut config = trial.configuration().unwrap();
+        assert!(!config.is_writable());
         let mut retained = [0; 4];
         config.read(0, &mut retained).unwrap();
         assert_eq!(retained, [0x5a; 4]);
         assert!(config.erase(0, PAGE_SIZE).is_err());
         if confirm {
             trial.confirm().unwrap();
+            assert!(trial.configuration().unwrap().is_writable());
         }
         drop(trial);
         let (_, state) = prepare_boot(flash.clone(), LAYOUT).unwrap();

@@ -126,3 +126,12 @@ Nordic layout 3 requires `--swap-bytes 372736` for cost measurement and
 `--minimum-recovery-seconds 65` for the watchdog runner. The whole active slot is
 swapped, regardless of candidate length. Physical interruption during a swap has
 host fault-injection coverage but remains an unperformed hardware check.
+
+## Installed-program check
+
+Add `--appliance` to `prepare --ota` to bind the existing native dimmer fixture
+(power, u8 level, SetLevel and retained level observations) to the binary USB peer.
+The release policy is fingerprinted from that actual surface. No automation is
+compiled into this image: definitions and enablement arrive after boot through
+ordinary program messages. Use `lattice-tools` for installation and inspection.
+The fixture exercises MCU dispatch and registered state, not a physical lamp.

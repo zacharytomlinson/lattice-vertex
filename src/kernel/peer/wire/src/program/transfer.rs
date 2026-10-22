@@ -27,6 +27,7 @@ pub enum Status {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request<'a> {
+    Clock(crate::clock::Request),
     Execution(super::execution::Request<'a>),
     Info,
     Begin {
@@ -56,6 +57,7 @@ pub enum Request<'a> {
 impl Request<'_> {
     pub fn encode(self, out: &mut [u8; REQUEST_BYTES]) -> usize {
         match self {
+            Self::Clock(r) => r.encode(out),
             Self::Execution(request) => request.encode(out),
             Self::Dependencies { state, after } => {
                 out[0] = 6;
@@ -107,6 +109,9 @@ impl Request<'_> {
 }
 impl<'a> Request<'a> {
     pub fn decode(b: &'a [u8]) -> Option<Self> {
+        if b.first().is_some_and(|tag| *tag >= 15) {
+            return crate::clock::Request::decode(b).map(Self::Clock);
+        }
         if b.first().is_some_and(|tag| *tag >= 7) {
             return super::execution::Request::decode(b).map(Self::Execution);
         }

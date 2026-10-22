@@ -189,7 +189,7 @@ fn record_admission() {
 fn installation_publication() {
     let native = Device::new();
     let mut flash = Flash::new();
-    let mut programs = Programs::new();
+    let mut programs = Configuration::new();
     programs.restore(&mut flash, &native, &SURFACE).unwrap();
     let mut references = Vec::new();
     for (transfer, argument) in [(1, true), (2, false)] {
@@ -266,7 +266,7 @@ fn installation_publication() {
     }
     // Reconstruct against new native storage, using only committed bytes.
     let restarted = Device::new();
-    let mut restored = Programs::new();
+    let mut restored = Configuration::new();
     restored.restore(&mut flash, &restarted, &SURFACE).unwrap();
     let mut link = restarted.head.load(Ordering::Acquire);
     for expected in references.iter().rev() {
@@ -313,7 +313,7 @@ fn partial_installation() {
     for accepted in [0, 1, 48, 113, 114] {
         let native = Device::new();
         let mut flash = Flash::new();
-        let mut programs = Programs::new();
+        let mut programs = Configuration::new();
         programs.restore(&mut flash, &native, &SURFACE).unwrap();
         let bytes = definition(true);
         programs.receive(
@@ -353,7 +353,7 @@ fn partial_installation() {
                 Status::Invalid
             );
         }
-        let mut restarted = Programs::new();
+        let mut restarted = Configuration::new();
         restarted.restore(&mut flash, &native, &SURFACE).unwrap();
         assert_eq!(restarted.used, 4);
         assert_eq!(native.head.load(Ordering::Acquire), NONE);
@@ -365,7 +365,7 @@ fn reservation_expiry() {
     for started in [0, u32::MAX - 10_000] {
         let native = Device::new();
         let mut flash = Flash::new();
-        let mut p = Programs::new();
+        let mut p = Configuration::new();
         p.restore(&mut flash, &native, &SURFACE).unwrap();
         p.receive(
             5,
@@ -386,8 +386,8 @@ fn reservation_expiry() {
     }
 }
 
-fn install(bytes: &[u8], native: &dyn Native, flash: &mut Flash) -> Programs {
-    let mut p = Programs::new();
+fn install(bytes: &[u8], native: &dyn Native, flash: &mut Flash) -> Configuration {
+    let mut p = Configuration::new();
     p.restore(flash, native, &SURFACE).unwrap();
     assert_eq!(
         p.receive(
@@ -456,7 +456,7 @@ fn admission_commit() {
             p.poll(&mut flash, &native).unwrap();
         }
         let committed = p.enabled(4);
-        let mut restored = Programs::new();
+        let mut restored = Configuration::new();
         restored.restore(&mut flash, &native, &SURFACE).unwrap();
         assert_eq!(restored.enabled(4), committed);
         assert!(restored.initial().is_none()); // Recovery has its own source walk.
@@ -515,7 +515,7 @@ fn admission_commit() {
 
 #[test]
 fn configuration_versions() {
-    for version in [1, 2, 3] {
+    for version in [1, 2, 3, 4] {
         let native = Device::new();
         let mut flash = Flash::new();
         let mut p = install(&definition(true), &native, &mut flash);
@@ -524,10 +524,10 @@ fn configuration_versions() {
         while p.pending_write() {
             p.poll(&mut flash, &native).unwrap();
         }
-        let mut restored = Programs::new();
+        let mut restored = Configuration::new();
         let result = restored.restore(&mut flash, &native, &SURFACE);
-        assert_eq!(result.is_ok(), version <= 2);
-        if version <= 2 {
+        assert_eq!(result.is_ok(), version <= 3);
+        if version <= 3 {
             assert_eq!(&restored.bytes[..4], &MAGIC);
             assert_eq!(restored.part(4, 1).unwrap().definition.head(), Some(60));
             let before = restored.epoch();
@@ -536,11 +536,103 @@ fn configuration_versions() {
                 restored.poll(&mut flash, &native).unwrap();
             }
             assert!(restored.epoch() > before);
-            let mut again = Programs::new();
+            let mut again = Configuration::new();
             again.restore(&mut flash, &native, &SURFACE).unwrap();
             assert_eq!(&again.bytes[..4], &MAGIC);
         }
     }
+}
+
+#[test]
+fn clock_configuration_commit() {
+    use lattice_peer_wire::clock::{Profile, Request as C, Zone};
+    let native = Device::new();
+    let mut flash = Flash::new();
+    let mut p = install(&definition(true), &native, &mut flash);
+    let end = p.used;
+    let profile = Profile {
+        latitude: 30_000_000,
+        longitude: -97_000_000,
+        zone: Zone::UTC,
+    };
+    for revision in 0..2 {
+        let profile = Profile {
+            latitude: profile.latitude + revision as i32,
+            ..profile
+        };
+        let request = C::Configure { revision, profile };
+        assert_eq!(p.clock_request(request).status, Status::Persisting);
+        while p.pending_write() {
+            // Every interrupted checkpoint still exposes the previous complete record.
+            let mut recovered = Configuration::new();
+            recovered.restore(&mut flash, &native, &SURFACE).unwrap();
+            assert_eq!(
+                recovered.clock().map(|c| c.0),
+                (revision != 0).then_some(revision)
+            );
+            p.poll(&mut flash, &native).unwrap();
+        }
+        assert_eq!(p.clock(), Some((revision + 1, profile)));
+        assert_eq!(p.clock_request(request).status, Status::Ok);
+        assert_eq!(p.used, end + CLOCK_BYTES as u16);
+        let mut restored = Configuration::new();
+        restored.restore(&mut flash, &native, &SURFACE).unwrap();
+        assert_eq!(restored.clock(), p.clock());
+        assert_eq!(restored.part(4, 1).unwrap().definition.head(), Some(60));
+    }
+}
+
+#[test]
+fn temporal_source_boundaries() {
+    use lattice_peer_wire::clock::{Predicate, Profile, Zone, MIN_UTC};
+    crate::port::test_port_reset();
+    activation::reset();
+    let mut time = crate::kernel::time::Time::new();
+    time.configure(
+        Some(Profile {
+            latitude: 0,
+            longitude: 0,
+            zone: Zone::UTC,
+        }),
+        0,
+    );
+    time.add(100, Predicate::Civil { start: 1, end: 2 }, 0)
+        .unwrap();
+    time.anchor(1, 0, MIN_UTC * 1000, 0).unwrap();
+    for (mono, truth, emitted) in [
+        (0, false, false),
+        (999, false, false),
+        (1000, true, true),
+        (1000, true, false),
+        (1999, true, false),
+        (2000, false, true),
+    ] {
+        time.poll(mono);
+        assert_eq!(time.value(100), Some(truth));
+        assert_eq!(activation::pending(), emitted);
+        if emitted {
+            assert_eq!(
+                activation::first().unwrap().cursor,
+                100 | crate::kernel::time::SOURCE
+            );
+            activation::advance(NONE);
+        }
+    }
+    // No native source is necessary: the temporal record is itself a local source.
+    let mut bytes = terminal(0);
+    bytes.truncate(48);
+    bytes[10..12].copy_from_slice(&48u16.to_le_bytes());
+    bytes.extend_from_slice(&[8, 0, 0, 0, 0, 1, 56, 0]); // head entry -> temporal record
+    bytes.extend_from_slice(&[16, 0, 7, 48, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        validation::validate(&bytes, &Device::new(), &SURFACE),
+        Ok(())
+    );
+    bytes[59..61].copy_from_slice(&56u16.to_le_bytes());
+    assert_eq!(
+        validation::validate(&bytes, &Device::new(), &SURFACE),
+        Err(Error::Link)
+    );
 }
 
 struct Running {

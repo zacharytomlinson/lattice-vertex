@@ -2,7 +2,7 @@
 //! compiler-sized working extent until completion or acknowledged transfer.
 use super::{
     evaluation::{self, Values},
-    Programs,
+    Configuration,
 };
 use crate::{
     ir::Value,
@@ -186,7 +186,7 @@ impl Traversals {
     }
     fn reserve(
         &mut self,
-        programs: &Programs,
+        programs: &Configuration,
         entry: Entry,
         cause: Cause,
         upstream: bool,
@@ -227,7 +227,7 @@ impl Traversals {
         });
         Ok(slot)
     }
-    pub fn activate(&mut self, programs: &Programs, entry: Entry) -> Result<(), Status> {
+    pub fn activate(&mut self, programs: &Configuration, entry: Entry) -> Result<(), Status> {
         if self.epoch == 0 {
             return Err(Status::Busy);
         }
@@ -280,7 +280,7 @@ impl Traversals {
         index: usize,
         link: Link,
         upstream: bool,
-        programs: &Programs,
+        programs: &Configuration,
     ) -> Result<(), Status> {
         match link {
             Link::Stop => self.finish(index),
@@ -342,7 +342,7 @@ impl Traversals {
     }
     pub fn poll(
         &mut self,
-        programs: &mut Programs,
+        programs: &mut Configuration,
         native: &'static dyn Native,
         context: &TaskContext,
         now: u32,
@@ -415,7 +415,7 @@ impl Traversals {
         &mut self,
         index: usize,
         v: Visit,
-        programs: &Programs,
+        programs: &Configuration,
         native: &'static dyn Native,
         context: &TaskContext,
     ) -> Result<bool, Status> {
@@ -469,6 +469,14 @@ impl Traversals {
             .split_at_mut(v.carried as usize);
         let mut values = Values { carried, scratch };
         let next = match op {
+            Operation::Temporal { yes, no, .. } => {
+                let source = v.entry.definition + super::PREFIX as u16 + v.entry.record;
+                if super::runtime::temporal_value(source).ok_or(Status::Unavailable)? {
+                    yes
+                } else {
+                    no
+                }
+            }
             Operation::Entry { inputs, next, .. } => {
                 for input in inputs.iter() {
                     values.read(input).map_err(super::status)?;
@@ -598,7 +606,7 @@ impl Traversals {
     }
     pub fn receive<'a>(
         &mut self,
-        programs: &Programs,
+        programs: &Configuration,
         caller: u64,
         request: Request<'_>,
         now: u32,
@@ -614,7 +622,7 @@ impl Traversals {
     }
     fn handle<'a>(
         &mut self,
-        programs: &Programs,
+        programs: &Configuration,
         caller: u64,
         request: Request<'_>,
         now: u32,

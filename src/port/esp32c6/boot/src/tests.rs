@@ -182,6 +182,7 @@ fn pending_trial_cannot_destroy_rollback_and_confirmation_updates_only_running_r
     let mut storage = ImageStorage::new(flash.clone(), LAYOUT, 1).unwrap();
     assert_eq!(storage.begin(521), Err(Error::TrialPending));
     let mut config = storage.configuration().unwrap();
+    assert!(!config.is_writable());
     let mut retained = [0; 4];
     config.read(0, &mut retained).unwrap();
     assert_eq!(retained, [0x5a; 4]);
@@ -189,6 +190,7 @@ fn pending_trial_cannot_destroy_rollback_and_confirmation_updates_only_running_r
     assert_eq!(flash.0.borrow().bytes, before);
     storage.confirm().unwrap();
     assert_eq!(storage.boot_state(), BootState::Valid);
+    assert!(storage.configuration().unwrap().is_writable());
     assert_eq!(
         metadata::read(&mut flash.clone(), LAYOUT.ota_data.offset).unwrap(),
         [valid(1), valid(2)]

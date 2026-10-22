@@ -14,12 +14,14 @@ use lattice_peer_wire::program::{
     transfer::{Reply, Request, Status, DATA_BYTES},
     Definition, Error, Source, NONE,
 };
-use lattice_storage::configuration::Configuration;
+use lattice_storage::configuration::Configuration as Snapshot;
 use sha2::{Digest, Sha256};
 
 const CAPACITY: usize = 8192;
+const _: () = assert!(CAPACITY < super::time::SOURCE as usize);
 const PREFIX: usize = 24;
-const MAGIC: [u8; 4] = *b"LPG\x02";
+const MAGIC: [u8; 4] = *b"LPG\x03";
+const CLOCK_BYTES: usize = PREFIX + lattice_peer_wire::clock::PROFILE_BYTES;
 
 #[derive(Clone, Copy)]
 struct Part<'a> {
@@ -31,19 +33,31 @@ struct Part<'a> {
 }
 fn parts(bytes: &[u8]) -> impl Iterator<Item = Result<Part<'_>, Status>> {
     let mut at = 4;
-    core::iter::from_fn(move || {
+    core::iter::from_fn(move || loop {
         if at >= bytes.len() {
             return None;
         }
         let result = (|| {
             let prefix = bytes.get(at..at + PREFIX).ok_or(Status::Invalid)?;
             let length = u16::from_le_bytes(prefix[..2].try_into().unwrap()) as usize;
-            if length < PREFIX || prefix[2] & !3 != 0 || prefix[3] != 0 {
+            if length < PREFIX || at + length > bytes.len() || prefix[2] & !3 != 0 || prefix[3] > 1
+            {
                 return Err(Status::Invalid);
             }
             let generation = u32::from_le_bytes(prefix[4..8].try_into().unwrap());
             if generation == 0 {
                 return Err(Status::Invalid);
+            }
+            if prefix[3] == 1 {
+                if length != CLOCK_BYTES
+                    || prefix[2] != 0
+                    || lattice_peer_wire::clock::Profile::decode(&bytes[at + PREFIX..at + length])
+                        .is_none()
+                {
+                    return Err(Status::Invalid);
+                }
+                at += length;
+                return Ok(None);
             }
             let part = Part {
                 offset: at as u16,
@@ -56,13 +70,71 @@ fn parts(bytes: &[u8]) -> impl Iterator<Item = Result<Part<'_>, Status>> {
                 .map_err(status)?,
             };
             at += length;
-            Ok(part)
+            Ok(Some(part))
         })();
         if result.is_err() {
             at = bytes.len();
         }
-        Some(result)
+        match result {
+            Ok(Some(part)) => return Some(Ok(part)),
+            Ok(None) => continue,
+            Err(e) => return Some(Err(e)),
+        }
     })
+}
+fn clock_bytes(revision: u32, profile: lattice_peer_wire::clock::Profile) -> [u8; CLOCK_BYTES] {
+    let mut b = [0; CLOCK_BYTES];
+    b[..2].copy_from_slice(&(CLOCK_BYTES as u16).to_le_bytes());
+    b[3] = 1;
+    b[4..8].copy_from_slice(&revision.to_le_bytes());
+    profile.encode((&mut b[PREFIX..]).try_into().unwrap());
+    b
+}
+fn context_record(
+    bytes: &[u8],
+) -> Result<Option<(u16, u32, lattice_peer_wire::clock::Profile)>, Status> {
+    let mut at = 4;
+    let mut found = None;
+    while at < bytes.len() {
+        let prefix = bytes.get(at..at + PREFIX).ok_or(Status::Invalid)?;
+        let n = u16::from_le_bytes(prefix[..2].try_into().unwrap()) as usize;
+        if n < PREFIX || at + n > bytes.len() || prefix[3] > 1 {
+            return Err(Status::Invalid);
+        }
+        if prefix[3] == 1 {
+            let revision = u32::from_le_bytes(prefix[4..8].try_into().unwrap());
+            if found.is_some()
+                || n != CLOCK_BYTES
+                || revision == 0
+                || prefix[2] != 0
+                || prefix[8..].iter().any(|b| *b != 0)
+            {
+                return Err(Status::Invalid);
+            }
+            found = Some((
+                at as u16,
+                revision,
+                lattice_peer_wire::clock::Profile::decode(&bytes[at + PREFIX..at + n])
+                    .ok_or(Status::Invalid)?,
+            ));
+        }
+        at += n;
+    }
+    Ok(found)
+}
+fn temporal_count(bytes: &[u8]) -> Result<usize, Status> {
+    let mut count = 0;
+    for p in parts(bytes) {
+        for r in p?.definition.records() {
+            if matches!(
+                r.map_err(status)?.operation,
+                lattice_peer_wire::program::Operation::Temporal { .. }
+            ) {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
 }
 fn status(error: Error) -> Status {
     match error {
@@ -93,21 +165,135 @@ struct Pending {
 #[derive(Clone, Copy)]
 struct Checkpoint {
     target: Option<(u16, bool, u32)>,
+    clock: Option<(u16, u32, lattice_peer_wire::clock::Profile)>,
     phase: Phase,
 }
 
-pub(crate) struct Programs {
+pub(crate) struct Configuration {
     bytes: [u8; CAPACITY],
     reply: [u8; DATA_BYTES],
     used: u16,
-    store: Option<Configuration>,
+    store: Option<Snapshot>,
     pending: Option<Pending>,
     checkpoint_pending: Option<Checkpoint>,
     initial_pending: bool,
+    clock_offset: u16,
+    temporal_dirty: bool,
     last_activity: u32,
     state: Status,
 }
-impl Programs {
+impl Configuration {
+    fn clock(&self) -> Option<(u32, lattice_peer_wire::clock::Profile)> {
+        if self.clock_offset == NONE {
+            return None;
+        }
+        let at = self.clock_offset as usize;
+        Some((
+            u32::from_le_bytes(self.bytes[at + 4..at + 8].try_into().unwrap()),
+            lattice_peer_wire::clock::Profile::decode(&self.bytes[at + PREFIX..at + CLOCK_BYTES])
+                .unwrap(),
+        ))
+    }
+    fn clock_request(&mut self, request: lattice_peer_wire::clock::Request) -> Reply<'_> {
+        use lattice_peer_wire::clock::Request as C;
+        let old = self.clock();
+        let revision = old.map_or(0, |c| c.0);
+        if let C::Configure {
+            revision: expected,
+            profile,
+        } = request
+        {
+            if !profile.valid() {
+                return Reply::status(Status::Invalid);
+            }
+            if old.is_some_and(|(r, p)| {
+                p == profile && (expected == r || expected.checked_add(1) == Some(r))
+            }) {
+            } else {
+                if expected != revision {
+                    return Reply::status(Status::Conflict);
+                }
+                if self.pending.is_some() || self.checkpoint_pending.is_some() {
+                    return Reply::status(Status::Busy);
+                }
+                let Some(next) = revision.checked_add(1) else {
+                    return Reply::status(Status::Bounds);
+                };
+                let at = if self.clock_offset == NONE {
+                    self.used
+                } else {
+                    self.clock_offset
+                };
+                let total = (self.used as usize).max(at as usize + CLOCK_BYTES);
+                let Some(store) = self.store.as_mut() else {
+                    return Reply::status(Status::Unsupported);
+                };
+                if total > store.capacity().min(CAPACITY as u32) as usize {
+                    return Reply::status(Status::Bounds);
+                }
+                if store.begin(total as u32).is_err() {
+                    return Reply::status(Status::Storage);
+                }
+                self.checkpoint_pending = Some(Checkpoint {
+                    target: None,
+                    clock: Some((at, next, profile)),
+                    phase: Phase::Erasing,
+                });
+                return Reply {
+                    generation: next,
+                    ..Reply::status(Status::Persisting)
+                };
+            }
+        } else if request != C::Profile {
+            return Reply::status(Status::Unsupported);
+        }
+        if let Some((generation, profile)) = old {
+            profile.encode((&mut self.reply[..32]).try_into().unwrap());
+            Reply {
+                generation,
+                bytes: &self.reply[..32],
+                ..Reply::status(Status::Ok)
+            }
+        } else {
+            Reply::status(Status::Unavailable)
+        }
+    }
+    fn temporal_records(
+        &self,
+    ) -> impl Iterator<Item = (u16, lattice_peer_wire::clock::Predicate)> + '_ {
+        parts(&self.bytes[..self.used as usize])
+            .filter_map(Result::ok)
+            .flat_map(|p| {
+                p.definition.records().filter_map(move |r| {
+                    let r = r.ok()?;
+                    if let lattice_peer_wire::program::Operation::Temporal { predicate, .. } =
+                        r.operation
+                    {
+                        Some((p.offset + PREFIX as u16 + r.offset, predicate))
+                    } else {
+                        None
+                    }
+                })
+            })
+    }
+    fn temporal_entry(&self, source: u16) -> Option<lattice_peer_wire::program::execution::Entry> {
+        for p in parts(&self.bytes[..self.used as usize]).filter_map(Result::ok) {
+            let start = p.offset as usize + PREFIX;
+            if (source as usize) >= start && (source as usize) < start + p.definition.bytes().len()
+            {
+                if let lattice_peer_wire::program::Operation::Temporal { entry, .. } =
+                    p.definition.record(source - start as u16).ok()?.operation
+                {
+                    return Some(lattice_peer_wire::program::execution::Entry {
+                        definition: p.offset,
+                        generation: p.generation,
+                        record: entry,
+                    });
+                }
+            }
+        }
+        None
+    }
     pub(crate) const fn new() -> Self {
         Self {
             bytes: [0; CAPACITY],
@@ -117,6 +303,8 @@ impl Programs {
             pending: None,
             checkpoint_pending: None,
             initial_pending: false,
+            clock_offset: NONE,
+            temporal_dirty: false,
             last_activity: 0,
             state: Status::Unsupported,
         }
@@ -131,8 +319,9 @@ impl Programs {
         self.pending = None;
         self.checkpoint_pending = None;
         self.initial_pending = false;
+        self.clock_offset = NONE;
         self.state = Status::Storage;
-        let store = Configuration::open(flash).map_err(|_| Status::Storage)?;
+        let store = Snapshot::open(flash).map_err(|_| Status::Storage)?;
         let used = store.current().map_or(4, |i| i.length() as usize);
         if !(4..=CAPACITY).contains(&used) {
             return Err(Status::Bounds);
@@ -147,11 +336,20 @@ impl Programs {
         self.used = used as u16;
         self.store = Some(store);
         let legacy = self.bytes[..4] == *b"LPG\x01";
-        if self.bytes[..4] != MAGIC && !legacy {
+        let older = legacy || self.bytes[..4] == *b"LPG\x02";
+        if self.bytes[..4] != MAGIC && !older {
             self.state = Status::Invalid;
             return Err(self.state);
         }
         let result = (|| {
+            let clock = context_record(&self.bytes[..used])?;
+            if older && clock.is_some() {
+                return Err(Status::Invalid);
+            }
+            self.clock_offset = clock.map_or(NONE, |(offset, _, _)| offset);
+            if temporal_count(&self.bytes[..used])? > super::time::CAPACITY {
+                return Err(Status::Bounds);
+            }
             for part in parts(&self.bytes[..used]) {
                 let part = part?;
                 if self.bytes[part.offset as usize + 2] & 2 != 0 {
@@ -180,12 +378,17 @@ impl Programs {
         Ok(())
     }
     fn wire(&mut self, native: &dyn Native) {
+        self.temporal_dirty = true;
         native.clear_dependencies();
         let mut part_offset = 4;
         while part_offset < self.used as usize {
             let length =
                 u16::from_le_bytes(self.bytes[part_offset..part_offset + 2].try_into().unwrap())
                     as usize;
+            if self.bytes[part_offset + 3] != 0 {
+                part_offset += length;
+                continue;
+            }
             let start = part_offset + PREFIX;
             let count =
                 u16::from_le_bytes(self.bytes[start + 8..start + 10].try_into().unwrap()) as usize;
@@ -271,6 +474,9 @@ impl Programs {
         if self.state != Status::Ok {
             return self.progress(self.state);
         }
+        if let Request::Clock(request) = request {
+            return self.clock_request(request);
+        }
         if let Request::Execution(request) = request {
             return self.admission(request);
         }
@@ -323,7 +529,7 @@ impl Programs {
             | Request::Data { transfer, .. }
             | Request::Commit { transfer, .. }
             | Request::Abort { transfer } => transfer,
-            _ => unreachable!(),
+            _ => return Reply::status(Status::Unsupported),
         };
         if self.checkpoint_pending.is_some() {
             return Reply::status(Status::Busy);
@@ -441,6 +647,8 @@ impl Programs {
                         Status::Conflict
                     } else if let Err(error) = validation::validate(bytes, native, surface) {
                         status(error)
+                    } else if temporal_count(&self.bytes[..self.used as usize]).unwrap_or(usize::MAX).saturating_add(Definition::parse(bytes).unwrap().records().filter(|r| matches!(r,Ok(r) if matches!(r.operation,lattice_peer_wire::program::Operation::Temporal {..}))).count()) > super::time::CAPACITY {
+                        Status::Bounds
                     } else if Definition::parse(bytes)
                         .unwrap()
                         .sources()
@@ -555,7 +763,7 @@ impl Programs {
     }
 }
 
-impl Programs {
+impl Configuration {
     fn part(&self, offset: u16, generation: u32) -> Result<Part<'_>, Status> {
         if self.state != Status::Ok {
             return Err(self.state);
@@ -588,6 +796,7 @@ impl Programs {
             .map_err(|_| Status::Storage)?;
         self.checkpoint_pending = Some(Checkpoint {
             target,
+            clock: None,
             phase: Phase::Erasing,
         });
         Ok(())
@@ -664,6 +873,9 @@ impl Programs {
     }
     fn poll_checkpoint<F: NorFlash>(&mut self, flash: &mut F) -> Result<(), Status> {
         let mut control = self.checkpoint_pending.unwrap();
+        let total = control.clock.map_or(self.used as usize, |(at, _, _)| {
+            (self.used as usize).max(at as usize + CLOCK_BYTES)
+        });
         let result: Result<bool, lattice_storage::Error> = (|| {
             let store = self.store.as_mut().unwrap();
             match control.phase {
@@ -673,13 +885,22 @@ impl Programs {
                     }
                 }
                 Phase::Writing(offset) => {
-                    let end = (offset as usize + 256).min(self.used as usize);
+                    let end = (offset as usize + 256).min(total);
                     let mut bytes = [0; 256];
                     canonical_range(
                         &self.bytes[..self.used as usize],
                         offset as usize,
                         &mut bytes[..end - offset as usize],
                     );
+                    if let Some((at, revision, profile)) = control.clock {
+                        let record = clock_bytes(revision, profile);
+                        for (i, value) in record.into_iter().enumerate() {
+                            let position = at as usize + i;
+                            if position >= offset as usize && position < end {
+                                bytes[position - offset as usize] = value;
+                            }
+                        }
+                    }
                     if let Some((target, enabled, revision)) = control.target {
                         for (at, value) in core::iter::once((target as usize + 2, enabled as u8))
                             .chain(
@@ -696,7 +917,7 @@ impl Programs {
                         }
                     }
                     store.write(flash, offset as u32, &bytes[..end - offset as usize])?;
-                    control.phase = if end == self.used as usize {
+                    control.phase = if end == total {
                         Phase::Committing
                     } else {
                         Phase::Writing(end as u16)
@@ -721,6 +942,12 @@ impl Programs {
                 Ok(())
             }
             Ok(true) => {
+                if let Some((at, revision, profile)) = control.clock {
+                    self.bytes[at as usize..at as usize + CLOCK_BYTES]
+                        .copy_from_slice(&clock_bytes(revision, profile));
+                    self.used = total as u16;
+                    self.clock_offset = at;
+                }
                 if let Some((target, enabled, revision)) = control.target {
                     self.bytes[target as usize + 2] = if enabled { 3 } else { 0 };
                     self.initial_pending |= enabled;
@@ -753,7 +980,7 @@ impl Programs {
     fn recovery(&self, after: u16) -> Option<(u16, lattice_peer_wire::program::execution::Entry)> {
         use lattice_peer_wire::program::execution::Entry;
         for p in parts(&self.bytes[..self.used as usize]).filter_map(Result::ok) {
-            if p.definition.sources().next().is_none() && p.offset > after && self.enabled(p.offset)
+            if p.definition.sources().next().is_none() && !p.definition.records().any(|r| matches!(r,Ok(r) if matches!(r.operation,lattice_peer_wire::program::Operation::Temporal {..}))) && p.offset > after && self.enabled(p.offset)
             {
                 if let Some(record) = p.definition.head() {
                     return Some((
@@ -779,6 +1006,21 @@ impl Programs {
                     ));
                 }
             }
+            for r in p.definition.records().filter_map(Result::ok) {
+                if let lattice_peer_wire::program::Operation::Temporal { entry, .. } = r.operation {
+                    let at = p.offset + PREFIX as u16 + r.offset;
+                    if at > after {
+                        return Some((
+                            at,
+                            Entry {
+                                definition: p.offset,
+                                generation: p.generation,
+                                record: entry,
+                            },
+                        ));
+                    }
+                }
+            }
         }
         None
     }
@@ -798,7 +1040,11 @@ fn canonical_digest(definition: Definition<'_>) -> [u8; 32] {
 }
 
 fn canonical_range(image: &[u8], offset: usize, output: &mut [u8]) {
-    output.copy_from_slice(&image[offset..offset + output.len()]);
+    output.fill(0);
+    if offset < image.len() {
+        let n = output.len().min(image.len() - offset);
+        output[..n].copy_from_slice(&image[offset..offset + n]);
+    }
     for part in parts(image) {
         let Ok(part) = part else {
             break;

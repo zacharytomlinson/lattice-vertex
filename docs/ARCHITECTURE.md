@@ -829,6 +829,22 @@ upstream-to-head activation path. Forward traversal reads that predicate at its 
 position. The kernel arms the next relevant deadline rather than repeatedly scanning every
 program or comparing the clock once per second.
 
+Civil-time predicates such as 20:00–22:00 follow the installation's local civil
+time, including daylight-saving changes. Commissioning must therefore supply the
+timezone information needed to determine those changes, alongside UTC and location.
+UTC remains the common reference; a fixed offset alone does not implement this
+policy. Timezone interpretation and solar calculation belong to the kernel, not
+appliance adapters. A small recurring month/week/weekday rule pair allows each
+vertex to derive future seasonal transitions from the commissioned policy. Rules
+are policy, not geography: coordinates alone cannot supply civil timezone law.
+If that policy changes, commissioning updates it; no annual transition download
+is needed for an unchanged recurring rule.
+
+A tablet or computer can supply the initial reference and rough coordinates.
+An outdoor observational vertex with GPS may later supply an accurate reference
+through the same ordinary peer mechanism. Neither GPS nor Wi-Fi is a required
+kernel interface, and the observation provider acquires no special network role.
+
 Commissioned location/time configuration occupies rewritable reserved storage that
 survives firmware updates, separate from disposable transfer journals. Location
 can survive a restart; time validity also requires counter continuity. An unanchored

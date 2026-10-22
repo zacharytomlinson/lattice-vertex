@@ -39,6 +39,8 @@ pub(crate) mod peer;
 #[cfg(feature = "use-mutexes")]
 pub(crate) mod program;
 pub(crate) mod storage;
+#[cfg(feature = "use-mutexes")]
+pub(crate) mod time;
 #[cfg(feature = "firmware-update")]
 pub mod update;
 #[cfg(feature = "host-link")]

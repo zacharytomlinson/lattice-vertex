@@ -74,6 +74,8 @@ def write_hex(path, memory):
 
 
 def prepare(args):
+    if args.appliance and not args.ota:
+        raise ValueError("--appliance requires --ota")
     if args.staging_check and not args.ota:
         raise ValueError("--staging-check requires --ota")
     if args.watchdog_check and not args.ota:
@@ -94,6 +96,7 @@ def prepare(args):
     if args.watchdog_check:
         builds += [("stall-entry", "ota-stall-before-init"), ("stall-radio", "ota-stall-before-radio")]
     for name, features in builds:
+        if args.appliance: features += ",ota-appliance"
         if args.staging_check and name == "a": features += ",ota-staging-check"
         if args.activation_check and name == "a": features += ",ota-activation-check"
         subprocess.run(common + ["--bin", "radio" if args.program else "ota" if args.ota else "update", "--features", features], cwd=HERE, check=True)
@@ -148,6 +151,7 @@ def main():
     build.add_argument("--activation-check", action="store_true", help="hold automatic activation for ten seconds after verification in image A")
     build.add_argument("--staging-check", action="store_true", help="hold staging for ten seconds after accepting an offer in image A")
     build.add_argument("--watchdog-check", action="store_true", help="also build stalled trial images for hardware rollback checks")
+    build.add_argument("--appliance", action="store_true", help="bind the native dimmer fixture to the OTA/USB peer; no preinstalled programs")
     mode = build.add_mutually_exclusive_group()
     mode.add_argument("--ota", action="store_true", help="build the signed receiver and binary host interface")
     mode.add_argument("--program", action="store_true", help="build the storage-backed appliance without signing policy or preinstalled programs")

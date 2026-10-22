@@ -200,7 +200,9 @@ fn participate(
         }
         let mut program_bytes = [0; lattice_peer_wire::program::transfer::REQUEST_BYTES];
         if let Some((index, owner, length)) =
-            crate::kernel::program::runtime::outgoing(milliseconds, &mut program_bytes)
+            crate::kernel::program::runtime::outgoing(milliseconds, &mut program_bytes, |after| {
+                forwarder.time_neighbor(after)
+            })
         {
             let read = frame::ProgramRead {
                 reader: local,
@@ -210,7 +212,7 @@ fn participate(
             if let Some(message) =
                 forwarder.originate_program(read, &program_bytes[..length], milliseconds)
             {
-                crate::kernel::program::runtime::sent(index, read.request, milliseconds);
+                crate::kernel::program::runtime::sent(index, owner, read.request, milliseconds);
                 if !send(radio, message, &mut sequence, &mut outgoing_buffer) {
                     forwarder.transmit_failed(&message);
                 }
@@ -298,6 +300,11 @@ fn participate(
         } else {
             timeout
         };
+        let timeout = crate::kernel::program::runtime::deadline_ms().map_or(timeout, |ms| {
+            timeout.min(
+                crate::milliseconds_to_ticks_checked(ms).unwrap_or(crate::types::portMAX_DELAY),
+            )
+        });
         #[cfg(feature = "host-link")]
         let timeout = host.wait_ms(milliseconds).map_or(timeout, |ms| {
             timeout.min(crate::milliseconds_to_ticks_checked(ms as u64).unwrap())

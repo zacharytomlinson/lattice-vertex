@@ -41,6 +41,12 @@ pub(super) fn validate(bytes: &[u8], native: &dyn Native, surface: &[u8; 32]) ->
         }
         outputs[count] = output;
         match r.operation {
+            Operation::Temporal { entry, .. } => {
+                if entry >= r.offset {
+                    return Err(Error::Link);
+                }
+                activation(d, entry)?;
+            }
             Operation::Entry {
                 upstream, inputs, ..
             } => {
@@ -194,18 +200,7 @@ pub(super) fn validate(bytes: &[u8], native: &dyn Native, surface: &[u8; 32]) ->
         if native.state_binding(source.state).is_none() {
             return Err(Error::Binding);
         }
-        let mut at = source.entry;
-        loop {
-            let Operation::Entry { upstream, .. } = d.record(at)?.operation else {
-                return Err(Error::Link);
-            };
-            match upstream {
-                Link::Stop if d.head() == Some(at) => break,
-                Link::Remote(_) => break,
-                Link::Local(previous) => at = previous,
-                _ => return Err(Error::Link),
-            }
-        }
+        activation(d, source.entry)?;
         if d.sources()
             .take_while(|s| s.offset < source.offset)
             .any(|s| s.state == source.state)
@@ -250,6 +245,30 @@ pub(super) fn validate(bytes: &[u8], native: &dyn Native, surface: &[u8; 32]) ->
     };
     for (i, item) in d.records().enumerate() {
         match item?.operation {
+            Operation::Temporal { entry, .. } => {
+                let mut from_entry = [false; MAX_RECORDS];
+                let entry_index = offsets[..count]
+                    .iter()
+                    .position(|o| *o == entry)
+                    .ok_or(Error::Link)?;
+                from_entry[entry_index] = true;
+                for j in entry_index..i {
+                    if from_entry[j] {
+                        for edge in edges[j] {
+                            if edge != NONE {
+                                let k = offsets[..count]
+                                    .iter()
+                                    .position(|o| *o == edge)
+                                    .ok_or(Error::Link)?;
+                                from_entry[k] = true;
+                            }
+                        }
+                    }
+                }
+                if !from_entry[i] {
+                    return Err(Error::Link);
+                }
+            }
             Operation::Unary { input, .. } | Operation::Branch { input, .. } => check(i, input)?,
             Operation::Binary { left, right, .. } | Operation::Test { left, right, .. } => {
                 check(i, left)?;
@@ -264,6 +283,19 @@ pub(super) fn validate(bytes: &[u8], native: &dyn Native, surface: &[u8; 32]) ->
         }
     }
     Ok(())
+}
+fn activation(d: Definition<'_>, mut at: u16) -> Result<(), Error> {
+    loop {
+        let Operation::Entry { upstream, .. } = d.record(at)?.operation else {
+            return Err(Error::Link);
+        };
+        match upstream {
+            Link::Stop if d.head() == Some(at) => return Ok(()),
+            Link::Remote(_) => return Ok(()),
+            Link::Local(previous) if previous < at => at = previous,
+            _ => return Err(Error::Link),
+        }
+    }
 }
 fn overlaps(a: Location, b: Location) -> bool {
     a.region == b.region && a.offset < b.end().unwrap() && b.offset < a.end().unwrap()

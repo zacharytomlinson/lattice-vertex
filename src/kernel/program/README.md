@@ -10,7 +10,8 @@ callback, installation loop, storage policy, or message handler.
 head-admission command enables execution. The kernel follows upstream activation
 links, evaluates the installed local records, transfers complete visits and invokes
 native functions in existing RTOS tasks. Firmware supplies no evaluator callback.
-Time/solar and externally installed retained-state maintenance remain unsupported.
+Local time/solar records use kernel deadlines and the same upstream activation
+path. Externally installed retained-state maintenance remains unsupported.
 
 ## Ownership and publication
 
@@ -23,9 +24,11 @@ without storage still forwards program traffic and reports `Unsupported` locally
 
 The loader runs in the resident radio/peer task. It reconstructs before PHY
 formation, using the task stack rather than the board entry stack. Trial firmware
-cannot confirm startup until its definitions reconstruct and a new receiver incarnation
-commits. One configuration checkpoint per boot gives new receiver tickets an epoch
-that cannot alias tickets issued before restart. This is not a mutation journal.
+cannot confirm startup until its definitions reconstruct. Configuration remains
+read-only during an unconfirmed trial. After confirmation permits writes, one
+configuration checkpoint commits a new receiver incarnation before execution is
+admitted. Its epoch cannot alias tickets issued before restart. This is not a
+mutation journal.
 Confirmed firmware can still expose a reconstruction error for recovery without
 inventing a physical mutation. Nothing invokes a native getter or transformer
 merely to validate/install its declaration.
@@ -85,6 +88,14 @@ Each operation record begins with its complete byte length (`u16`) and kind
 | 4 test | Comparison primitive, left/right operands, true/false links |
 | 5 branch | Boolean operand, true/false links |
 | 6 invoke | Native transformer reference `u64`, argument list, success/failure links |
+| 7 temporal | Activation entry `u16`, temporal predicate, true/false links |
+
+A temporal predicate is tag 0 plus start/end `u32` local seconds, or tag 1 plus
+two solar boundaries. Each solar boundary is event `u8` (sunrise=0, noon=1,
+sunset=2) and signed offset seconds `i32`. The record registers a local source even
+when a preceding condition short-circuits. Its activation entry must precede and
+reach it, and lead upstream to a head/foreign owner. It consumes no carried slot.
+The [time component](../time/README.md) owns its clock/deadline semantics.
 
 The invoke record describes continuation on the returned native result. It does
 not infer physical completion or encode an acceptance-only continuation. A
@@ -119,17 +130,23 @@ capacity separately. Firmware callbacks cannot substitute for missing record kin
 
 ## Persistent image
 
-The committed payload starts with `LPG`, version byte 2, followed by local
-definitions. Each has a 24-byte prefix: total prefix-plus-definition length
-(`u16`), enabled flag (`u8`, 0 or 1), reserved zero (`u8`), generation (`u32`),
+The committed payload starts with `LPG`, version byte 3, followed by local
+definitions and an optional commissioned clock profile. Each has a 24-byte prefix: total prefix-plus-definition length
+(`u16`), enabled flag (`u8`, 0 or 1), record kind zero (`u8`), generation (`u32`),
 installing caller (`u64`), transfer nonce (`u32`), and admission revision (`u32`).
-LPG v1 is read as disabled with admission revision zero; the startup checkpoint
-upgrades its header and preserves every definition offset and generation. Runtime
+LPG v1 is read as disabled with admission revision zero. V2 admission is preserved.
+The startup checkpoint upgrades either header and preserves every definition offset and generation. Runtime
 source links and the pending-initial-evaluation flag are excluded from saved/read bytes. Definitions append to this
 image; there is no deletion, live replacement or reuse of occupied extents yet.
 Generations do not wrap. The immutable caller/nonce and canonical definition
 digest distinguish a repeated commit from conflicting work after a lost reply or
 restart. A reservation receipt is not a commit receipt.
+
+One kind-1 context record uses the same 24-byte prefix followed by a 32-byte clock
+profile. Its length is 56, generation is the profile revision, and other prefix
+fields are zero. It appends once and is subsequently replaced in place within a
+new committed image. Definitions before or after it keep their original offsets.
+The exported image includes this context; it is not an LPD definition.
 
 The [shared store](../storage/README.md#local-configuration) provides interrupted-
 write recovery. This layer determines what those bytes mean and when their native
@@ -154,6 +171,9 @@ the ordinary path-cost field. Host v4 carries these through kinds **7/0x87**.
 | 4 abort | Transfer; only a receiving reservation can be discarded |
 | 5 read | Offset `u16` within the committed local image |
 | 6 dependencies | Native state reference `u64`, source cursor `u16`; `0xffff` starts at the head |
+
+Clock commands 15–18 share this service; layouts and revision semantics are in the
+[time component](../time/README.md#commissioning-and-reacquisition).
 
 Replies contain status `u8`, offset `u16`, generation `u32`, accepted `u16`, total
 `u16`, byte count `u8`, and up to 48 bytes. Begin/Data/Commit offsets identify the
@@ -263,5 +283,16 @@ installed automation. Build with `--bin radio --features program-test`; the port
 `tests/target/program`. Preparation does not flash a board. Follow the port's
 existing layout-3 provisioning procedure with those artifacts before a physical
 test. This mode needs no release public key. Signed-update builds use
-the same service. Build/host checks do not establish a live radio installation or
-physical program execution.
+the same service. `prepare --ota --appliance` provides the existing dimmer fixture
+and binary USB host endpoint together; it still contains no preinstalled program.
+
+The 2026-10-22 C6/nRF52840 hardware check installed 133-byte and 135-byte definitions
+after boot, including radio installation of the remote half. It evaluated
+`C6.level >= 100 && Nordic.power`, computed `C6.level - 50` at the C6, and invoked
+Nordic SetLevel with that carried byte. False predicates suppressed mutation;
+changing only Nordic power activated backward through the C6 and returned to the
+Nordic. Enable/disable/resume, registered delta events, and reconstruction after
+resetting both MCUs passed, with no reported execution faults, uncertain handoffs
+or activation overflow in the capture. These are software-backed native surfaces;
+the result does not establish physical dimmer behavior or loss-free RF. Artifacts,
+captures and the one-off authoring/check script remain in the external lab.

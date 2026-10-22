@@ -28,7 +28,8 @@ Useful component entry points:
 - [Hardware checks](../src/port/TESTING.md), including port-owned build/upload recipes.
 - [Package/transfer tools](../tools/README.md) and
   [shared flash storage](../src/kernel/storage/README.md).
-- [Resident program records and installation](../src/kernel/program/README.md).
+- [Resident program records and installation](../src/kernel/program/README.md),
+  [local time and solar](../src/kernel/time/README.md).
 
 Historical run logs, device-specific captures and superseded investigations live
 in the external local lab. They are not kernel dependencies. Maintained procedures

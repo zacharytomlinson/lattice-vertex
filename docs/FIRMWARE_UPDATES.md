@@ -258,8 +258,11 @@ is guaranteed. A ready measured candidate bounds pending-policy receive waits to
 
 ## Watchdog-backed startup confirmation
 
-`update::startup` confirms after storage/appliance initialization, an advancing
-kernel tick, and a completed local radio energy measurement. It needs no neighbor,
+`storage::startup` confirms after storage/appliance initialization, successful
+read-only program reconstruction, an advancing kernel tick, and a completed local
+radio energy measurement. The receiver-incarnation checkpoint waits until trial
+confirmation permits configuration writes; execution then waits for that checkpoint.
+Startup confirmation needs no neighbor,
 packet exchange, or successful network formation. This establishes local startup,
 not arbitrary appliance correctness. The kernel writes confirmation once. An
 uncertain failure stops watchdog feeding rather than retrying changed metadata;

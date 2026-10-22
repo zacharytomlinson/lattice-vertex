@@ -94,6 +94,12 @@ impl<'a> Operands<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Operation<'a> {
+    Temporal {
+        entry: u16,
+        predicate: crate::clock::Predicate,
+        yes: Link,
+        no: Link,
+    },
     Entry {
         upstream: Link,
         inputs: Operands<'a>,
@@ -143,7 +149,9 @@ impl Operation<'_> {
             | Self::Read { next, .. }
             | Self::Unary { next, .. }
             | Self::Binary { next, .. } => [next, Link::Stop],
-            Self::Test { yes, no, .. } | Self::Branch { yes, no, .. } => [yes, no],
+            Self::Test { yes, no, .. }
+            | Self::Branch { yes, no, .. }
+            | Self::Temporal { yes, no, .. } => [yes, no],
             Self::Invoke {
                 success, failure, ..
             } => [success, failure],
@@ -425,6 +433,17 @@ fn decode_record(bytes: &[u8], offset: u16) -> Result<Record<'_>, Error> {
             success: r.link()?,
             failure: r.link()?,
         },
+        7 => {
+            let entry = r.word()?;
+            let (predicate, n) = crate::clock::Predicate::decode(r.0).ok_or(Error::Encoding)?;
+            r.take(n)?;
+            Operation::Temporal {
+                entry,
+                predicate,
+                yes: r.link()?,
+                no: r.link()?,
+            }
+        }
         _ => return Err(Error::Encoding),
     };
     if !r.0.is_empty() {

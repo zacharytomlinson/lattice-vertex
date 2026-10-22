@@ -415,6 +415,9 @@ impl Forwarder {
         let (peer, token) = self.links.maintain(now)?;
         Some(self.link_message(peer, LinkPhase::Offer, token))
     }
+    pub(super) fn time_neighbor(&self, after: u64) -> Option<u64> {
+        self.links.read(after).1.map(|link| link.peer)
+    }
 
     fn link_message(&self, peer: u64, phase: LinkPhase, token: u32) -> Message<'static> {
         Message {

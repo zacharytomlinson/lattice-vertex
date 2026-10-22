@@ -86,15 +86,21 @@ fn main() -> ! {
         TaskHandle::spawn_static(&context, b"ota-usb", &mut STACK, &mut CONTROL, 1, usb_task)
             .unwrap();
     }
-    static APPLIANCE: kernel::Appliance<(), core::convert::Infallible> =
-        kernel::Appliance::new(&lattice_vertex::surface::EMPTY);
-    APPLIANCE.initialize(&context, ());
+    #[cfg(feature = "ota-appliance")]
+    let appliance = lattice_radio_test::surface::appliance(&context, true);
+    #[cfg(not(feature = "ota-appliance"))]
+    let appliance = {
+        static APPLIANCE: kernel::Appliance<(), core::convert::Infallible> =
+            kernel::Appliance::new(&lattice_vertex::surface::EMPTY);
+        APPLIANCE.initialize(&context, ());
+        &APPLIANCE
+    };
     kernel::start_with_updates(
         context,
         p.IEEE802154,
-        &APPLIANCE,
+        appliance,
         storage,
-        update_policy::policy(2),
+        update_policy::policy(2, kernel::update::appliance_surface_identity(appliance)),
     )
 }
 #[panic_handler]

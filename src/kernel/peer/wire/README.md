@@ -11,8 +11,13 @@ Native invocation messages use the existing scalar argument bounds and statuses
 callback-fragment prototype; they are now rejected and reserved against semantic
 reuse in this wire version. `program` now owns LPD v1 records and installation
 commands/replies used by LVT opcodes 21/22 and host kinds 7/0x87. See the
-[program component](../../program/README.md) for their limits. Traversal-head
-delivery and execution remain separate work.
+[program component](../../program/README.md) for installation, receiver-reserved
+handoffs and execution limits. Their runtime remains in the kernel.
+
+`clock` supplies numeric commissioning profiles, recurring Gregorian/civil rules,
+temporal predicate encodings and reference messages. It carries no live clock,
+deadline task or hardware dependency. [Local time/solar](../../time/README.md) owns
+those runtime responsibilities.
 
 The optional `host` feature adds the bounded local packet records and COBS stream
 codec described in [the host interface](../host/README.md). This replaces the former

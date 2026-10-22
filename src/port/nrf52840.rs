@@ -65,7 +65,12 @@ pub fn initialize(mut systick: SYST) -> hal::Peripherals {
     // crystal nor board-specific regulator inductors are needed for this port.
     let peripherals = hal::init(config);
     #[cfg(feature = "nrf52840-update")]
-    watchdog::start();
+    {
+        watchdog::start();
+        let mut core = unsafe { cortex_m::Peripherals::steal() };
+        core.DCB.enable_trace();
+        core.DWT.enable_cycle_counter();
+    }
     INITIALIZED.store(true, Ordering::Release);
     peripherals
 }
