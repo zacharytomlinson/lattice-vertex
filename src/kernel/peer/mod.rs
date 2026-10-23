@@ -4,6 +4,8 @@
 
 use crate::kernel::radio::cost::TimePerByte;
 mod bootstrap;
+#[cfg(feature = "use-mutexes")]
+mod control;
 pub(crate) mod exposure;
 mod forwarding;
 pub(crate) mod frame;
@@ -99,6 +101,34 @@ fn update_control_complete(
     }
 }
 
+#[cfg(feature = "use-mutexes")]
+fn receive_request(
+    control: &mut control::Control,
+    native: &'static dyn crate::kernel::appliance::Native,
+    context: &crate::sync::TaskContext,
+    caller: u64,
+    request: lattice_peer_wire::program::transfer::Request<'_>,
+    now: u32,
+    output: &mut [u8; lattice_peer_wire::program::transfer::REPLY_BYTES],
+) -> usize {
+    if let lattice_peer_wire::program::transfer::Request::Control(request) = request {
+        let mut bytes = [0; lattice_peer_wire::program::transfer::DATA_BYTES];
+        control
+            .receive(
+                caller,
+                request,
+                crate::kernel::program::runtime::epoch(),
+                native,
+                context,
+                now,
+                &mut bytes,
+            )
+            .encode(output)
+    } else {
+        crate::kernel::program::runtime::receive(caller, request, output)
+    }
+}
+
 // Common discovery filter, not an allocated PAN or membership credential.
 const PAN_ID: u16 = 0x4c56;
 
@@ -169,6 +199,7 @@ fn participate(
     let mut piece = [0; frame::SURFACE_BYTES];
     let mut forwarder = forwarding::Forwarder::new(local, network);
     let mut invocations = invocation::Invocations::new();
+    let mut control = control::take();
     #[cfg(feature = "host-link")]
     let mut host = host::Host::new();
     let context = unsafe { crate::sync::TaskContext::assume() };
@@ -187,6 +218,24 @@ fn participate(
         let now = tasks::xTaskGetTickCount();
         let milliseconds = ((now as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
         forwarder.expire(milliseconds);
+        #[cfg(feature = "host-link")]
+        while let Some(target) = host::take_target() {
+            if let Some((request, owner)) = control.offer(target, milliseconds) {
+                forwarder.cancel_read(forwarding::ReadRequest::Program(frame::ProgramRead {
+                    reader: local,
+                    owner,
+                    request,
+                }));
+            }
+        }
+        control.poll(native, &context, milliseconds);
+        while let Some((request, owner)) = control.canceled() {
+            forwarder.cancel_read(forwarding::ReadRequest::Program(frame::ProgramRead {
+                reader: local,
+                owner,
+                request,
+            }));
+        }
         crate::kernel::program::runtime::poll_work(local, &context, milliseconds);
         if let Some((index, request, owner, sent)) = crate::kernel::program::runtime::awaiting() {
             if milliseconds.wrapping_sub(sent) >= 2_000 {
@@ -196,6 +245,58 @@ fn participate(
                     request,
                 }));
                 crate::kernel::program::runtime::retry(index, milliseconds);
+            }
+        }
+        if let Some((index, request, owner, sent)) = control.awaiting() {
+            if milliseconds.wrapping_sub(sent) >= 200 {
+                forwarder.cancel_read(forwarding::ReadRequest::Program(frame::ProgramRead {
+                    reader: local,
+                    owner,
+                    request,
+                }));
+                control.retry(index, milliseconds);
+            }
+        }
+        let mut control_bytes = [0; lattice_peer_wire::program::transfer::REQUEST_BYTES];
+        if let Some((index, owner, length)) = control.outgoing(
+            crate::kernel::program::runtime::epoch(),
+            milliseconds,
+            &mut control_bytes,
+        ) {
+            let read = frame::ProgramRead {
+                reader: local,
+                owner,
+                request: forwarder.request_token(milliseconds as u16),
+            };
+            if owner == local {
+                control.sent(index, read.request, milliseconds);
+                let mut bytes = [0; lattice_peer_wire::program::transfer::REPLY_BYTES];
+                let request =
+                    lattice_peer_wire::program::transfer::Request::decode(&control_bytes[..length])
+                        .unwrap();
+                let n = receive_request(
+                    &mut control,
+                    native,
+                    &context,
+                    local,
+                    request,
+                    milliseconds,
+                    &mut bytes,
+                );
+                control.reply(
+                    index,
+                    lattice_peer_wire::program::transfer::Reply::decode(&bytes[..n]).unwrap(),
+                    milliseconds,
+                );
+            } else if let Some(message) =
+                forwarder.originate_program(read, &control_bytes[..length], milliseconds)
+            {
+                control.sent(index, read.request, milliseconds);
+                if !send(radio, message, &mut sequence, &mut outgoing_buffer) {
+                    forwarder.transmit_failed(&message);
+                }
+            } else {
+                control.retry(index, milliseconds);
             }
         }
         let mut program_bytes = [0; lattice_peer_wire::program::transfer::REQUEST_BYTES];
@@ -254,6 +355,7 @@ fn participate(
                 &description,
                 native,
                 &mut invocations,
+                &mut control,
                 &context,
                 milliseconds,
             )
@@ -295,11 +397,14 @@ fn participate(
         collect_costs(radio, &mut forwarder, measured_at);
         let timeout =
             period.saturating_sub(tasks::xTaskGetTickCount().wrapping_sub(last_discovery));
-        let timeout = if crate::kernel::program::runtime::pending() {
+        let timeout = if crate::kernel::program::runtime::pending() || control.pending() {
             timeout.min(crate::milliseconds_to_ticks_checked(10).unwrap())
         } else {
             timeout
         };
+        let timeout = control.wait_ms(milliseconds).map_or(timeout, |ms| {
+            timeout.min(crate::milliseconds_to_ticks_checked(ms as u64).unwrap())
+        });
         let timeout = crate::kernel::program::runtime::deadline_ms().map_or(timeout, |ms| {
             timeout.min(
                 crate::milliseconds_to_ticks_checked(ms).unwrap_or(crate::types::portMAX_DELAY),
@@ -340,6 +445,19 @@ fn participate(
             } = message.content
             {
                 if n == network && read.reader == local {
+                    if let Some((index, request, owner, _)) = control.awaiting() {
+                        if read.request == request && read.owner == owner {
+                            if forwarder.complete_read(message, measured_at).is_some() {
+                                forwarder.cancel_read(forwarding::ReadRequest::Program(read));
+                                if let Some(r) =
+                                    lattice_peer_wire::program::transfer::Reply::decode(bytes)
+                                {
+                                    control.reply(index, r, measured_at);
+                                }
+                            }
+                            continue;
+                        }
+                    }
                     if let Some((index, request, owner, _)) =
                         crate::kernel::program::runtime::awaiting()
                     {
@@ -374,7 +492,17 @@ fn participate(
                     message,
                     milliseconds,
                     &mut reply_bytes,
-                    crate::kernel::program::runtime::receive,
+                    |caller, request, output| {
+                        receive_request(
+                            &mut control,
+                            native,
+                            &context,
+                            caller,
+                            request,
+                            milliseconds,
+                            output,
+                        )
+                    },
                 ) {
                     if !send(radio, reply, &mut sequence, &mut outgoing_buffer) {
                         forwarder.transmit_failed(&reply);
@@ -567,7 +695,9 @@ fn participate(
                 now,
                 local,
                 conflict,
-                forwarder.work_pending() || crate::kernel::program::runtime::pending(),
+                forwarder.work_pending()
+                    || crate::kernel::program::runtime::pending()
+                    || control.pending(),
                 |notice| {
                     let sent = send(
                         radio,

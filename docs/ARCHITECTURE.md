@@ -464,10 +464,20 @@ zero-copy path that the implementation has not demonstrated. Measure input-to-di
 and input-to-observed-state latency; radio airtime, contention, retries and finite native
 execution still contribute. A hard latency bound requires those costs to be bounded.
 
-Streaming does not authorize cancellation or supersession of accepted work, or merging
-actual registered appliance deltas. Any combining of unsent UI samples is a separate,
-explicit input policy. Ordering, the outstanding-update bound and disconnect/reconnect
-behavior must be decided before implementation; no particular stream ABI is fixed here.
+A live scalar stream represents the user's current intended target. Obsolete intermediate
+slider positions may be replaced at both sender and receiver while still pending; native
+preparation may be retargeted until the hardware function starts. This explicitly differs
+from admitting a discrete program/native operation: accepting a stream sample records
+current intent and does not promise to invoke every intermediate value. A running native
+call is not preempted. Every actual acquired appliance change retains its normal delta
+semantics. Hardware qualification and application units determine meaningful granularity;
+the kernel does not invent a universal brightness deadband.
+
+Finishing a gesture seals its latest target for a native result and observed-state
+feedback. Closing an unsealed session abandons undispatched intent. A disconnected host
+cannot carry an old unsent target into a new attachment. Stale receiver/session identity
+is an explicit failure, not authorization to reopen and replay an uncertain operation.
+The component documentation owns the bounded session, expiry and wire details.
 
 ### Dependent delivery and acceptance receipts
 

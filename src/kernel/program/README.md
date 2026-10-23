@@ -245,11 +245,11 @@ observed traversal is not a substitute for the owner's correlated acceptance.
 An upstream activation is the addressed notification of a source delta. Its first
 remote delivery is necessary for the receiving vertex to continue traversal;
 local registration is not a substitute for getting that notification across the radio.
-The `dependent_delivery` boundary table drops one request or reply at each handoff
-phase of a forward transfer and checks invocation count, retained progress and
-independence from `StateChanged` broadcast eviction. It does not separately inject
-loss into a remote upstream activation. These host checks do not establish crash
-recovery or arbitrary multi-hop radio delivery.
+The `dependent_delivery` table drops requests and replies during remote upstream
+activation and forward handoff. It checks invocation count, retained progress and
+independence from `StateChanged` broadcast eviction, including a source change on
+the other owner that must reach the head before evaluation. These host checks do
+not establish crash recovery or arbitrary multi-hop radio delivery.
 
 A foreign handoff first reserves a receiver context and working extent. Ordered
 chunks are acknowledged without evaluation; identical duplicates are harmless and

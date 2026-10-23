@@ -2,6 +2,7 @@
 #![no_std]
 pub use lattice_ir::{Integer, Type, Value};
 pub mod clock;
+pub mod control;
 pub mod cost;
 #[cfg(feature = "host")]
 pub mod host;

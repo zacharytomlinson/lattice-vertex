@@ -21,7 +21,8 @@ code and retire the proposal; do not maintain a parallel specification.
 Useful component entry points:
 
 - [Peer discovery](../src/kernel/peer/TESTING.md), [links](../src/kernel/peer/LINKS.md),
-  [surfaces](../src/kernel/peer/EXPOSURE.md) and [native control](../src/kernel/peer/INVOCATION.md).
+  [surfaces](../src/kernel/peer/EXPOSURE.md), [native calls](../src/kernel/peer/INVOCATION.md)
+  and [continuous control](../src/kernel/peer/control/README.md).
 - [Wire definitions and communication cost](../src/kernel/peer/wire/README.md),
   [host attachment](../src/kernel/peer/host/README.md) and
   [transport checks](../src/kernel/radio/TESTING.md).

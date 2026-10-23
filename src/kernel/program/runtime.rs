@@ -369,3 +369,7 @@ pub(super) fn admit_changes(programs: &Configuration, traversals: &mut Traversal
         }
     }
 }
+
+pub(crate) fn epoch() -> u64 {
+    unsafe { (&*core::ptr::addr_of!(TRAVERSALS)).epoch }
+}

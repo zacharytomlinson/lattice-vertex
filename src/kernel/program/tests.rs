@@ -824,123 +824,184 @@ fn dependent_delivery() {
     use lattice_peer_wire::program::execution::Request as E;
     // Each handoff phase can lose either its request or its reply. The same
     // accepted causes must still produce one invocation each on the true path.
-    for (truth, loss) in [
-        (false, None),
-        (true, None),
-        (true, Some((9, false))),  // session request
-        (true, Some((9, true))),   // session reply
-        (true, Some((10, false))), // reserve request
-        (true, Some((10, true))),  // reservation reply
-        (true, Some((11, false))), // data request
-        (true, Some((11, true))),  // data reply
-        (true, Some((12, false))), // commit request
-        (true, Some((12, true))),  // acceptance reply
-        (true, Some((13, false))), // release request
-        (true, Some((13, true))),  // release reply
-    ] {
-        crate::port::test_port_reset();
-        execution::reset();
-        crate::kernel::change::reset();
-        let context = unsafe { TaskContext::assume() };
-        let native_a = running(truth);
-        let native_b = running(truth);
-        let mut head = definition(true)[..86].to_vec();
-        head[4..6].copy_from_slice(&1u16.to_le_bytes());
-        head[6..8].fill(0);
-        head[79] = 1;
-        head.extend_from_slice(&[25, 0, 5, 1, 0, 0, 0, 2]);
-        head.extend_from_slice(&2u64.to_le_bytes());
-        head.extend_from_slice(&4u16.to_le_bytes());
-        head.extend_from_slice(&1u32.to_le_bytes());
-        head.extend_from_slice(&48u16.to_le_bytes());
-        head.push(0);
-        head[56..58].copy_from_slice(&111u16.to_le_bytes());
-        head.extend_from_slice(&[8, 0, 0, 1, 60, 0, 0, 0]);
-        let mut tail = terminal(1);
-        tail.truncate(48);
-        tail.extend_from_slice(&[12, 0, 0, 0, 1, 1, 0, 0, 0, 1, 60, 0]);
-        tail.extend_from_slice(&[18, 0, 6]);
-        tail.extend_from_slice(&CALL.to_le_bytes());
-        tail.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0]);
-        let mut flash_a = Flash::new();
-        let mut flash_b = Flash::new();
-        let mut a = install(&head, native_a, &mut flash_a);
-        let mut b = install(&tail, native_b, &mut flash_b);
-        let mut ta = Traversals::new();
-        ta.local = 1;
-        ta.epoch = 10;
-        let mut tb = Traversals::new();
-        tb.local = 2;
-        tb.epoch = 20;
-        // Finish boot's disabled recovery before enabling this newly installed head.
-        for _ in 0..8 {
-            ta.poll(&mut a, native_a, &context, 0);
-            tb.poll(&mut b, native_b, &context, 0);
-        }
-        assert_eq!(
-            a.admission(E::Enable {
-                definition: 4,
-                generation: 1,
-                revision: 0,
-                enabled: true
-            })
-            .status,
-            Status::Persisting
-        );
-        while a.pending_write() {
-            a.poll(&mut flash_a, native_a).unwrap();
-        }
-        let mut wire = [0; lattice_peer_wire::program::transfer::REQUEST_BYTES];
-        let mut data = [0; DATA_BYTES];
-        let mut dropped = false;
-        crate::kernel::change::bind(native_a);
-        for now in (10..=10_000).step_by(10) {
-            if let Some((index, _, _, sent)) = ta.awaiting() {
-                if now - sent >= 2_000 {
-                    ta.retry(index, now);
-                }
+    for upstream in [false, true] {
+        for (truth, loss) in [
+            (false, None),
+            (true, None),
+            (true, Some((9, false))),  // session request
+            (true, Some((9, true))),   // session reply
+            (true, Some((10, false))), // reserve request
+            (true, Some((10, true))),  // reservation reply
+            (true, Some((11, false))), // data request
+            (true, Some((11, true))),  // data reply
+            (true, Some((12, false))), // commit request
+            (true, Some((12, true))),  // acceptance reply
+            (true, Some((13, false))), // release request
+            (true, Some((13, true))),  // release reply
+        ] {
+            if upstream && matches!(loss, Some((11, _))) {
+                continue;
+            } // upstream carries no values
+            crate::port::test_port_reset();
+            execution::reset();
+            crate::kernel::change::reset();
+            let context = unsafe { TaskContext::assume() };
+            let native_a = running(truth);
+            let native_b = running(truth);
+            let mut head = definition(true)[..86].to_vec();
+            head[4..6].copy_from_slice(&1u16.to_le_bytes());
+            head[6..8].fill(0);
+            head[79] = 1;
+            head.extend_from_slice(&[25, 0, 5, 1, 0, 0, 0, 2]);
+            head.extend_from_slice(&2u64.to_le_bytes());
+            head.extend_from_slice(&4u16.to_le_bytes());
+            head.extend_from_slice(&1u32.to_le_bytes());
+            head.extend_from_slice(&48u16.to_le_bytes());
+            head.push(0);
+            head[56..58].copy_from_slice(&111u16.to_le_bytes());
+            head.extend_from_slice(&[8, 0, 0, 1, 60, 0, 0, 0]);
+            let mut tail = terminal(1);
+            tail.truncate(48);
+            tail.extend_from_slice(&[12, 0, 0, 0, 1, 1, 0, 0, 0, 1, 60, 0]);
+            tail.extend_from_slice(&[18, 0, 6]);
+            tail.extend_from_slice(&CALL.to_le_bytes());
+            tail.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0]);
+            if upstream {
+                head = definition(true);
+                tail = definition(true)[..60].to_vec();
+                tail[4..8].fill(0);
+                tail[10..12].fill(0xff);
+                // A remote source entry points to A's head. It carries no operands.
+                tail.extend_from_slice(&[22, 0, 0, 2]);
+                tail.extend_from_slice(&1u64.to_le_bytes());
+                tail.extend_from_slice(&4u16.to_le_bytes());
+                tail.extend_from_slice(&1u32.to_le_bytes());
+                tail.extend_from_slice(&60u16.to_le_bytes());
+                tail.extend_from_slice(&[0, 0]);
             }
-            if now == 330 {
-                let admitted = ta.statistics.admitted;
-                let batch = crate::kernel::change::batch();
-                for sequence in 0..10 {
-                    crate::kernel::change::record(
-                        core::ptr::from_ref(native_a).cast(),
-                        STATE,
-                        Some(crate::ir::Value::boolean((sequence % 2 == 1) == truth)),
+            let mut flash_a = Flash::new();
+            let mut flash_b = Flash::new();
+            let mut a = install(&head, native_a, &mut flash_a);
+            let mut b = install(&tail, native_b, &mut flash_b);
+            let mut ta = Traversals::new();
+            ta.local = 1;
+            ta.epoch = 10;
+            let mut tb = Traversals::new();
+            tb.local = 2;
+            tb.epoch = 20;
+            let mut wire = [0; lattice_peer_wire::program::transfer::REQUEST_BYTES];
+            let mut data = [0; DATA_BYTES];
+            let mut dropped = false;
+            let source = if upstream { native_b } else { native_a };
+            crate::kernel::change::bind(source);
+            for now in (10..=10_000).step_by(10) {
+                // Complete disabled recovery through the real handoff before enablement.
+                if now == 1000 {
+                    assert_eq!(
+                        a.admission(E::Enable {
+                            definition: 4,
+                            generation: 1,
+                            revision: 0,
+                            enabled: true
+                        })
+                        .status,
+                        Status::Persisting
                     );
-                }
-                runtime::admit_changes(&a, &mut ta);
-                ta.poll(&mut a, native_a, &context, now);
-                assert_eq!(ta.statistics.admitted, admitted);
-                assert_eq!(crate::kernel::change::evicted(), 2);
-                drop(batch);
-            }
-            runtime::admit_changes(&a, &mut ta);
-            ta.poll(&mut a, native_a, &context, now);
-            tb.poll(&mut b, native_b, &context, now);
-            if let Some((index, owner, n)) = ta.outgoing(now, &mut wire) {
-                assert_eq!(owner, 2);
-                ta.sent(index, now as u16, now);
-                let omit = !dropped && loss.is_some_and(|(opcode, _)| opcode == wire[0]);
-                dropped |= omit;
-                if !omit || loss.unwrap().1 {
-                    let r = tb.receive(&b, 1, E::decode(&wire[..n]).unwrap(), now, &mut data);
-                    if !omit {
-                        ta.reply(index, r, now);
+                    while a.pending_write() {
+                        a.poll(&mut flash_a, native_a).unwrap();
                     }
                 }
+                for t in [&mut ta, &mut tb] {
+                    if let Some((index, _, _, sent)) = t.awaiting() {
+                        if now - sent >= 2_000 {
+                            t.retry(index, now);
+                        }
+                    }
+                }
+                if now == 1330 {
+                    let (p, t) = if upstream {
+                        (&b, &mut tb)
+                    } else {
+                        (&a, &mut ta)
+                    };
+                    let admitted = t.statistics.admitted;
+                    let batch = crate::kernel::change::batch();
+                    for sequence in 0..10 {
+                        crate::kernel::change::record(
+                            core::ptr::from_ref(source).cast(),
+                            STATE,
+                            Some(crate::ir::Value::boolean((sequence % 2 == 1) == truth)),
+                        );
+                    }
+                    runtime::admit_changes(p, t);
+                    assert_eq!(t.statistics.admitted, admitted);
+                    assert_eq!(crate::kernel::change::evicted(), 2);
+                    drop(batch);
+                }
+                if upstream {
+                    runtime::admit_changes(&b, &mut tb);
+                } else {
+                    runtime::admit_changes(&a, &mut ta);
+                }
+                ta.poll(&mut a, native_a, &context, now);
+                tb.poll(&mut b, native_b, &context, now);
+                // Apply the same loss partition to B->A activation or A->B execution.
+                let mut exchange = |from: &mut Traversals,
+                                    to: &mut Traversals,
+                                    p: &Configuration,
+                                    sender,
+                                    receiver,
+                                    selected| {
+                    if let Some((index, owner, n)) = from.outgoing(now, &mut wire) {
+                        assert_eq!(owner, receiver);
+                        from.sent(index, now as u16, now);
+                        let omit = now >= 1000
+                            && selected
+                            && !dropped
+                            && loss.is_some_and(|(opcode, _)| opcode == wire[0]);
+                        dropped |= omit;
+                        if !omit || loss.unwrap().1 {
+                            let r = to.receive(
+                                p,
+                                sender,
+                                E::decode(&wire[..n]).unwrap(),
+                                now,
+                                &mut data,
+                            );
+                            if !omit {
+                                from.reply(index, r, now);
+                            }
+                        }
+                    }
+                };
+                exchange(&mut ta, &mut tb, &b, 1, 2, !upstream);
+                exchange(&mut tb, &mut ta, &a, 2, 1, upstream);
+                execution::run_ready(&context);
             }
-            execution::run_ready(&context);
+            let expected = 11 * truth as u32;
+            assert_eq!(
+                (
+                    native_a.calls.load(Ordering::Relaxed),
+                    native_b.calls.load(Ordering::Relaxed)
+                ),
+                if upstream {
+                    (expected, 0)
+                } else {
+                    (0, expected)
+                },
+                "upstream={upstream} loss={loss:?}"
+            );
+            assert_eq!((ta.statistics.faults, tb.statistics.faults), (0, 0));
+            assert!(a.initial().is_none());
+            assert_eq!(super::activation::overflow(), 0);
+            assert_eq!(dropped, loss.is_some(), "loss partition {loss:?}");
+            assert!(!super::activation::pending());
+            assert!(
+                !(if upstream { &tb } else { &ta }).pending(),
+                "sender retained completed work: {loss:?}"
+            );
+            crate::kernel::change::reset();
+            execution::reset();
         }
-        assert_eq!(native_b.calls.load(Ordering::Relaxed), 11 * truth as u32, "a admitted={} completed={} faults={} last={} pending={}; b admitted={} completed={} faults={} last={} pending={}; causes={} awaiting={:?}", ta.statistics.admitted,ta.statistics.completed,ta.statistics.faults,ta.statistics.last_status,ta.pending(),tb.statistics.admitted,tb.statistics.completed,tb.statistics.faults,tb.statistics.last_status,tb.pending(),super::activation::pending(),ta.awaiting());
-        assert_eq!((ta.statistics.faults, tb.statistics.faults), (0, 0));
-        assert!(a.initial().is_none());
-        assert_eq!(super::activation::overflow(), 0);
-        assert_eq!(dropped, loss.is_some(), "loss partition {loss:?}");
-        assert!(!super::activation::pending());
-        assert!(!ta.pending(), "sender retained completed work: {loss:?}");
-        crate::kernel::change::reset();
-        execution::reset();
     }
 }

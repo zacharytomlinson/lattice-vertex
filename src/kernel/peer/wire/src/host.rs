@@ -58,6 +58,18 @@ impl Arguments {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Packet {
+    ControlTarget {
+        target: crate::control::Target,
+    },
+    ControlFault {
+        owner: u64,
+        nonce: u64,
+        status: crate::program::transfer::Status,
+    },
+    /// Latest addressed control progress, distinct from the observation delta stream.
+    ControlProgress {
+        feedback: crate::control::Feedback,
+    },
     Program {
         token: u32,
         owner: u64,
@@ -165,7 +177,11 @@ pub enum Packet {
 impl Packet {
     pub fn token(self) -> u32 {
         match self {
-            Self::Changed { .. } | Self::ChangesLost { .. } => 0,
+            Self::Changed { .. }
+            | Self::ChangesLost { .. }
+            | Self::ControlProgress { .. }
+            | Self::ControlTarget { .. }
+            | Self::ControlFault { .. } => 0,
             Self::Status { token }
             | Self::Program { token, .. }
             | Self::ProgramResult { token, .. }
@@ -189,6 +205,7 @@ impl Packet {
         matches!(
             self,
             Self::Status { .. }
+                | Self::ControlTarget { .. }
                 | Self::Program { .. }
                 | Self::UpdateControl { .. }
                 | Self::Update { .. }
@@ -204,6 +221,46 @@ impl Packet {
         body[0] = VERSION;
         body[2..6].copy_from_slice(&self.token().to_le_bytes());
         let len = match self {
+            Self::ControlTarget { target: t } => {
+                body[1] = 8;
+                body[6..14].copy_from_slice(&t.owner.to_le_bytes());
+                body[14..22].copy_from_slice(&t.nonce.to_le_bytes());
+                let mut bytes = [0; crate::program::transfer::REQUEST_BYTES];
+                let n = crate::control::Request::Target {
+                    ticket: t.ticket,
+                    sequence: t.sequence,
+                    value: t.value,
+                }
+                .encode(&mut bytes);
+                body[22..22 + n].copy_from_slice(&bytes[..n]);
+                22 + n
+            }
+            Self::ControlFault {
+                owner,
+                nonce,
+                status,
+            } => {
+                body[1] = 147;
+                body[6..14].copy_from_slice(&owner.to_le_bytes());
+                body[14..22].copy_from_slice(&nonce.to_le_bytes());
+                body[22] = status as u8;
+                23
+            }
+
+            Self::ControlProgress { feedback: f } => {
+                body[1] = 146;
+                body[6..14].copy_from_slice(&f.owner.to_le_bytes());
+                let mut bytes = [0; crate::program::transfer::REQUEST_BYTES];
+                let n = crate::control::Request::Feedback {
+                    nonce: f.nonce,
+                    ticket: f.ticket,
+                    revision: f.revision,
+                    progress: f.progress,
+                }
+                .encode(&mut bytes);
+                body[14..14 + n].copy_from_slice(&bytes[..n]);
+                14 + n
+            }
             Self::Program { owner, data, .. } => {
                 body[1] = 7;
                 body[6..14].copy_from_slice(&owner.to_le_bytes());
@@ -647,6 +704,50 @@ fn decode_body(b: &[u8]) -> Option<Packet> {
                     attribute: value(14),
                     sequence: u32::from_le_bytes(b[22..26].try_into().ok()?),
                     value: state,
+                },
+            }
+        }
+        (8, 43..=50) if token == 0 => {
+            let crate::control::Request::Target {
+                ticket,
+                sequence,
+                value: v,
+            } = crate::control::Request::decode(&b[22..])?
+            else {
+                return None;
+            };
+            Packet::ControlTarget {
+                target: crate::control::Target {
+                    owner: value(6),
+                    nonce: value(14),
+                    ticket,
+                    sequence,
+                    value: v,
+                },
+            }
+        }
+        (147, 23) if token == 0 => Packet::ControlFault {
+            owner: value(6),
+            nonce: value(14),
+            status: crate::program::transfer::Status::decode(b[22])?,
+        },
+        (146, 52..=65) if token == 0 => {
+            let crate::control::Request::Feedback {
+                nonce,
+                ticket,
+                revision,
+                progress,
+            } = crate::control::Request::decode(&b[14..])?
+            else {
+                return None;
+            };
+            Packet::ControlProgress {
+                feedback: crate::control::Feedback {
+                    owner: value(6),
+                    nonce,
+                    ticket,
+                    revision,
+                    progress,
                 },
             }
         }

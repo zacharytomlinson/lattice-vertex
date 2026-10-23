@@ -10,11 +10,15 @@ accepted remote deltas also stream to an attached host without state polling.
 The host event buffer is bounded and reports oldest-event eviction separately
 from command results; it does not guarantee RF delivery or retain state history.
 
+For successive absolute targets, [continuous control](control/README.md) reuses
+these native tasks with replaceable preparation until hardware execution starts.
+It supplies addressed progress independently of the broadcast observation ring.
+Ordinary calls described here retain their discrete invocation semantics.
+
 This is native control, not distributed program installation. The callback-based
 fragment prototype and its transport buffer have been removed. Resident records
-now load and wire through the [program component](../program/README.md); upstream
-activation, forward execution and per-traversal storage remain
-[execution work](../../../docs/KERNEL_DIRECTION.md#next-implementation-milestone).
+now load, wire and execute through the [program component](../program/README.md),
+which owns upstream activation, forward execution and per-traversal storage.
 Experimental LVT v7 opcodes 19/20 and native invocation result statuses 6/7 are retired and rejected;
 do not reuse them for different semantics within this wire version. Native
 invocation opcodes 8/9, statuses 0–5, and host-v4 encoding are unchanged.

@@ -51,6 +51,7 @@ fn poll<'a>(host: &'a mut Host, node: &mut Forwarder, now: u32) -> Option<Messag
         &Description::new(&crate::surface::EMPTY).unwrap(),
         &DEFAULT_NATIVE,
         &mut Invocations::new(),
+        &mut crate::kernel::peer::control::Control::new(),
         &unsafe { TaskContext::assume() },
         now,
     )
@@ -273,7 +274,15 @@ fn request_termination() {
         };
         submit(&context, request).unwrap();
         assert!(host
-            .poll(&mut node, &description, native, &mut calls, &context, 0)
+            .poll(
+                &mut node,
+                &description,
+                native,
+                &mut calls,
+                &mut crate::kernel::peer::control::Control::new(),
+                &context,
+                0
+            )
             .is_none());
         assert_eq!(native.calls.load(Relaxed), 0);
         if disconnected {
@@ -284,6 +293,7 @@ fn request_termination() {
             &description,
             native,
             &mut calls,
+            &mut crate::kernel::peer::control::Control::new(),
             &context,
             READ_TIMEOUT_MS,
         );
@@ -305,6 +315,7 @@ fn request_termination() {
             &description,
             native,
             &mut calls,
+            &mut crate::kernel::peer::control::Control::new(),
             &context,
             READ_TIMEOUT_MS + 1,
         );
@@ -317,6 +328,7 @@ fn request_termination() {
             &description,
             native,
             &mut calls,
+            &mut crate::kernel::peer::control::Control::new(),
             &context,
             READ_TIMEOUT_MS + 2,
         );
@@ -371,6 +383,7 @@ fn state_results() {
                 &description,
                 native,
                 &mut Invocations::new(),
+                &mut crate::kernel::peer::control::Control::new(),
                 &context,
                 0,
             );
@@ -438,7 +451,15 @@ fn call_results() {
             )
             .unwrap();
             let mut calls = Invocations::new();
-            let out = host.poll(&mut node, &description, native, &mut calls, &context, 0);
+            let out = host.poll(
+                &mut node,
+                &description,
+                native,
+                &mut calls,
+                &mut crate::kernel::peer::control::Control::new(),
+                &context,
+                0,
+            );
             assert_eq!(out.is_some(), owner != 1);
             if let Some(out) = out {
                 let Content::Invoke { call, .. } = out.content else {
@@ -472,6 +493,7 @@ fn call_results() {
                     &description,
                     native,
                     &mut calls,
+                    &mut crate::kernel::peer::control::Control::new(),
                     &context,
                     READ_TIMEOUT_MS
                 )
@@ -624,4 +646,82 @@ fn call_identity_bounds() {
         assert_eq!(host.call_request(token.wrapping_add(11)), None);
         assert_eq!(host.call_request(token.wrapping_add(10)), Some(u32::MAX));
     }
+}
+
+#[test]
+fn control_mailbox_bounds() {
+    use lattice_peer_wire::{
+        control::{Target, Ticket},
+        program::transfer::Status,
+        Integer,
+    };
+    for count in [0, 1, 4, 5] {
+        let context = reset();
+        connect(&context);
+        for nonce in 1..=count {
+            submit(
+                &context,
+                Packet::ControlTarget {
+                    target: Target {
+                        owner: 2,
+                        nonce,
+                        ticket: Ticket {
+                            epoch: 3,
+                            slot: 0,
+                            generation: 1,
+                        },
+                        sequence: 1,
+                        value: Value::integer(Integer::U8, 7).unwrap(),
+                    },
+                },
+            )
+            .unwrap();
+        }
+        let mut retained = 0;
+        while take_target().is_some() {
+            retained += 1;
+        }
+        assert_eq!(retained, count.min(4));
+        if count > 4 {
+            assert!(matches!(
+                receive(&context),
+                Some(Packet::ControlFault {
+                    owner: 2,
+                    nonce: 5,
+                    status: Status::Busy
+                })
+            ));
+        }
+        assert!(receive(&context).is_none());
+    }
+    let context = reset();
+    connect(&context);
+    let fault = Packet::ControlFault {
+        owner: 2,
+        nonce: 3,
+        status: Status::Stale,
+    };
+    control_event(session().unwrap(), fault);
+    publish_control(
+        session().unwrap(),
+        lattice_peer_wire::control::Feedback {
+            owner: 2,
+            nonce: 3,
+            ticket: Ticket {
+                epoch: 4,
+                slot: 0,
+                generation: 1,
+            },
+            revision: 1,
+            progress: lattice_peer_wire::control::Progress {
+                received: 1,
+                completed: 1,
+                result: InvokeStatus::Invoked,
+                finished: false,
+                state: StateReadResult::Busy,
+            },
+        },
+    );
+    assert_eq!(receive(&context), Some(fault));
+    assert!(receive(&context).is_none());
 }

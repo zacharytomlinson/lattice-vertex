@@ -1,6 +1,5 @@
-//! Bounded host requests and registered-change delivery from the resident peer.
-//! USB belongs to the board firmware; this module owns admission and buffering.
-//! No allocation, configuration override, retry, or foreign-surface registry.
+//! Host admission, latest control intent and observed-change buffering.
+//! The port owns USB; the resident peer owns routing and control delivery.
 
 use super::{
     exposure::Description,
@@ -29,7 +28,11 @@ struct Mailbox {
     first: usize,
     count: usize,
     dropped: u32,
+    controls: [Option<Packet>; 4],
+    targets: [Option<lattice_peer_wire::control::Target>; 4],
 }
+const _: () = assert!(core::mem::size_of::<Mailbox>() <= 2048);
+
 impl Mailbox {
     const fn new() -> Self {
         Self {
@@ -42,6 +45,8 @@ impl Mailbox {
             first: 0,
             count: 0,
             dropped: 0,
+            controls: [None; 4],
+            targets: [None; 4],
         }
     }
 }
@@ -58,11 +63,51 @@ fn access<R>(f: impl FnOnce(&mut Mailbox) -> R) -> R {
     f(unsafe { &mut *core::ptr::addr_of_mut!(MAILBOX) })
 }
 
-/// Exactly one request may be outstanding, including a response waiting for USB.
+/// One ordinary request may be outstanding, including a response waiting for USB.
+/// Control targets use their own bounded latest-intent mailbox and do not wait for it.
 /// Call from the one owning host-transport task, never from an ISR.
 pub fn submit(_context: &TaskContext, request: Packet) -> Result<(), Failure> {
     if !request.is_request() {
         return Err(Failure::InvalidRequest);
+    }
+    if let Packet::ControlTarget { target } = request {
+        let admission = access(|m| {
+            if !m.attached {
+                return Err(Failure::InvalidRequest);
+            }
+            let i = m
+                .targets
+                .iter()
+                .position(|s| s.is_some_and(|s| s.owner == target.owner && s.nonce == target.nonce))
+                .or_else(|| m.targets.iter().position(Option::is_none))
+                .ok_or(Failure::Busy)?;
+            if m.targets[i].is_some_and(|old| target.sequence == old.sequence && target != old) {
+                return Err(Failure::InvalidRequest);
+            }
+            if m.targets[i].is_none_or(|old| target.sequence > old.sequence) {
+                m.targets[i] = Some(target);
+            }
+            Ok(())
+        });
+        if let Err(failure) = admission {
+            if let Some(generation) = session() {
+                control_fault(
+                    generation,
+                    target.owner,
+                    target.nonce,
+                    if failure == Failure::Busy {
+                        lattice_peer_wire::program::transfer::Status::Busy
+                    } else {
+                        lattice_peer_wire::program::transfer::Status::Invalid
+                    },
+                );
+            } else {
+                return Err(failure);
+            }
+        }
+        #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
+        crate::kernel::radio::task::notify_work();
+        return Ok(());
     }
     access(|m| {
         if m.busy {
@@ -80,12 +125,15 @@ pub fn submit(_context: &TaskContext, request: Packet) -> Result<(), Failure> {
 pub fn connect(_context: &TaskContext) {
     access(|m| m.attached = true);
 }
-/// Drain a reply first, then any loss notice, then registered changes in order.
+/// Drain a reply, control progress/faults, loss notice, then registered changes.
 pub fn receive(_context: &TaskContext) -> Option<Packet> {
     access(|m| {
         if let Some(response) = m.response.take() {
             m.busy = false;
             return Some(response);
+        }
+        if let Some(f) = m.controls.iter_mut().find_map(Option::take) {
+            return Some(f);
         }
         if m.dropped != 0 {
             return Some(Packet::ChangesLost {
@@ -117,6 +165,73 @@ pub(super) fn publish(change: StateChange) {
         m.count += 1;
     });
 }
+pub(super) fn session() -> Option<u32> {
+    access(|m| m.attached.then_some(m.generation))
+}
+pub(super) fn take_target() -> Option<lattice_peer_wire::control::Target> {
+    access(|m| m.targets.iter_mut().find_map(Option::take))
+}
+fn control_identity(p: Packet) -> Option<(u64, u64)> {
+    match p {
+        Packet::ControlProgress { feedback: f } => Some((f.owner, f.nonce)),
+        Packet::ControlFault { owner, nonce, .. } => Some((owner, nonce)),
+        _ => None,
+    }
+}
+fn control_event(generation: u32, event: Packet) {
+    access(|m| {
+        if !m.attached || m.generation != generation {
+            return;
+        }
+        let key = control_identity(event);
+        let i = m
+            .controls
+            .iter()
+            .position(|s| s.is_some_and(|s| control_identity(s) == key))
+            .or_else(|| m.controls.iter().position(Option::is_none))
+            .unwrap_or(0);
+        // A later snapshot must not hide an unread terminal failure for this stream.
+        if matches!(m.controls[i], Some(Packet::ControlFault { .. }))
+            && m.controls[i].and_then(control_identity) == key
+        {
+            return;
+        }
+        m.controls[i] = Some(event);
+    });
+}
+pub(super) fn publish_control(generation: u32, feedback: lattice_peer_wire::control::Feedback) {
+    control_event(generation, Packet::ControlProgress { feedback });
+}
+pub(super) fn control_fault(
+    generation: u32,
+    owner: u64,
+    nonce: u64,
+    status: lattice_peer_wire::program::transfer::Status,
+) {
+    control_event(
+        generation,
+        Packet::ControlFault {
+            owner,
+            nonce,
+            status,
+        },
+    );
+}
+pub(super) fn forget_control(owner: u64, ticket: lattice_peer_wire::control::Ticket) {
+    access(|m| {
+        for t in &mut m.targets {
+            if t.is_some_and(|t| t.owner == owner && t.ticket == ticket) {
+                *t = None;
+            }
+        }
+        for e in &mut m.controls {
+            if matches!(e,Some(Packet::ControlProgress{feedback}) if feedback.owner==owner&&feedback.ticket==ticket)
+            {
+                *e = None;
+            }
+        }
+    });
+}
 /// Abandon the USB session. Old radio completions cannot satisfy a new session.
 pub fn disconnect(_context: &TaskContext) {
     access(|m| {
@@ -128,7 +243,7 @@ pub fn disconnect(_context: &TaskContext) {
     crate::kernel::radio::task::notify_work();
 }
 pub(crate) fn pending() -> bool {
-    access(|m| m.request.is_some())
+    access(|m| m.request.is_some() || m.targets.iter().any(Option::is_some))
 }
 pub(crate) fn staging_pending() -> bool {
     access(|m| {
@@ -213,6 +328,7 @@ impl Host {
         description: &Description,
         native: &'static dyn Native,
         invocations: &mut Invocations,
+        control: &mut super::control::Control,
         context: &TaskContext,
         now: u32,
     ) -> Option<Message<'a>> {
@@ -424,9 +540,45 @@ impl Host {
         if let Packet::Program { data, .. } = request {
             let operation =
                 lattice_peer_wire::program::transfer::Request::decode(data.as_slice()).unwrap();
+            if let lattice_peer_wire::program::transfer::Request::Control(c) = operation {
+                use lattice_peer_wire::control::Request as C;
+                if let C::Open { epoch, nonce, .. } = c {
+                    if !control.watch(owner, nonce, epoch, generation, now) {
+                        let mut bytes = [0; lattice_peer_wire::program::transfer::REPLY_BYTES];
+                        let n = lattice_peer_wire::program::transfer::Reply::status(
+                            lattice_peer_wire::program::transfer::Status::Busy,
+                        )
+                        .encode(&mut bytes);
+                        deliver(
+                            generation,
+                            Packet::ProgramResult {
+                                token,
+                                owner,
+                                data: Bytes::new(&bytes[..n]).unwrap(),
+                            },
+                        );
+                        return None;
+                    }
+                }
+                if let C::Finish { ticket, .. } = c {
+                    control.sealing(owner, ticket, now);
+                }
+                if let C::Close { ticket, nonce } = c {
+                    control.unwatch(owner, nonce);
+                    forget_control(owner, ticket);
+                }
+            }
             if owner == local {
                 let mut response = [0; lattice_peer_wire::program::transfer::REPLY_BYTES];
-                let n = crate::kernel::program::runtime::receive(local, operation, &mut response);
+                let n = super::receive_request(
+                    control,
+                    native,
+                    context,
+                    local,
+                    operation,
+                    now,
+                    &mut response,
+                );
                 deliver(
                     generation,
                     Packet::ProgramResult {

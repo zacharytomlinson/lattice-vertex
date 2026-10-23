@@ -12,7 +12,7 @@ protocol manual, test diary or history of completed milestones.
 | RTOS core and CPU ports | Existing task, interrupt, timer and synchronization facilities; C6 and Nordic startup | Reuse this foundation; appliance authors do not reimplement it |
 | State and native operations | Passive shared HAL, kernel getter acquisition, observed-value cache, registered deltas and history maintenance | Fallback sampling is implemented; direct device-event acquisition bindings remain optional port work |
 | Native call execution | Static FreeRTOS call tasks, asynchronous RF/USB completion, pending-call deduplication and update holds | Execution capacity is bounded; caller/route timeouts do not cancel a call or guarantee late result delivery |
-| Continuous native control | Individual scalar calls and pushed state observations exist | Required kernel stream primitive is slated; ordered continuous delivery/feedback is not implemented, and the host client waits for each call result |
+| Continuous native control | Latest-target sessions, asynchronous host input, native preparation replacement and addressed progress/feedback | C6/Nordic burst, 50 Hz input and final-value completion checked both ways; tablet UI integration remains |
 | Durable appliance bindings | Named declarations become owner-local numeric references; native lookup/deltas and LSF v2 use them; duplicate bindings are rejected | Loader reconstruction uses these references; changed physical meanings/types remain compatibility changes |
 | Resident programs | Durable installation/enablement, upstream activation, typed local evaluation, receiver-reserved handoffs and asynchronous native invocation; C6/Nordic live execution and reset reconstruction checked | Native and temporal execution are live checked with software-backed surfaces; externally installed retained-state operations remain absent |
 | Time and solar | Commissioned UTC anchor, persistent coordinates/recurring civil rules, local deadline sources and peer reacquisition | C6/Nordic deadline execution and peer reacquisition live checked; no backed RTC/GPS adapter or clock consensus |
@@ -46,6 +46,7 @@ flowchart TB
     observation["kernel::change: registered deltas and transport publication"]
     history["kernel::state: firmware-bound history and derived state"]
     peer["kernel::peer: discovery, links, forwarding, exposure and native invocation"]
+    control["peer::control: bounded latest-target sessions and addressed feedback"]
     transport["kernel::radio: resident transport and MAC handling"]
     ports["CPU, radio, flash and boot integration: C6 / Nordic"]
     rtos["Inherited RTOS: tasks, interrupts, timers and synchronization"]
@@ -68,6 +69,9 @@ flowchart TB
     history --> observation
     observation -->|best-effort outward notices| peer
     peer --> appliance
+    host -->|asynchronous current intent| control
+    peer <--> control
+    control -->|prepare or retarget before execution| monitor
     peer -->|native call admission/completion| monitor
     peer --> transport
     transport --> ports
@@ -103,9 +107,9 @@ flowchart TB
     class adapters,abi planned;
 ```
 
-Planned continuous native control extends the existing peer, host and native-call
-relationships. Its ordering and delivery belong to the kernel; the appliance HAL
-does not gain a stream callback or networking responsibility.
+Continuous native control extends the existing peer, host and native-call owners.
+It coalesces current intent in fixed storage and uses the same native tasks; it adds
+no appliance callback, networking responsibility or firmware loop.
 
 ## Next implementation milestone
 
@@ -118,38 +122,39 @@ distinction does not make automation independent of outward delta delivery.
 Relays do not infer relevance or receipt by watching unrelated traversal.
 
 The source/activation/handoff review confirmed that separation. The existing owner-local
-delivery table now drops a request or reply at each of the five forward-handoff phases and
-checks that accepted causes still produce one invocation each. It also checks the
+delivery table now drops requests or replies in both remote upstream activation and
+forward handoff, checking that accepted causes still produce one invocation each. It also checks the
 false branch and independence from outward broadcast eviction. These are host checks;
 they do not establish arbitrary physical RF delivery or recovery across crashes.
-No new runtime delivery mechanism was needed for those loss cases. The table starts
-with local activation at the head; it does not separately exercise a source delta's
-first remote upstream notification under loss. That is the remaining focused delivery
-check before moving on. Earlier hardware runs exercised remote upstream activation
-without controlled loss. The broadcast ring still supplies no reliable subscription.
+The remote case registers its source change on the other owner and loses the first
+upstream request or receipt before the head can act. That focused gap is now covered
+by the existing owner-local table. No runtime delivery change was needed for those
+cases. Earlier hardware runs exercised remote upstream activation without controlled
+loss. The broadcast ring still supplies no reliable subscription.
 
 Public receive logs, universal delta reconciliation and automation history are
 deferred. Replacement/removal and reclamation remain subsequent lifecycle work;
 occupied definition extents are not reused. Further delivery changes should address
 a concrete failure or an explicitly added recipient requirement.
 
-### Slated core communication work
+### Continuous native control
 
-[Continuous native control](ARCHITECTURE.md#continuous-native-control) is essential
-for tablet interactions such as a dimmer slider. Reuse the native function handle,
-typed scalar codec, peer routes and RTOS call dispatch. Provide ordered successive
-inputs and addressed feedback over a continuing relationship, with bounded flow
-control and delivery recovery. A final slider position must not disappear when
-the user releases the control. This is a kernel facility available to peers, not
-a tablet-only workaround or an appliance firmware implementation burden.
+The [control component](../src/kernel/peer/control/README.md) now carries the latest
+scalar intent over the ordinary owner-directed kernel service. The source's host
+mailbox accepts updates without waiting for an RF reply; the source and destination
+retain one latest pending target per session. Old retries cannot restore older
+intent. Prepared target calls can be replaced before execution starts, while
+ordinary invocations and running calls remain protected from replacement.
 
-Start from the current single-frame invocation path and measure its latency and
-round-trip limit. Identify avoidable serialization/copies and introduce bounded
-pipelining if needed. Keep the compact binary path; do not promise RDMA or zero-copy.
-Host-client support belongs in `lattice-tools`, with tablet integration consuming
-it. Specify ordering, any unsent-sample combining, capacity and reconnect behavior
-before implementing them. Accepted work and actual appliance changes retain their
-existing semantics. This work does not change the distributed traversal model.
+The destination pushes addressed progress and observed-state snapshots to the
+participating peer. Finish seals the last target; close abandons unsealed pending
+intent. Numeric codecs are shared with `lattice-tools`, whose client/CLI provide
+open, set, progress, finish and close. These source changes require a local wire
+override until the new vertex revision is published and pinned. Live burst/paced input, final-value completion and addressed feedback passed on C6
+and Nordic in both directions with software-backed native states. The next step is
+tablet input/feedback integration using this client, followed by a physical appliance
+check. Program replacement/removal remains separate lifecycle work. No RDMA,
+zero-copy or hard response-time guarantee is claimed.
 
 ### Implemented execution foundation
 
@@ -222,6 +227,7 @@ for preserving local configuration through combined-image updates.
 | Mathematical surface encoding/read path | [peer/EXPOSURE.md](../src/kernel/peer/EXPOSURE.md) |
 | Native calls, current-state reads and delta propagation | [peer/INVOCATION.md](../src/kernel/peer/INVOCATION.md) |
 | Numeric wire types and marginal communication cost | [peer/wire/README.md](../src/kernel/peer/wire/README.md) |
+| Continuous scalar intent and feedback | [control/README.md](../src/kernel/peer/control/README.md) |
 | Host attachment | [peer/host/README.md](../src/kernel/peer/host/README.md) |
 | Image transfer and activation | [FIRMWARE_UPDATES.md](FIRMWARE_UPDATES.md) |
 | Local time, solar and commissioning | [time/README.md](../src/kernel/time/README.md) |

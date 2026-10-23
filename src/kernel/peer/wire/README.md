@@ -19,6 +19,12 @@ temporal predicate encodings and reference messages. It carries no live clock,
 deadline task or hardware dependency. [Local time/solar](../../time/README.md) owns
 those runtime responsibilities.
 
+`control` defines latest-target sessions and addressed native/observed progress.
+Its inner command tags 19–23 use the existing Program service envelope; they are
+not the retired outer LVT opcodes. The optional host codec adds asynchronous target
+kind 8 and progress/fault kinds 146/147. Each record fits the existing frame bounds.
+The [control owner](../control/README.md) implements their runtime and lifetime.
+
 The optional `host` feature adds the bounded local packet records and COBS stream
 codec described in [the host interface](../host/README.md). This replaces the former
 `lattice-host-link` crate under `host/wire`: scalar encoding now has both radio and

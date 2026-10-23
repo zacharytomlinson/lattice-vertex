@@ -6,14 +6,16 @@ links, routing, deadlines, and radio operations. The attachment cannot select a
 PAN, channel, source identity, or network founder.
 
 `kernel::host::connect`, `submit`, `receive`, and `disconnect` operate from the owning transport
-task. One fixed mailbox accepts one request at a time, including its unread reply.
+task. The ordinary mailbox accepts one request at a time, including its unread reply.
+Continuous targets have four independent latest-intent entries and four coalesced
+feedback/fault entries; they do not wait for an ordinary request to finish.
 Busy requests are rejected. Disconnect invalidates host completions and cancels
 local return paths without withdrawing the resident peer. It cannot undo a native
 operation that has already reached its owner. No graph execution queue is added.
 
 The implemented operations are status, cursor-based link reads, immutable surface
-ranges, current-state reads, native transformer invocation, and signed-image
-transfer records. Local update maintenance is available when the receiver is enabled. Local requests use
+ranges, current-state reads, native transformer invocation, signed-image transfer records, program/time operations and continuous scalar
+control. See [control](../control/README.md) for the latter's lifetime and bounds. Local update maintenance is available when the receiver is enabled. Local requests use
 the existing description/native binding. Remote requests use the ordinary radio
 messages, bounded read/call paths, duplicate handling, and route learning. Replies
 terminate at the local caller. Host tokens are not radio neighbors or credentials.
@@ -65,7 +67,7 @@ Surface ranges are now at most 63 bytes, making room for RF path-cost propagatio
 The nRF companion and Linux client must consume the same wire revision.
 
 All records begin with version (`u8`), kind (`u8`), and token (`u32`).
-Unsolicited kinds 144/145 require token zero; kind distinguishes events from
+Unsolicited kinds 144–147 and asynchronous input kind 8 require token zero; kind distinguishes events from
 replies, including a reply to request token zero. A change is at most 37 encoded
 bytes and a loss notice is 12 bytes.
 
@@ -78,6 +80,8 @@ bytes and a loss notice is 12 bytes.
 | 4 Invoke | owner `u64`, transformer `u64`, scalar argument list |
 | 5 Update | owner `u64`, one bounded `wire::update::Request` |
 | 6 UpdateControl | local action `u8`: status=0, select trial=1, confirm=2, reset=3 |
+| 7 Program | owner `u64`, bounded program/clock/control command |
+| 8 ControlTarget | owner/nonce `u64`, ticket, sequence `u32`, typed scalar |
 | 128 Ready | address `u64`, founder `u64`, channel `u8` |
 | 129 Link | owner/after/via `u64`, revision `u32`, peer `u64`, round-trip milliseconds `u16`, outgoing cost `u32` |
 | 130 Surface | owner `u64`, offset/total `u16`, up to 63 bytes |
@@ -85,8 +89,11 @@ bytes and a loss notice is 12 bytes.
 | 132 Invoked | owner/transformer `u64`, native status `u8` |
 | 133 Updated | owner `u64`, update progress (28 bytes), outgoing path cost `u32` |
 | 134 UpdateControlResult | update progress (28 bytes), running release `u64` |
+| 135 ProgramResult | owner `u64`, bounded program/clock/control reply |
 | 144 Changed | owner/attribute `u64`, sequence `u32`, typed scalar or 255 unavailable |
 | 145 ChangesLost | evicted event count `u32` |
+| 146 ControlProgress | owner/nonce, ticket, revision, received/completed sequences, native status and observed state |
+| 147 ControlFault | owner/nonce `u64`, service status `u8` |
 | 255 Error | reason `u8`: busy, invalid request, transmit failure, timeout |
 
 Update records are additive to host v4. `Update` shares existing read-token and
@@ -106,7 +113,8 @@ The argument section has the same 61-byte/30-value radio limit. It starts with a
 count byte and declared-width scalars. State tags are 0 value, 1 unknown attribute,
 2 busy. Native statuses are documented in [INVOCATION.md](../INVOCATION.md).
 
-The XIAO USB application and Linux consumer live in `lattice-tablet`. The consumer
+Port-owned checks provide the USB endpoint; the shared Linux client lives in
+`lattice-tools` and is consumed by `lattice-tablet`. The consumer
 assembles only explicitly requested surfaces and checks completeness before
 inspection/saving. The MCU retains no foreign surface or global registry.
 
@@ -120,7 +128,8 @@ by the RF and host codecs. Native success never manufactures a change.
 
 Eight pending changes occupy fixed storage separate from the request/reply slot.
 On overflow the oldest change is evicted and a saturating loss count is retained.
-`receive` returns a ready reply first, then the loss notice, then changes in order.
+`receive` returns a ready reply first, then control progress/faults, the loss notice,
+then changes in order.
 An event never releases the outstanding-request slot. Disconnect discards events
 and loss counts; a new attachment starts fresh. This is a transport buffer, not a
 graph execution queue or a retained state mirror. Loss notices count this buffer's

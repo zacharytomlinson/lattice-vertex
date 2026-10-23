@@ -33,6 +33,7 @@ struct Call {
     values: [Value; crate::configLATTICE_PROGRAM_ARGUMENTS],
     length: usize,
     valid: bool,
+    replaceable: bool,
     #[cfg(feature = "firmware-update")]
     _hold: crate::kernel::update::UpdateHold,
 }
@@ -77,8 +78,8 @@ pub(crate) fn submit(
     }
     let mut values = [Value::boolean(false); MAX_CALL_ARGUMENTS];
     match decode_arguments(arguments, &mut values) {
-        Some(values) => submit_prepared(native, context, transformer, values, true),
-        None => submit_prepared(native, context, transformer, &[], false),
+        Some(values) => submit_prepared(native, context, transformer, values, true, false),
+        None => submit_prepared(native, context, transformer, &[], false, false),
     }
 }
 
@@ -88,7 +89,50 @@ pub(crate) fn submit_values(
     transformer: u64,
     arguments: &[Value],
 ) -> Result<Ticket, InvokeStatus> {
-    submit_prepared(native, context, transformer, arguments, true)
+    submit_prepared(native, context, transformer, arguments, true, false)
+}
+/// A scalar control target remains replaceable until its native function starts.
+/// Ordinary native calls and program invocations never use this admission mode.
+pub(crate) fn submit_target(
+    native: &'static dyn Native,
+    context: &TaskContext,
+    transformer: u64,
+    value: Value,
+) -> Result<Ticket, InvokeStatus> {
+    submit_prepared(native, context, transformer, &[value], true, true)
+}
+pub(crate) fn replace_target(ticket: Ticket, value: Value) -> bool {
+    access(|slots| {
+        let Some(s) = slots
+            .get_mut(ticket.slot)
+            .filter(|s| s.generation == ticket.generation && s.phase == Phase::Ready)
+        else {
+            return false;
+        };
+        let Some(c) = s
+            .call
+            .as_mut()
+            .filter(|c| c.replaceable && c.length == 1 && c.values[0].ty() == value.ty())
+        else {
+            return false;
+        };
+        c.values[0] = value;
+        true
+    })
+}
+pub(crate) fn cancel_target(ticket: Ticket) -> bool {
+    let removed = access(|slots| {
+        let s = slots
+            .get_mut(ticket.slot)
+            .filter(|s| s.generation == ticket.generation && s.phase == Phase::Ready)?;
+        if !s.call.as_ref()?.replaceable {
+            return None;
+        }
+        s.phase = Phase::Idle;
+        s.call.take()
+    });
+    // Releasing the update hold must happen outside the interrupt mask.
+    removed.is_some()
 }
 fn submit_prepared(
     native: &'static dyn Native,
@@ -96,6 +140,7 @@ fn submit_prepared(
     transformer: u64,
     arguments: &[Value],
     valid: bool,
+    replaceable: bool,
 ) -> Result<Ticket, InvokeStatus> {
     if arguments.len() > crate::configLATTICE_PROGRAM_ARGUMENTS {
         return Err(InvokeStatus::Arguments);
@@ -111,6 +156,7 @@ fn submit_prepared(
         values,
         length: arguments.len(),
         valid,
+        replaceable,
         #[cfg(feature = "firmware-update")]
         _hold: hold,
     });

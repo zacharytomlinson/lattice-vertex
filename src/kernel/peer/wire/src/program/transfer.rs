@@ -25,9 +25,34 @@ pub enum Status {
     Stale = 15,
     Unavailable = 16,
 }
+impl Status {
+    pub fn decode(byte: u8) -> Option<Self> {
+        Some(match byte {
+            0 => Status::Ok,
+            1 => Status::Receiving,
+            2 => Status::Persisting,
+            3 => Status::Installed,
+            4 => Status::Busy,
+            5 => Status::Unsupported,
+            6 => Status::Invalid,
+            7 => Status::Bounds,
+            8 => Status::Binding,
+            9 => Status::Compatibility,
+            10 => Status::Storage,
+            11 => Status::Conflict,
+            12 => Status::Enabled,
+            13 => Status::Disabled,
+            14 => Status::Accepted,
+            15 => Status::Stale,
+            16 => Status::Unavailable,
+            _ => return None,
+        })
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request<'a> {
     Clock(crate::clock::Request),
+    Control(crate::control::Request),
     Execution(super::execution::Request<'a>),
     Info,
     Begin {
@@ -58,6 +83,7 @@ impl Request<'_> {
     pub fn encode(self, out: &mut [u8; REQUEST_BYTES]) -> usize {
         match self {
             Self::Clock(r) => r.encode(out),
+            Self::Control(r) => r.encode(out),
             Self::Execution(request) => request.encode(out),
             Self::Dependencies { state, after } => {
                 out[0] = 6;
@@ -109,6 +135,9 @@ impl Request<'_> {
 }
 impl<'a> Request<'a> {
     pub fn decode(b: &'a [u8]) -> Option<Self> {
+        if b.first().is_some_and(|tag| *tag >= 19) {
+            return crate::control::Request::decode(b).map(Self::Control);
+        }
         if b.first().is_some_and(|tag| *tag >= 15) {
             return crate::clock::Request::decode(b).map(Self::Clock);
         }
@@ -181,26 +210,7 @@ impl<'a> Reply<'a> {
         if !(12..=REPLY_BYTES).contains(&b.len()) || b[11] as usize != b.len() - 12 {
             return None;
         }
-        let status = match b[0] {
-            0 => Status::Ok,
-            1 => Status::Receiving,
-            2 => Status::Persisting,
-            3 => Status::Installed,
-            4 => Status::Busy,
-            5 => Status::Unsupported,
-            6 => Status::Invalid,
-            7 => Status::Bounds,
-            8 => Status::Binding,
-            9 => Status::Compatibility,
-            10 => Status::Storage,
-            11 => Status::Conflict,
-            12 => Status::Enabled,
-            13 => Status::Disabled,
-            14 => Status::Accepted,
-            15 => Status::Stale,
-            16 => Status::Unavailable,
-            _ => return None,
-        };
+        let status = Status::decode(b[0])?;
         Some(Self {
             status,
             offset: u16::from_le_bytes(b[1..3].try_into().ok()?),
