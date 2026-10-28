@@ -116,6 +116,14 @@ actually acquires; hardware event/latching support is needed where intervening
 transitions must be retained. This local observation record is not a replicated
 world model. An unchanged observation does not activate programs.
 
+Use the MCU's event routing, timer compare, capture/counter, DMA and waveform
+peripherals where they implement the hardware binding's behavior directly.
+Event-capable acquisition is a required kernel path; a uniform periodic scan is
+not its substitute. Acquisition sources and any necessary sampling cadence belong
+to the hardware binding. The kernel owns their wakeup, observation and delta flow.
+Keep an interrupt notification distinct from an acquired state change, and retain
+events or samples in hardware/bounded storage when their individual values matter.
+
 A mutation calls the supplied hardware function. Subsequent acquisition establishes
 what actually changed, including partial effects of a failed operation. Returning
 success does not manufacture the desired observed state. The kernel propagates
@@ -141,8 +149,13 @@ packet buffers and DMA are internal mechanisms, not an obligation to author pack
 Matter, GPIO and other local appliance interfaces remain encapsulated behind the same
 state/mutation model. The hardware and state interfaces must make participation automatic
 without a separate firmware send/notification ritual or firmware-owned monitoring loop.
-Kernel-owned physical acquisition is distinct from polling programs for truth. Concrete
-hardware binding signatures remain implementation design work.
+Kernel-owned physical acquisition is distinct from polling programs for truth.
+Each state identifies its physical acquisition source: an event, a sampling interval,
+or acquisition at kernel invocation boundaries. A readiness event can be shared by
+coupled states. The kernel takes the startup baseline, selects getters and maintains
+the observation/delta path. Existing getter-only adapters may retain their fallback
+sampling behavior without changing their source. Peripheral register/interrupt
+wiring belongs to the hardware binding; it introduces no networking responsibility.
 
 ### Independently replaceable kernel and appliance code
 
@@ -452,6 +465,12 @@ The caller supplies the destination, native handle and argument. The kernel owns
 framing, correlation, ordering, bounded flow control, delivery recovery and dispatch to
 the native hardware function. The relationship reuses established bindings and routes;
 it must not require surface discovery or a new connection for each slider movement.
+Opening a control stream binds its forwarding path as well as its native function.
+Each participating relay retains the adjacent directions for that stream. Subsequent
+updates carry a stream handle, ordering information and raw argument bytes; the type,
+function and end-to-end addresses belong to the binding. A lost binding interrupts
+the stream. It must be reopened with fresh input, not silently rerouted or replayed.
+
 Feedback belongs to the participating peers rather than a guarantee that every vertex
 receives every update. Receipt, native-call completion and observed physical state retain
 their distinct meanings. The final selected value needs an established outcome or an
@@ -659,6 +678,50 @@ revision without retaining that entire revision is an explicit installation and 
 obligation.
 
 ## Installation replacement and enablement
+
+### Vertex-owned fragment sharing
+
+The compiler composes the intended logic, partitions it by ownership of its inputs
+and hardware operations, and sends each vertex its local fragment and graph
+connections. It does not inspect a remote fragment catalog to arrange reuse or
+remain online to reconcile adjacency. An automation is a description of graph
+behavior, not a separate runtime entity owning copies of fragments on each vertex.
+
+Each vertex performs local matching during installation. When the same computation
+already exists, it retains that computation once and adds the incoming fragment's
+paired upstream/downstream references. The pairs remain associated; two unrelated
+upstream and downstream lists must not create new cross-connections. Removing a
+path removes its relevant reference pair. Other pairs keep the shared computation
+installed; removal of the final pair permits reclaiming the computation once
+local users of its storage have been detached. Appliance states and native
+functions keep their existing ownership and are not removed with a graph path.
+
+Sharing stored computation does not merge evaluations or their read/write heads.
+A forward evaluation addresses one paired connection and follows only that pair's
+authored continuation, subject to its local predicate/branch result. Sharing the
+computation or the upstream physical vertex does not establish the preceding
+conditions or carried values of another pair. It must not cause execution through
+that other pair. A new local state delta can initiate separate upstream activations
+for multiple affected relationships; each still undergoes its own forward path.
+
+### Explicit removal
+
+Explicit removal takes effect when that vertex processes the addressed deletion
+command. Ready local evaluations are dispatched in admission order before a later
+command; a computation already executing in that handler is not interrupted by
+another message. Waiting for remote traffic or a hardware function does not block
+all other local events. There is no network-wide execution stack or drain authority.
+
+Removal detaches the selected connections and their pending source notifications.
+Subsequent continuations addressed to them stop there. A native hardware function
+already running finishes; its detached continuation cannot follow the removed
+edges. A call that has not started is canceled. A message already delivered beyond
+this vertex cannot be recalled; another vertex applies deletion when it receives
+its own command. This is distinct from replacement's deliberate drain policy below.
+Storage reuse must preserve generation identity so delayed traffic cannot bind to
+a new connection occupying the same address.
+
+### Replacement lifecycle
 
 A program replacement follows firmware-install reasoning: the old revision remains active
 until the new one is installed and compatibility is established. The delegate stages the

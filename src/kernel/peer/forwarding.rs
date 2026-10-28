@@ -15,6 +15,9 @@ use super::{
     Network,
 };
 
+mod streams;
+use streams::{StreamPath, STREAMS};
+
 const ROUTES: usize = 3;
 const READ_PATHS: usize = 8;
 const DISCOVERY_PATHS: usize = 4;
@@ -234,6 +237,7 @@ impl ChangeNotice {
 /// wire validation excludes them. Call paths retain exact arguments for replay
 /// comparison; no foreign IR or appliance-state mirror is retained.
 pub(super) struct Forwarder {
+    streams: [StreamPath; STREAMS],
     next_request: Option<u16>,
     local: u64,
     network: Network,
@@ -248,7 +252,7 @@ pub(super) struct Forwarder {
 
 // Existing path budgets plus bounded per-neighbor update absence records.
 // Peer, route, and return-path capacities are unchanged.
-const _: () = assert!(core::mem::size_of::<Forwarder>() <= 2464);
+const _: () = assert!(core::mem::size_of::<Forwarder>() <= 2912);
 
 impl Forwarder {
     pub(super) fn ordinary_work_pending(&self) -> bool {
@@ -283,6 +287,7 @@ impl Forwarder {
     }
     pub(super) const fn new(local: u64, network: Network) -> Self {
         Self {
+            streams: [StreamPath::EMPTY; STREAMS],
             next_request: None,
             local,
             network,
@@ -299,6 +304,7 @@ impl Forwarder {
     /// Times are wrapping milliseconds. Traffic and the existing peer wakeup
     /// retire stale records; this is no additional scheduler or polling task.
     pub(super) fn expire(&mut self, now: u32) {
+        self.expire_streams(now);
         let routes = &mut self.routes;
         self.links.expire(now, |peer| {
             for route in &mut *routes {
@@ -626,7 +632,22 @@ impl Forwarder {
         bytes: &'a [u8],
         now: u32,
     ) -> Option<Message<'a>> {
-        let destination = self.originate_read_path(ReadRequest::Program(read), now)?;
+        let proposed = self.originate_read_path(ReadRequest::Program(read), now)?;
+        let destination =
+            match self.stream_setup(read, bytes, self.local, proposed.unwrap_or(0), now) {
+                Ok(next) => (next != 0).then_some(next),
+                Err(_) => {
+                    self.cancel_read(ReadRequest::Program(read));
+                    return None;
+                }
+            };
+        if let Some(path) = self
+            .reads
+            .iter_mut()
+            .find(|p| p.read == ReadRequest::Program(read))
+        {
+            path.onward = destination.unwrap_or(0);
+        }
         Some(Message {
             source: self.local,
             destination,
@@ -661,9 +682,35 @@ impl Forwarder {
                 let next = self
                     .begin_read(ReadRequest::Program(read), incoming.source, remaining, now)?
                     .onward;
+                let next = match self.stream_setup(read, bytes, incoming.source, next, now) {
+                    Ok(next) => next,
+                    Err(status) => {
+                        let n = lattice_peer_wire::program::transfer::Reply::status(status)
+                            .encode(output);
+                        return Some(Message {
+                            source: self.local,
+                            destination: Some(incoming.source),
+                            path_cost: TimePerByte::ZERO,
+                            content: Content::ProgramResult {
+                                network,
+                                read,
+                                hops: 1,
+                                bytes: &output[..n],
+                            },
+                        });
+                    }
+                };
+                if let Some(path) = self
+                    .reads
+                    .iter_mut()
+                    .find(|p| p.read == ReadRequest::Program(read))
+                {
+                    path.onward = if read.owner == self.local { 0 } else { next };
+                }
                 if read.owner == self.local {
                     let request = lattice_peer_wire::program::transfer::Request::decode(bytes)?;
                     let n = handle(read.reader, request, output);
+                    self.stream_response(read, self.local, &output[..n], now);
                     return Some(Message {
                         source: self.local,
                         destination: Some(incoming.source),
@@ -701,6 +748,7 @@ impl Forwarder {
                     now,
                     incoming.path_cost,
                 )?;
+                self.stream_response(read, incoming.source, bytes, now);
                 Some(Message {
                     source: self.local,
                     destination: Some(previous),
@@ -763,6 +811,9 @@ impl Forwarder {
             return None;
         }
         let previous = self.return_read(request, incoming.source, hops, now, incoming.path_cost)?;
+        if let Content::ProgramResult { read, bytes, .. } = incoming.content {
+            self.stream_response(read, incoming.source, bytes, now);
+        }
         (previous == self.local).then_some(incoming)
     }
 

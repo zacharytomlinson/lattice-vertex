@@ -170,7 +170,9 @@ pub(crate) fn startup_progress(radio_completed: bool) {
     if startup.progress(tasks::xTaskGetTickCount() as u32, radio_completed, || {
         receiver.confirm()
     }) {
-        STARTUP_CONFIRMED.store(true, Ordering::Release);
+        if !STARTUP_CONFIRMED.swap(true, Ordering::AcqRel) {
+            crate::kernel::radio::task::notify_work();
+        }
         port::watchdog::feed();
     }
 }
@@ -184,16 +186,16 @@ pub(crate) fn pending() -> bool {
 pub(crate) fn contending() -> bool {
     unsafe { (&*core::ptr::addr_of!(ACTIVATION)).contending() }
 }
-pub(crate) fn awaiting_activation() -> bool {
+pub(crate) fn activation_wait_ms(now: u32) -> Option<u32> {
     unsafe {
-        crate::kernel::storage::receiver().is_some_and(|r| {
-            r.phase == lattice_peer_wire::update::Phase::Ready
-                && r.header.is_some_and(|h| {
-                    h.costs
-                        .outage_ms(r.storage.activation_swap_bytes())
-                        .is_some()
-                })
-        })
+        let ready = crate::kernel::storage::receiver().and_then(|r| {
+            (r.phase == lattice_peer_wire::update::Phase::Ready)
+                .then(|| (r.header.unwrap(), r.storage.activation_swap_bytes()))
+        });
+        if ready.is_some() && activation::epoch() != ACTIVITY_EPOCH {
+            return Some(0);
+        }
+        (&*core::ptr::addr_of!(ACTIVATION)).wait_ms(now, ready)
     }
 }
 /// Called only by the resident peer, after ordinary local/received work. Sending

@@ -70,14 +70,21 @@ deadline path after computing their next boundary. Unanchored time remains unava
 
 ## Integration still required
 
+- Vertex-local computation sharing and addressed connection removal are now
+  implemented in the program component. Each visit follows only its selected
+  pair. Explicit deletion stops remaining local graph work and leaves running
+  native calls to finish without continuation. Host checks and the C6/Nordic
+  check cover sharing, reboot reconstruction, reclamation and stale references.
+  The hardware check uses software-backed appliance states, not physical actuators.
 - Delivery assurance follows installed dependencies and explicitly addressed
   recipients through the existing acceptance/retry path. Universal dissemination
   and public receive-log inspection are deferred; relays need no dependency census.
 - Historical inputs and automation-authored retained-state maintenance are deferred.
   Current calculations do not require them. The firmware-bound history helper does
   not justify modifying an appliance surface to satisfy an automation's history query.
-- Replacement, head relocation, revision cutover, drain evidence and storage
-  reclamation remain absent. Occupied definition extents are not reused.
+- Coordinated replacement, head relocation, revision cutover and drain evidence
+  remain absent. Explicit removal and free-extent reuse are separate, implemented
+  local operations; they do not claim distributed drain or atomic network deletion.
 - Reboot recovery currently initiates independent upstream activations from restored
   source bindings. Multiple returning participants can cause repeated evaluations;
   coordinated outage reconciliation is deferred.

@@ -7,9 +7,11 @@ pub(crate) fn delivery_possible(result: Result<(), super::Error>) -> bool {
 }
 
 pub(crate) const ATTEMPTS: u8 = 4;
+// Initial CCA plus four channel-access backoffs, independent of frame retries.
+pub(crate) const CHANNEL_ATTEMPTS: u8 = 5;
 pub(crate) const ACK_WAIT_US: u32 = 864; // 54 symbols at 16 us.
 const RECENT_SENDERS: usize = 8;
-const DUPLICATE_MS: u32 = 200;
+const DUPLICATE_MS: u32 = duplicate_window_ms(crate::configTICK_RATE_HZ as u32);
 
 /// The kernel's 2006 data profile, with an extended unicast destination.
 pub(crate) fn requests_ack(frame: &[u8]) -> bool {
@@ -31,9 +33,25 @@ pub(crate) fn matches_ack(frame: &[u8], sequence: u8) -> bool {
 
 /// In-flight RX + full TX frame + ACK, rounded up with a tick-boundary allowance. Ports retain
 /// DMA storage until completion or synchronous cancellation on deadline.
-pub(crate) fn attempt_ticks(tick_hz: u32) -> u32 {
-    let us = (super::MAX_FRAME_SIZE as u64 + 8) * 64 + u64::from(ACK_WAIT_US);
-    (us * u64::from(tick_hz)).div_ceil(1_000_000) as u32 + 2
+pub(crate) const fn attempt_ticks(tick_hz: u32) -> u32 {
+    let us = (super::MAX_FRAME_SIZE as u64 + 8) * 64 + ACK_WAIT_US as u64;
+    (us * tick_hz as u64).div_ceil(1_000_000) as u32 + 2
+}
+
+/// Maximum CSMA delay at BE=5, rounded up to the selected kernel tick.
+const fn maximum_backoff_ticks(tick_hz: u32) -> u32 {
+    (31 * 320 * tick_hz as u64).div_ceil(1_000_000) as u32
+}
+
+/// Retain a received DSN through the complete bounded retry train, including
+/// channel-busy waits, receive turns after failures, and in-flight RX completion
+/// at backoff, transmission and receive-turn deadlines.
+const fn duplicate_window_ms(tick_hz: u32) -> u32 {
+    let receive = super::receive::receive_turn_ticks(tick_hz) as u64;
+    let operation =
+        maximum_backoff_ticks(tick_hz) as u64 + attempt_ticks(tick_hz) as u64 + 4 * receive;
+    let ticks = ATTEMPTS as u64 * CHANNEL_ATTEMPTS as u64 * operation + receive;
+    (ticks * 1000).div_ceil(tick_hz as u64) as u32
 }
 
 pub(crate) struct Backoff(u32);
@@ -41,12 +59,12 @@ impl Backoff {
     pub(crate) fn new(address: u64) -> Self {
         Self((address as u32 ^ (address >> 32) as u32) | 1)
     }
-    /// Retry delay: randomized 320-us slots, rounded up to kernel ticks.
-    pub(crate) fn ticks(&mut self, retry: u8, tick_hz: u32) -> u32 {
+    /// CSMA delay before channel assessment: BE=3..5, 320-us slots, tick-rounded.
+    pub(crate) fn ticks(&mut self, backoffs: u8, tick_hz: u32) -> u32 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 17;
         self.0 ^= self.0 << 5;
-        let slots = self.0 & ((1 << (3 + retry.min(2))) - 1);
+        let slots = self.0 & ((1 << (3 + backoffs.min(2))) - 1);
         (u64::from(slots) * 320 * u64::from(tick_hz)).div_ceil(1_000_000) as u32
     }
 }
@@ -147,7 +165,10 @@ mod tests {
             seen.accept(&f, 48),
             "intervening accepted sequence replaces history"
         );
-        assert!(seen.accept(&f, 248), "bounded history expires");
+        assert!(
+            seen.accept(&f, 48 + DUPLICATE_MS),
+            "bounded history expires"
+        );
         for ack in [[2, 0, 255], [0x12, 0, 255]] {
             assert!(matches_ack(&ack, 255));
             assert!(!seen.accept(&ack, 249));
@@ -173,7 +194,7 @@ mod tests {
             !seen.accept(&frame(9, 3), 1),
             "time wrap does not expire recent data"
         );
-        assert!(seen.accept(&frame(9, 3), 200));
+        assert!(seen.accept(&frame(9, 3), DUPLICATE_MS));
         for (result, possible) in [
             (Ok(()), true),
             (Err(super::super::Error::NoAcknowledgement), true),
@@ -184,10 +205,24 @@ mod tests {
             assert_eq!(delivery_possible(result), possible);
         }
         let mut backoff = Backoff::new(42);
-        for retry in 0..3 {
-            for _ in 0..32 {
-                assert!(backoff.ticks(retry, 1000) <= 10);
+        for hz in [100, 1_000, 32_768] {
+            for busy in 0..CHANNEL_ATTEMPTS {
+                for _ in 0..32 {
+                    assert!(backoff.ticks(busy, hz) <= maximum_backoff_ticks(hz));
+                }
             }
+            let window = duplicate_window_ms(hz);
+            let minimum_ticks = u64::from(ATTEMPTS)
+                * u64::from(CHANNEL_ATTEMPTS)
+                * u64::from(attempt_ticks(hz) + maximum_backoff_ticks(hz));
+            assert!(u64::from(window) * u64::from(hz) >= minimum_ticks * 1000);
+        }
+        let f = frame(42, 7);
+        for start in [0u32, u32::MAX - 100] {
+            let mut seen = Duplicates::new();
+            assert!(seen.accept(&f, start));
+            assert!(!seen.accept(&f, start.wrapping_add(DUPLICATE_MS - 1)));
+            assert!(seen.accept(&f, start.wrapping_add(DUPLICATE_MS)));
         }
         assert_eq!(attempt_ticks(1000), 12);
     }

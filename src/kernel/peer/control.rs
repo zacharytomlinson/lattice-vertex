@@ -5,9 +5,11 @@ use crate::{
     kernel::appliance::{execution, Native},
     sync::TaskContext,
 };
+#[cfg(feature = "host-link")]
+use lattice_peer_wire::control::{Argument, Feedback, Target};
 use lattice_peer_wire::{
-    control::{Feedback, Progress, Request, State, Target, Ticket},
-    program::transfer::{Reply, Status, DATA_BYTES, REQUEST_BYTES},
+    control::{Progress, Request, State, Stream, Ticket},
+    program::transfer::{Reply, Status, DATA_BYTES},
     InvokeStatus, StateReadResult,
 };
 const COUNT: usize = 4;
@@ -30,7 +32,7 @@ struct Session {
     released: bool,
     revision: u32,
     confirmed: u32,
-    waiting: Option<(u16, u32, u32)>,
+    waiting: Option<(u32, u32)>,
     due: u32,
     backoff: u8,
 }
@@ -66,14 +68,14 @@ struct Listener {
     received: u32,
     finishing: bool,
     touched: u32,
-    waiting: Option<(u16, u32)>,
+    contact: u32,
+    waiting: Option<u32>,
     due: u32,
     backoff: u8,
 }
 pub(super) struct Control {
     slots: [Slot; COUNT],
     turn: usize,
-    canceled: [Option<(u16, u64)>; COUNT * 2],
     #[cfg(feature = "host-link")]
     listeners: [Option<Listener>; COUNT],
 }
@@ -87,16 +89,14 @@ impl Control {
                 session: None,
             }; COUNT],
             turn: 0,
-            canceled: [None; COUNT * 2],
             #[cfg(feature = "host-link")]
             listeners: [None; COUNT],
         }
     }
     #[cfg(feature = "host-link")]
     pub fn watch(&mut self, owner: u64, nonce: u64, epoch: u64, generation: u32, now: u32) -> bool {
-        for (i, l) in self.listeners.iter_mut().enumerate() {
-            if let Some(old) = l.filter(|l| super::host::session() != Some(l.generation)) {
-                self.canceled[COUNT + i] = old.waiting.map(|(t, _)| (t, old.owner));
+        for l in &mut self.listeners {
+            if l.is_some_and(|l| super::host::session() != Some(l.generation)) {
                 *l = None;
             }
         }
@@ -122,6 +122,7 @@ impl Control {
             received: 0,
             finishing: false,
             touched: now,
+            contact: now,
             waiting: None,
             due: 0,
             backoff: 0,
@@ -142,15 +143,14 @@ impl Control {
     }
     #[cfg(feature = "host-link")]
     pub fn unwatch(&mut self, owner: u64, nonce: u64) {
-        for (i, l) in self.listeners.iter_mut().enumerate() {
-            if let Some(old) = l.filter(|l| l.owner == owner && l.nonce == nonce) {
-                self.canceled[COUNT + i] = old.waiting.map(|(t, _)| (t, owner));
+        for l in &mut self.listeners {
+            if l.is_some_and(|l| l.owner == owner && l.nonce == nonce) {
                 *l = None;
             }
         }
     }
     #[cfg(feature = "host-link")]
-    pub fn offer(&mut self, t: Target, now: u32) -> Option<(u16, u64)> {
+    pub fn offer(&mut self, t: Target, now: u32) {
         #[cfg(feature = "firmware-update")]
         crate::kernel::update::activation::activity();
         let Some(l) = self.listeners.iter_mut().flatten().find(|l| {
@@ -159,24 +159,24 @@ impl Control {
             if let Some(g) = super::host::session() {
                 super::host::control_fault(g, t.owner, t.nonce, Status::Stale);
             }
-            return None;
+            return;
         };
         if t.sequence == 0
             || t.ticket.epoch != l.epoch
             || l.ticket.is_some_and(|old| old != t.ticket)
         {
             super::host::control_fault(l.generation, t.owner, t.nonce, Status::Invalid);
-            return None;
+            return;
         }
         if let Some(old) = l.target {
             if t.sequence < old.sequence {
-                return None;
+                return;
             }
             if t.sequence == old.sequence {
                 if t.value != old.value {
                     super::host::control_fault(l.generation, t.owner, t.nonce, Status::Conflict);
                 }
-                return None;
+                return;
             }
         }
         l.ticket = Some(t.ticket);
@@ -184,7 +184,7 @@ impl Control {
         l.due = now;
         l.backoff = 0;
         l.touched = now;
-        l.waiting.take().map(|(token, _)| (token, l.owner))
+        l.waiting = None;
     }
     fn feedback(
         &mut self,
@@ -193,6 +193,7 @@ impl Control {
         ticket: Ticket,
         revision: u32,
         progress: Progress,
+        now: u32,
     ) -> Status {
         #[cfg(feature = "host-link")]
         {
@@ -208,6 +209,7 @@ impl Control {
                 return Status::Conflict;
             }
             l.ticket = Some(ticket);
+            l.contact = now;
             l.received = l.received.max(progress.received);
             if revision > l.revision {
                 super::host::publish_control(
@@ -226,7 +228,7 @@ impl Control {
         }
         #[cfg(not(feature = "host-link"))]
         {
-            let _ = (caller, nonce, ticket, revision, progress);
+            let _ = (caller, nonce, ticket, revision, progress, now);
             Status::Unsupported
         }
     }
@@ -259,7 +261,7 @@ impl Control {
         {
             return Reply {
                 generation: revision,
-                ..Reply::status(self.feedback(caller, nonce, ticket, revision, progress))
+                ..Reply::status(self.feedback(caller, nonce, ticket, revision, progress, now))
             };
         }
         if epoch == 0 {
@@ -410,8 +412,8 @@ impl Control {
                     return Reply::status(Status::Conflict);
                 }
                 s.released = true;
-                self.canceled[ticket.slot as usize] =
-                    s.waiting.take().map(|(token, _, _)| (token, s.caller));
+
+                s.waiting = None;
                 if !s.finishing {
                     s.pending = None;
                     if s.running.is_some_and(|(_, t)| execution::cancel_target(t)) {
@@ -436,22 +438,22 @@ impl Control {
     }
     pub fn poll(&mut self, native: &'static dyn Native, context: &TaskContext, now: u32) {
         #[cfg(feature = "host-link")]
-        for (i, l) in self.listeners.iter_mut().enumerate() {
+        for l in &mut self.listeners {
             if let Some(old) = *l {
                 if super::host::session() != Some(old.generation) {
-                    self.canceled[COUNT + i] = old.waiting.map(|(t, _)| (t, old.owner));
                     *l = None;
-                } else if !old.finishing
-                    && old.target.is_none_or(|t| t.sequence <= old.received)
-                    && now.wrapping_sub(old.touched) >= IDLE_MS
+                } else if now.wrapping_sub(old.contact) >= IDLE_MS
+                    || (!old.finishing
+                        && old.target.is_none_or(|t| t.sequence <= old.received)
+                        && now.wrapping_sub(old.touched) >= IDLE_MS)
                 {
                     super::host::control_fault(old.generation, old.owner, old.nonce, Status::Stale);
-                    self.canceled[COUNT + i] = old.waiting.map(|(t, _)| (t, old.owner));
+
                     *l = None;
                 }
             }
         }
-        for (i, slot) in self.slots.iter_mut().enumerate() {
+        for slot in &mut self.slots {
             let Some(s) = &mut slot.session else {
                 continue;
             };
@@ -478,7 +480,6 @@ impl Control {
                 }
             }
             if s.released && s.running.is_none() && s.pending.is_none() {
-                self.canceled[i] = s.waiting.map(|(t, _, _)| (t, s.caller));
                 slot.session = None;
                 continue;
             }
@@ -506,9 +507,6 @@ impl Control {
             }
         }
     }
-    pub fn canceled(&mut self) -> Option<(u16, u64)> {
-        self.canceled.iter_mut().find_map(Option::take)
-    }
     pub fn pending(&self) -> bool {
         #[cfg(feature = "host-link")]
         if self
@@ -524,10 +522,12 @@ impl Control {
             .filter_map(|s| s.session)
             .any(|s| s.running.is_some() || s.pending.is_some())
     }
+    fn feedback_due(s: Session, now: u32) -> bool {
+        !s.released
+            && (s.revision != s.confirmed
+                || (s.finishing && !s.progress().finished && now.wrapping_sub(s.due) >= 10_000))
+    }
     pub fn wait_ms(&self, now: u32) -> Option<u32> {
-        if let Some((_, _, _, sent)) = self.awaiting() {
-            return Some(200u32.saturating_sub(now.wrapping_sub(sent)));
-        }
         let until = |due: u32| {
             if due.wrapping_sub(now) < 1 << 31 {
                 due.wrapping_sub(now)
@@ -535,45 +535,75 @@ impl Control {
                 0
             }
         };
+        #[allow(unused_mut)] // source listeners exist only with host-link
         let mut next = self
             .slots
             .iter()
             .filter_map(|s| s.session)
-            .filter(|s| !s.released && s.revision != s.confirmed)
-            .map(|s| until(s.due))
+            .filter(|s| !s.released)
+            .filter_map(|s| {
+                if let Some((sent, _)) = s.waiting {
+                    Some(200u32.saturating_sub(now.wrapping_sub(sent)))
+                } else if s.revision != s.confirmed {
+                    Some(until(s.due))
+                } else if s.finishing && !s.progress().finished {
+                    Some(until(s.due.wrapping_add(10_000)))
+                } else {
+                    None
+                }
+            })
             .min();
+        for s in self
+            .slots
+            .iter()
+            .filter_map(|s| s.session)
+            .filter(|s| !s.released)
+        {
+            if !s.finishing || s.progress().finished {
+                let due = IDLE_MS.saturating_sub(now.wrapping_sub(s.touched));
+                next = Some(next.map_or(due, |n| n.min(due)));
+            }
+        }
         #[cfg(feature = "host-link")]
         for l in self.listeners.iter().flatten() {
-            if l.target.is_some_and(|t| t.sequence > l.received) {
-                next = Some(next.map_or(until(l.due), |n| n.min(until(l.due))));
+            let expiry = IDLE_MS.saturating_sub(now.wrapping_sub(l.contact));
+            next = Some(next.map_or(expiry, |n| n.min(expiry)));
+            if !l.finishing && l.target.is_none_or(|t| t.sequence <= l.received) {
+                let due = IDLE_MS.saturating_sub(now.wrapping_sub(l.touched));
+                next = Some(next.map_or(due, |n| n.min(due)));
+            }
+            let due = if let Some(sent) = l.waiting {
+                Some(200u32.saturating_sub(now.wrapping_sub(sent)))
+            } else if l.target.is_some_and(|t| t.sequence > l.received) {
+                Some(until(l.due))
+            } else {
+                None
+            };
+            if let Some(due) = due {
+                next = Some(next.map_or(due, |n| n.min(due)));
             }
         }
         next
     }
-    pub fn awaiting(&self) -> Option<(usize, u16, u64, u32)> {
+    pub fn awaiting(&self, now: u32) -> Option<(usize, u32)> {
+        #[allow(unused_mut)] // source listeners exist only with host-link
+        let mut oldest = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| Some((i, slot.session?.waiting?.0)))
+            .max_by_key(|(_, at)| now.wrapping_sub(*at));
         #[cfg(feature = "host-link")]
         for (i, l) in self.listeners.iter().enumerate() {
-            if let Some(l) = l {
-                if let Some((t, at)) = l.waiting {
-                    return Some((COUNT + i, t, l.owner, at));
+            if let Some(at) = l.and_then(|l| l.waiting) {
+                if oldest.is_none_or(|(_, old)| now.wrapping_sub(at) > now.wrapping_sub(old)) {
+                    oldest = Some((COUNT + i, at));
                 }
             }
         }
-        self.slots.iter().enumerate().find_map(|(i, slot)| {
-            let s = slot.session?;
-            let (t, at, _) = s.waiting?;
-            Some((i, t, s.caller, at))
-        })
+        oldest
     }
-    pub fn outgoing(
-        &mut self,
-        epoch: u64,
-        now: u32,
-        out: &mut [u8; REQUEST_BYTES],
-    ) -> Option<(usize, u64, usize)> {
-        if self.awaiting().is_some() {
-            return None;
-        }
+    pub fn outgoing(&mut self, now: u32) -> Option<(usize, u64, Stream)> {
         for n in 0..COUNT * 2 {
             let i = (self.turn + n) % (COUNT * 2);
             #[cfg(feature = "host-link")]
@@ -584,110 +614,90 @@ impl Control {
                 let Some(t) = l.target else {
                     continue;
                 };
-                if t.sequence <= l.received || now.wrapping_sub(l.due) >= 1 << 31 {
+                if l.waiting.is_some()
+                    || t.sequence <= l.received
+                    || now.wrapping_sub(l.due) >= 1 << 31
+                {
                     continue;
                 }
                 self.turn = (i + 1) % (COUNT * 2);
                 return Some((
                     i,
                     l.owner,
-                    Request::Target {
-                        ticket: t.ticket,
+                    Stream::Target {
+                        stream: l.nonce,
                         sequence: t.sequence,
-                        value: t.value,
-                    }
-                    .encode(out),
+                        argument: Argument::from_value(t.value),
+                    },
                 ));
             }
-            if i >= COUNT || epoch == 0 {
+            if i >= COUNT {
                 continue;
             }
-            let slot = &self.slots[i];
-            let Some(s) = slot.session else {
+            let Some(s) = self.slots[i].session else {
                 continue;
             };
-            if s.released || s.confirmed == s.revision || now.wrapping_sub(s.due) >= 1 << 31 {
+            if s.waiting.is_some()
+                || !Self::feedback_due(s, now)
+                || now.wrapping_sub(s.due) >= 1 << 31
+            {
                 continue;
             }
-            let r = Request::Feedback {
-                nonce: s.nonce,
-                ticket: Ticket {
-                    epoch,
-                    slot: i as u16,
-                    generation: slot.generation,
-                },
-                revision: s.revision,
-                progress: s.progress(),
-            };
             self.turn = (i + 1) % (COUNT * 2);
-            return Some((i, s.caller, r.encode(out)));
+            return Some((
+                i,
+                s.caller,
+                Stream::Progress {
+                    stream: s.nonce,
+                    revision: s.revision,
+                    progress: s.progress(),
+                },
+            ));
         }
         None
     }
-    pub fn sent(&mut self, index: usize, token: u16, now: u32) {
+    pub fn sent(&mut self, index: usize, now: u32) {
         #[cfg(feature = "host-link")]
         if index >= COUNT {
             if let Some(l) = self.listeners[index - COUNT].as_mut() {
-                l.waiting = Some((token, now));
+                l.waiting = Some(now);
             }
             return;
         }
         if let Some(s) = self.slots[index].session.as_mut() {
-            s.waiting = Some((token, now, s.revision));
+            s.waiting = Some((now, s.revision));
         }
     }
-    pub fn reply(&mut self, index: usize, reply: Reply<'_>, now: u32) {
-        #[cfg(feature = "host-link")]
-        if index >= COUNT {
-            let Some(l) = self.listeners[index - COUNT] else {
-                return;
-            };
-            if reply.status == Status::Busy {
-                self.retry(index, now);
-                return;
+    #[cfg(feature = "host-link")]
+    pub fn opened(&mut self, owner: u64, nonce: u64, state: State) {
+        if let Some(l) = self
+            .listeners
+            .iter_mut()
+            .flatten()
+            .find(|l| l.owner == owner && l.nonce == nonce && l.epoch == state.ticket.epoch)
+        {
+            if l.ticket.is_none() {
+                l.ticket = Some(state.ticket);
             }
-            if reply.status == Status::Accepted {
-                if let Some(state) = State::decode(reply).filter(|s| Some(s.ticket) == l.ticket) {
-                    self.feedback(
-                        l.owner,
-                        l.nonce,
-                        state.ticket,
-                        state.revision,
-                        state.progress,
-                    );
-                    if let Some(l) = self.listeners[index - COUNT].as_mut() {
-                        l.waiting = None;
-                        l.backoff = 0;
-                        l.due = now;
-                    }
-                    return;
-                }
-            }
-            super::host::control_fault(
-                l.generation,
-                l.owner,
-                l.nonce,
-                if reply.status == Status::Accepted {
-                    Status::Invalid
-                } else {
-                    reply.status
-                },
-            );
-            self.listeners[index - COUNT] = None;
-            return;
         }
-        let Some(s) = self.slots[index].session.as_mut() else {
-            return;
-        };
-        if reply.status == Status::Ok && s.waiting.is_some_and(|(_, _, r)| r == reply.generation) {
-            s.confirmed = reply.generation;
+    }
+    pub fn interrupt(&mut self, remote: u64, stream: u64, status: Status) {
+        #[cfg(not(feature = "host-link"))]
+        let _ = status;
+        #[cfg(feature = "host-link")]
+        for l in &mut self.listeners {
+            if let Some(old) = l.filter(|l| l.owner == remote && l.nonce == stream) {
+                super::host::control_fault(old.generation, old.owner, stream, status);
+                *l = None;
+            }
+        }
+        for s in self
+            .slots
+            .iter_mut()
+            .filter_map(|slot| slot.session.as_mut())
+            .filter(|s| s.caller == remote && s.nonce == stream)
+        {
             s.waiting = None;
-            s.backoff = 0;
-            s.due = now;
-        } else if matches!(reply.status, Status::Stale | Status::Unsupported) {
-            // Listener disappeared. Stop feedback; accepted native/final work remains owned.
-            s.waiting = None;
-            s.confirmed = s.revision;
             s.released = true;
             if !s.finishing {
                 s.pending = None;
@@ -695,8 +705,128 @@ impl Control {
                     s.running = None;
                 }
             }
-        } else {
-            self.retry(index, now);
+        }
+    }
+    pub fn receive_stream(
+        &mut self,
+        remote: u64,
+        packet: Stream,
+        epoch: u64,
+        native: &'static dyn Native,
+        context: &TaskContext,
+        now: u32,
+    ) -> Option<Stream> {
+        let id = packet.id();
+        let fault = |status| Some(Stream::Fault { stream: id, status });
+        match packet {
+            Stream::Target {
+                sequence, argument, ..
+            } => {
+                let Some((i, slot)) = self.slots.iter().enumerate().find(|(_, slot)| {
+                    slot.session
+                        .is_some_and(|s| s.caller == remote && s.nonce == id && !s.released)
+                }) else {
+                    return fault(Status::Stale);
+                };
+                let Some(value) = argument.value(slot.session.unwrap().input) else {
+                    return fault(Status::Invalid);
+                };
+                let ticket = Ticket {
+                    epoch,
+                    slot: i as u16,
+                    generation: slot.generation,
+                };
+                let mut out = [0; DATA_BYTES];
+                let status = self
+                    .receive(
+                        remote,
+                        Request::Target {
+                            ticket,
+                            sequence,
+                            value,
+                        },
+                        epoch,
+                        native,
+                        context,
+                        now,
+                        &mut out,
+                    )
+                    .status;
+                if status != Status::Accepted {
+                    return fault(status);
+                }
+                let s = self.slots[i].session.as_mut().unwrap();
+                // A retransmitted target needs a fresh progress receipt even if the
+                // preceding one was acknowledged before the source lost its response.
+                s.confirmed = 0;
+                s.due = now;
+                None
+            }
+            Stream::Progress {
+                revision, progress, ..
+            } => {
+                #[cfg(feature = "host-link")]
+                {
+                    let Some(l) = self
+                        .listeners
+                        .iter()
+                        .flatten()
+                        .find(|l| l.owner == remote && l.nonce == id)
+                        .copied()
+                    else {
+                        return fault(Status::Stale);
+                    };
+                    let Some(ticket) = l.ticket else {
+                        return None;
+                    }; // Open reply still in flight
+                    let status = self.feedback(remote, id, ticket, revision, progress, now);
+                    if status != Status::Ok {
+                        return fault(status);
+                    }
+                    if let Some(l) = self
+                        .listeners
+                        .iter_mut()
+                        .flatten()
+                        .find(|l| l.owner == remote && l.nonce == id)
+                    {
+                        if l.target.is_none_or(|t| t.sequence <= l.received) {
+                            l.waiting = None;
+                            l.backoff = 0;
+                            l.due = now;
+                        }
+                    }
+                    return Some(Stream::Receipt {
+                        stream: id,
+                        revision,
+                    });
+                }
+                #[cfg(not(feature = "host-link"))]
+                {
+                    let _ = (revision, progress);
+                    fault(Status::Unsupported)
+                }
+            }
+            Stream::Receipt { revision, .. } => {
+                let Some(s) = self
+                    .slots
+                    .iter_mut()
+                    .filter_map(|s| s.session.as_mut())
+                    .find(|s| s.caller == remote && s.nonce == id && !s.released)
+                else {
+                    return fault(Status::Stale);
+                };
+                if s.waiting.is_some_and(|(_, r)| r == revision) {
+                    s.confirmed = revision;
+                    s.waiting = None;
+                    s.backoff = 0;
+                    s.due = now;
+                }
+                None
+            }
+            Stream::Fault { status, .. } => {
+                self.interrupt(remote, id, status);
+                None
+            }
         }
     }
     pub fn retry(&mut self, index: usize, now: u32) {

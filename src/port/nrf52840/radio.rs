@@ -217,14 +217,14 @@ impl Radio {
                     return Ok(());
                 }
                 if !mac::is_ack(&incoming[..length]) {
-                    let evicted = received.push(&incoming[..length]);
+                    let dropped = received.push(&incoming[..length]);
                     #[cfg(feature = "test-support")]
-                    if evicted {
+                    if dropped {
                         crate::kernel::radio::testing::event(
                             crate::kernel::radio::testing::Event::ReceiveEvicted,
                         );
                     }
-                    let _ = evicted;
+                    let _ = dropped;
                 }
             }
         }

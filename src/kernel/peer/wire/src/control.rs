@@ -145,7 +145,7 @@ impl Request {
                 transformer,
                 state,
             } => {
-                out[0] = 19;
+                out[0] = 24;
                 for (n, v) in [epoch, nonce, transformer, state].into_iter().enumerate() {
                     out[1 + n * 8..9 + n * 8].copy_from_slice(&v.to_le_bytes());
                 }
@@ -192,7 +192,7 @@ impl Request {
     }
     pub fn decode(b: &[u8]) -> Option<Self> {
         Some(match (*b.first()?, b.len()) {
-            (19, 33) => Self::Open {
+            (24, 33) => Self::Open {
                 epoch: u64::from_le_bytes(b[1..9].try_into().ok()?),
                 nonce: u64::from_le_bytes(b[9..17].try_into().ok()?),
                 transformer: u64::from_le_bytes(b[17..25].try_into().ok()?),
@@ -275,6 +275,133 @@ pub struct Target {
     pub value: Value,
 }
 
+/// Argument bytes whose type and width were established by Open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Argument {
+    bytes: [u8; 8],
+    length: u8,
+}
+impl Argument {
+    pub fn from_value(value: Value) -> Self {
+        let mut typed = [0; 9];
+        let n = scalar::encode_value(value, &mut typed);
+        Self::new(&typed[1..n]).unwrap()
+    }
+    pub fn new(bytes: &[u8]) -> Option<Self> {
+        if !matches!(bytes.len(), 1 | 2 | 4 | 8) {
+            return None;
+        }
+        let mut argument = Self {
+            bytes: [0; 8],
+            length: bytes.len() as u8,
+        };
+        argument.bytes[..bytes.len()].copy_from_slice(bytes);
+        Some(argument)
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.length as usize]
+    }
+    pub fn value(self, ty: Type) -> Option<Value> {
+        let mut typed = [0; 9];
+        typed[0] = scalar::type_tag(ty);
+        typed[1..1 + self.length as usize].copy_from_slice(self.bytes());
+        let (value, n) = scalar::decode_value(&typed[..1 + self.length as usize])?;
+        (n == 1 + self.length as usize).then_some(value)
+    }
+}
+/// Data on an established bidirectional path. The handle is Open's nonce;
+/// relay bindings supply endpoints and the receiver supplies the argument type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stream {
+    Target {
+        stream: u64,
+        sequence: u32,
+        argument: Argument,
+    },
+    Progress {
+        stream: u64,
+        revision: u32,
+        progress: Progress,
+    },
+    Receipt {
+        stream: u64,
+        revision: u32,
+    },
+    Fault {
+        stream: u64,
+        status: Status,
+    },
+}
+impl Stream {
+    pub fn id(self) -> u64 {
+        match self {
+            Self::Target { stream, .. }
+            | Self::Progress { stream, .. }
+            | Self::Receipt { stream, .. }
+            | Self::Fault { stream, .. } => stream,
+        }
+    }
+    pub fn encode(self, out: &mut [u8; REQUEST_BYTES]) -> usize {
+        out[1..9].copy_from_slice(&self.id().to_le_bytes());
+        match self {
+            Self::Target {
+                sequence, argument, ..
+            } => {
+                out[0] = 25;
+                out[9..13].copy_from_slice(&sequence.to_le_bytes());
+                let b = argument.bytes();
+                out[13..13 + b.len()].copy_from_slice(b);
+                13 + b.len()
+            }
+            Self::Progress {
+                revision, progress, ..
+            } => {
+                out[0] = 26;
+                out[9..13].copy_from_slice(&revision.to_le_bytes());
+                13 + progress.encode(&mut out[13..])
+            }
+            Self::Receipt { revision, .. } => {
+                out[0] = 27;
+                out[9..13].copy_from_slice(&revision.to_le_bytes());
+                13
+            }
+            Self::Fault { status, .. } => {
+                out[0] = 28;
+                out[9] = status as u8;
+                10
+            }
+        }
+    }
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        let stream = u64::from_le_bytes(b.get(1..9)?.try_into().ok()?);
+        if stream == 0 {
+            return None;
+        }
+        let serial = || Some(u32::from_le_bytes(b.get(9..13)?.try_into().ok()?));
+        Some(match (*b.first()?, b.len()) {
+            (25, 14 | 15 | 17 | 21) => Self::Target {
+                stream,
+                sequence: serial()?,
+                argument: Argument::new(&b[13..])?,
+            },
+            (26, 24..=37) => Self::Progress {
+                stream,
+                revision: serial()?,
+                progress: Progress::decode(&b[13..])?,
+            },
+            (27, 13) => Self::Receipt {
+                stream,
+                revision: serial()?,
+            },
+            (28, 10) => Self::Fault {
+                stream,
+                status: Status::decode(b[9])?,
+            },
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +426,47 @@ mod tests {
                     value: Some(value),
                 },
             };
+            let argument = Argument::from_value(value);
+            assert_eq!(argument.value(value.ty()), Some(value));
+            for stream in [
+                Stream::Target {
+                    stream: 5,
+                    sequence: 3,
+                    argument,
+                },
+                Stream::Progress {
+                    stream: 5,
+                    revision: 8,
+                    progress,
+                },
+                Stream::Receipt {
+                    stream: 5,
+                    revision: 8,
+                },
+                Stream::Fault {
+                    stream: 5,
+                    status: Status::Stale,
+                },
+            ] {
+                let mut out = [0; REQUEST_BYTES];
+                let n = stream.encode(&mut out);
+                assert_eq!(Stream::decode(&out[..n]), Some(stream));
+                assert!(n <= 37);
+                if matches!(stream, Stream::Target { .. }) {
+                    assert_eq!(n, 13 + argument.bytes().len());
+                    for end in 0..n {
+                        if let Some(Stream::Target { argument, .. }) = Stream::decode(&out[..end]) {
+                            assert!(argument.value(value.ty()).is_none());
+                        }
+                    }
+                } else {
+                    for end in 0..n {
+                        assert!(Stream::decode(&out[..end]).is_none());
+                    }
+                }
+                out[1..9].fill(0);
+                assert!(Stream::decode(&out[..n]).is_none());
+            }
             for r in [
                 Request::Open {
                     epoch: 8,
@@ -377,5 +545,7 @@ mod tests {
                 assert_eq!(got.next(), None);
             }
         }
+        assert!(Argument::new(&[2]).unwrap().value(Type::Bool).is_none());
+        assert!(Request::decode(&[19; 33]).is_none()); // retired unbound Open
     }
 }

@@ -116,6 +116,14 @@ pub trait State {
 
     /// Current established observation, or `None` if unavailable.
     fn read(appliance: &Self::Appliance) -> Option<Self::Value>;
+
+    /// Bind physical acquisition once at kernel task startup. A hardware binding
+    /// may register its event waker here. Existing getter-only adapters retain
+    /// the sampling fallback; event-backed states need no periodic scan.
+    #[cfg(feature = "use-mutexes")]
+    fn acquisition(_appliance: &'static Self::Appliance) -> crate::kernel::Acquisition {
+        crate::kernel::Acquisition::periodic(crate::configLATTICE_ACQUISITION_MS)
+    }
 }
 
 /// An enumerable state definition with a typed native reader.
@@ -123,6 +131,8 @@ pub trait State {
 /// The handle stores its IR attribute and kernel-maintained history linkage.
 /// It neither owns nor duplicates the appliance's observed value.
 pub struct StateHandle<Appliance: 'static> {
+    #[cfg(feature = "use-mutexes")]
+    acquisition: fn(&'static Appliance) -> crate::kernel::Acquisition,
     definition: ir::Attribute<Read<Appliance>>,
     #[cfg(feature = "use-mutexes")]
     pub(crate) maintained:
@@ -139,6 +149,8 @@ impl<Appliance: 'static> StateHandle<Appliance> {
     /// Rejects an empty name or a name containing NUL.
     pub const fn new<S: State<Appliance = Appliance>>(name: &str) -> Self {
         Self {
+            #[cfg(feature = "use-mutexes")]
+            acquisition: S::acquisition,
             definition: ir::Attribute {
                 ty: S::Value::TYPE,
                 location: Read {
@@ -166,6 +178,11 @@ impl<Appliance: 'static> StateHandle<Appliance> {
     /// Read live state. Unavailable observations remain distinct from false or zero.
     pub fn read(&self, appliance: &Appliance) -> Option<Value> {
         self.definition.location.read(appliance)
+    }
+
+    #[cfg(feature = "use-mutexes")]
+    pub(crate) fn acquisition(&self, appliance: &'static Appliance) -> crate::kernel::Acquisition {
+        (self.acquisition)(appliance)
     }
 
     pub(crate) fn record_change(&self, appliance: &Appliance, value: Option<Value>) {

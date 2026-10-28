@@ -42,6 +42,7 @@ struct Slot {
     phase: Phase,
     call: Option<Call>,
     result: InvokeStatus,
+    detached: bool,
 }
 impl Slot {
     const fn new() -> Self {
@@ -50,6 +51,7 @@ impl Slot {
             phase: Phase::Idle,
             call: None,
             result: InvokeStatus::Busy,
+            detached: false,
         }
     }
 }
@@ -132,7 +134,29 @@ pub(crate) fn cancel_target(ticket: Ticket) -> bool {
         s.call.take()
     });
     // Releasing the update hold must happen outside the interrupt mask.
-    removed.is_some()
+    let canceled = removed.is_some();
+    drop(removed);
+    if canceled {
+        capacity_changed();
+    }
+    canceled
+}
+/// Explicit graph removal relinquishes this call's continuation. Ready calls
+/// have not touched hardware; running calls finish normally in their own task.
+pub(crate) fn detach(ticket: Ticket) {
+    let removed = access(|slots| {
+        let s = slots
+            .get_mut(ticket.slot)
+            .filter(|s| s.generation == ticket.generation)?;
+        if s.phase == Phase::Running {
+            s.detached = true;
+            return None;
+        }
+        s.phase = Phase::Idle;
+        s.call.take()
+    });
+    drop(removed);
+    capacity_changed();
 }
 fn submit_prepared(
     native: &'static dyn Native,
@@ -166,6 +190,7 @@ fn submit_prepared(
             .enumerate()
             .find(|(_, s)| s.phase == Phase::Idle && s.generation != u32::MAX)?;
         slot.generation += 1;
+        slot.detached = false;
         slot.call = call.take();
         slot.phase = Phase::Ready;
         Some(Ticket {
@@ -189,14 +214,22 @@ fn submit_prepared(
     Ok(ticket)
 }
 pub(crate) fn take_result(ticket: Ticket) -> Option<InvokeStatus> {
-    access(|slots| {
+    let result = access(|slots| {
         let slot = slots.get_mut(ticket.slot)?;
         if slot.generation != ticket.generation || slot.phase != Phase::Finished {
             return None;
         }
         slot.phase = Phase::Idle;
         Some(slot.result)
-    })
+    });
+    if result.is_some() {
+        capacity_changed();
+    }
+    result
+}
+fn capacity_changed() {
+    #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
+    crate::kernel::radio::task::notify_work();
 }
 pub(crate) fn completion_pending() -> bool {
     access(|slots| slots.iter().any(|s| s.phase == Phase::Finished))
@@ -223,7 +256,11 @@ fn run_one(index: usize, context: &TaskContext) -> bool {
     drop(call);
     access(|slots| {
         slots[index].result = result;
-        slots[index].phase = Phase::Finished;
+        slots[index].phase = if slots[index].detached {
+            Phase::Idle
+        } else {
+            Phase::Finished
+        };
     });
     #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
     crate::kernel::radio::task::notify_work();
@@ -291,10 +328,7 @@ mod tasks {
     extern "C" fn acquire(_: *mut c_void) {
         let context = unsafe { TaskContext::assume() };
         let native = unsafe { NATIVE.unwrap() };
-        loop {
-            native.acquire(&context);
-            crate::delay_ms(&context, crate::configLATTICE_ACQUISITION_MS);
-        }
+        super::super::acquisition::run(native, &context)
     }
 }
 #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
@@ -311,5 +345,37 @@ pub(crate) fn reset() {
     for index in 0..COUNT {
         let old = access(|slots| core::mem::replace(&mut slots[index], Slot::new()));
         drop(old);
+    }
+}
+
+#[cfg(all(test, feature = "port-test"))]
+mod tests {
+    use super::*;
+    #[test]
+    fn detachment_boundary() {
+        crate::port::test_port_reset();
+        reset();
+        for phase in [Phase::Ready, Phase::Running, Phase::Finished] {
+            access(|slots| {
+                slots[0].generation = 1;
+                slots[0].phase = phase;
+                slots[0].detached = false;
+            });
+            detach(Ticket {
+                slot: 0,
+                generation: 2,
+            });
+            assert!(access(|slots| slots[0].phase == phase && !slots[0].detached));
+            detach(Ticket {
+                slot: 0,
+                generation: 1,
+            });
+            assert!(access(|slots| if phase == Phase::Running {
+                slots[0].phase == Phase::Running && slots[0].detached
+            } else {
+                slots[0].phase == Phase::Idle
+            }));
+        }
+        reset();
     }
 }

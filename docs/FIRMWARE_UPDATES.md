@@ -254,7 +254,7 @@ the neighbor can remain retained beyond ordinary link expiry until then. Ordinar
 firmware understands notices without an updater; older firmware ignores them.
 Loss or partitions can still permit simultaneous updates. No alternate relay path
 is guaranteed. A ready measured candidate bounds pending-policy receive waits to
-250 ms; otherwise ordinary idle waits remain unchanged.
+the actual quiet/backoff or notice deadline; no periodic activation scan is required.
 
 ## Watchdog-backed startup confirmation
 

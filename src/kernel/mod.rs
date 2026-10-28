@@ -30,6 +30,8 @@
 #[cfg(feature = "use-mutexes")]
 mod appliance;
 #[cfg(feature = "use-mutexes")]
+pub use appliance::acquisition::{Acquisition, AcquisitionEvent};
+#[cfg(feature = "use-mutexes")]
 pub use appliance::{Appliance, InstallError};
 #[cfg(feature = "use-mutexes")]
 pub(crate) mod change;

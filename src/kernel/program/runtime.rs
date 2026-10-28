@@ -12,6 +12,8 @@ static mut RESTORED: bool = false;
 static mut SURFACE: [u8; 32] = [0; 32];
 static mut TRAVERSALS: Traversals = Traversals::new();
 static mut CHECKPOINT: bool = false;
+static mut FLASH_BLOCKED: bool = false;
+static mut MORE_LOCAL_WORK: bool = false;
 static mut TIME: crate::kernel::time::Time = crate::kernel::time::Time::new();
 static mut PROFILE_REVISION: u32 = 0;
 struct Synchronization {
@@ -50,6 +52,12 @@ pub(crate) fn receive(caller: u64, request: Request<'_>, output: &mut [u8; REPLY
             Some(native) => {
                 let programs = &mut *core::ptr::addr_of_mut!(CONFIGURATION);
                 let now = milliseconds();
+                // Earlier admitted local evaluations run before this command.
+                // Native calls and remote handoffs yield independently.
+                let traversals = &mut *core::ptr::addr_of_mut!(TRAVERSALS);
+                let context = crate::sync::TaskContext::assume();
+                traversals.dispatch(programs, native, &context);
+
                 if let Request::Clock(operation) = request {
                     use lattice_peer_wire::clock::Request as C;
                     if matches!(operation, C::Read | C::Anchor { .. }) {
@@ -119,7 +127,23 @@ pub(crate) fn receive(caller: u64, request: Request<'_>, output: &mut [u8; REPLY
                     programs.receive(caller, request, native, &*core::ptr::addr_of!(SURFACE));
                 let active = reply.status == Status::Receiving
                     && matches!(request, Request::Begin { .. } | Request::Data { .. });
+                let status = reply.status;
                 let n = reply.encode(output);
+                if let Request::Remove {
+                    definition,
+                    generation,
+                } = request
+                {
+                    if matches!(
+                        status,
+                        Status::Persisting | Status::Removed | Status::Storage
+                    ) {
+                        (&mut *core::ptr::addr_of_mut!(TRAVERSALS)).remove(definition, generation);
+                        (&mut *core::ptr::addr_of_mut!(TIME))
+                            .retain(|source| programs.temporal_entry(source).is_some());
+                    }
+                }
+
                 if active {
                     programs.last_activity = now;
                 }
@@ -153,6 +177,9 @@ pub(crate) fn poll() {
         };
         let programs = &mut *core::ptr::addr_of_mut!(CONFIGURATION);
         programs.expire(milliseconds());
+        if FLASH_BLOCKED {
+            return;
+        }
         if !RESTORED {
             crate::kernel::storage::with_storage(|storage| match storage.configuration() {
                 Ok(mut region) => {
@@ -170,6 +197,7 @@ pub(crate) fn poll() {
         }
         #[cfg(feature = "firmware-update")]
         let Some(_flash) = crate::kernel::update::staging::FlashStep::enter() else {
+            FLASH_BLOCKED = true;
             return;
         };
         crate::kernel::storage::with_storage(|storage| match storage.configuration() {
@@ -179,6 +207,8 @@ pub(crate) fn poll() {
                 // execution remains gated on that commit, not confirmation alone.
                 if region.is_writable() {
                     let _ = programs.poll(&mut region, native);
+                } else {
+                    FLASH_BLOCKED = true;
                 }
             }
             Err(_) => programs.state = Status::Storage,
@@ -206,18 +236,24 @@ pub(crate) fn poll_work(local: u64, context: &crate::sync::TaskContext, now: u32
             if PROFILE_REVISION != revision {
                 time.configure(profile.map(|p| p.1), mono);
                 PROFILE_REVISION = revision;
+                traversals.wake();
             }
             if programs.temporal_dirty {
+                time.retain(|source| programs.temporal_entry(source).is_some());
                 for (source, predicate) in programs.temporal_records() {
                     time.add(source, predicate, mono)
                         .expect("validated temporal capacity");
                 }
                 programs.temporal_dirty = false;
             }
+            if time.wait_ms(mono) == Some(0) {
+                traversals.wake();
+            }
             time.poll(mono);
         }
-        admit_changes(&*core::ptr::addr_of!(CONFIGURATION), traversals);
-        traversals.poll(
+        MORE_LOCAL_WORK = admit_changes(&*core::ptr::addr_of!(CONFIGURATION), traversals)
+            && super::activation::pending();
+        MORE_LOCAL_WORK |= traversals.poll(
             &mut *core::ptr::addr_of_mut!(CONFIGURATION),
             native,
             context,
@@ -322,8 +358,40 @@ pub(crate) fn reply(work: Work, bytes: &[u8], now: u32) {
 pub(crate) fn temporal_value(source: u16) -> Option<bool> {
     unsafe { (&*core::ptr::addr_of!(TIME)).value(source) }
 }
-pub(crate) fn deadline_ms() -> Option<u64> {
-    unsafe { (&*core::ptr::addr_of!(TIME)).wait_ms(crate::kernel::time::monotonic_ms()) }
+pub(crate) fn resume() {
+    unsafe {
+        FLASH_BLOCKED = false;
+        (&mut *core::ptr::addr_of_mut!(TRAVERSALS)).wake();
+    }
+}
+pub(crate) fn wait_ms(now: u32) -> Option<u64> {
+    unsafe {
+        let programs = &*core::ptr::addr_of!(CONFIGURATION);
+        let traversals = &*core::ptr::addr_of!(TRAVERSALS);
+        let time = &*core::ptr::addr_of!(TIME);
+        let sync = &*core::ptr::addr_of!(SYNC);
+        let mono = crate::kernel::time::monotonic_ms();
+        let mut next = time.wait_ms(mono);
+        let mut include = |ms: u64| next = Some(next.map_or(ms, |n| n.min(ms)));
+        if MORE_LOCAL_WORK || (!RESTORED && (&*core::ptr::addr_of!(NATIVE)).is_some()) {
+            include(0);
+        }
+        if let Some(ms) = programs.wait_ms(now, !FLASH_BLOCKED) {
+            include(ms.into());
+        }
+        if let Some(ms) = traversals.wait_ms(now, sync.waiting.is_none()) {
+            include(ms.into());
+        }
+        if let Some((_, _, sent, _)) = sync.waiting {
+            include(2000u32.saturating_sub(now.wrapping_sub(sent)).into());
+        } else if traversals.awaiting().is_none()
+            && time.profile.is_some()
+            && time.utc(mono).is_none()
+        {
+            include(sync.due.saturating_sub(mono));
+        }
+        next
+    }
 }
 
 fn milliseconds() -> u32 {
@@ -332,9 +400,9 @@ fn milliseconds() -> u32 {
 }
 
 /// Consume only this kernel instance's committed local-source notifications.
-pub(super) fn admit_changes(programs: &Configuration, traversals: &mut Traversals) {
+pub(super) fn admit_changes(programs: &Configuration, traversals: &mut Traversals) -> bool {
     if traversals.epoch == 0 || traversals.local == 0 || !crate::kernel::change::committed() {
-        return;
+        return false;
     }
     if let Some(change) = super::activation::first() {
         if change.cursor & crate::kernel::time::SOURCE != 0 {
@@ -342,13 +410,13 @@ pub(super) fn admit_changes(programs: &Configuration, traversals: &mut Traversal
                 programs.temporal_entry(change.cursor & !crate::kernel::time::SOURCE)
             {
                 match traversals.activate(programs, entry) {
-                    Err(Status::Busy) => return,
+                    Err(Status::Busy) => return false,
                     Err(e) => traversals.fault(entry, e),
                     Ok(()) => {}
                 }
             }
             super::activation::advance(u16::MAX);
-            return;
+            return true;
         }
         if let Some((definition, generation, source, next)) = programs.dependency(change.cursor) {
             let entry = lattice_peer_wire::program::execution::Entry {
@@ -358,7 +426,7 @@ pub(super) fn admit_changes(programs: &Configuration, traversals: &mut Traversal
             };
             match traversals.activate(programs, entry) {
                 Ok(()) => super::activation::advance(next),
-                Err(Status::Busy) => {}
+                Err(Status::Busy) => return false,
                 Err(e) => {
                     traversals.fault(entry, e);
                     super::activation::advance(next);
@@ -367,7 +435,9 @@ pub(super) fn admit_changes(programs: &Configuration, traversals: &mut Traversal
         } else {
             super::activation::advance(u16::MAX);
         }
+        return true;
     }
+    false
 }
 
 pub(crate) fn epoch() -> u64 {

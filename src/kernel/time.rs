@@ -100,6 +100,19 @@ impl Time {
         self.rearm();
         Ok(())
     }
+    pub fn retain(&mut self, mut keep: impl FnMut(u16) -> bool) {
+        let mut count = 0;
+        for i in 0..self.count {
+            let alarm = self.alarms[i].unwrap();
+            if keep(alarm.source) {
+                self.alarms[count] = Some(alarm);
+                count += 1;
+            }
+        }
+        self.alarms[count..].fill(None);
+        self.count = count;
+        self.rearm();
+    }
     pub fn sample(&self, predicate: Predicate, mono: u64) -> (Option<bool>, Option<i64>) {
         let (Some(profile), Some(utc)) = (self.profile, self.utc(mono)) else {
             return (None, None);
@@ -400,6 +413,14 @@ mod tests {
         );
         assert_eq!(t.wait_ms(100), Some(7_200_000));
         assert_eq!(t.value(0), Some(true));
+        t.retain(|source| source % 2 == 0);
+        assert_eq!(t.count, CAPACITY / 2);
+        for source in 0..CAPACITY as u16 {
+            assert_eq!(t.value(source).is_some(), source % 2 == 0);
+        }
+        t.retain(|_| false);
+        assert_eq!(t.wait_ms(100), None);
+        assert!(t.add(0, Predicate::Civil { start: 0, end: 1 }, 100).is_ok());
         assert_eq!(Time::new().utc(100), None); // persisted profile is not an outage clock
         for (ms, valid) in [
             (MIN_UTC * 1000 - 1, false),

@@ -88,6 +88,21 @@ impl Activation {
             Some(_) => Action::Wait,
         }
     }
+    pub fn wait_ms(&self, now: u32, ready: Option<(Header, u32)>) -> Option<u32> {
+        let (header, swap) = ready?;
+        let duration = header.costs.outage_ms(swap)?;
+        if self.package != Some(header.id) {
+            return Some(0);
+        }
+        Some(if let Some(since) = self.announced {
+            NOTICE_MS.saturating_sub(now.wrapping_sub(since))
+        } else {
+            duration
+                .max(MIN_QUIET_MS)
+                .saturating_add(self.backoff)
+                .saturating_sub(now.wrapping_sub(self.quiet_since))
+        })
+    }
     pub fn announced(&mut self, now: u32, sent: bool) {
         if sent {
             self.announced = Some(now);
@@ -192,6 +207,7 @@ impl Commit {
 impl Drop for Commit {
     fn drop(&mut self) {
         HOLDS.store(0, Ordering::Release);
+        wake();
     }
 }
 
@@ -251,6 +267,9 @@ mod tests {
                     Action::Announce(_)
                 ));
                 a.announced(at(24_000), true);
+                assert_eq!(a.wait_ms(at(25_999), Some((header(true), 0))), Some(1));
+                assert_eq!(a.wait_ms(at(26_000), Some((header(true), 0))), Some(0));
+                assert_eq!(a.wait_ms(at(24_000), Some((header(false), 0))), None);
                 assert_eq!(
                     a.poll(at(25_999), 2, Some((header(true), 0)), false, false),
                     Action::Wait

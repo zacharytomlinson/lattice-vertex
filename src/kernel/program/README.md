@@ -36,10 +36,27 @@ merely to validate/install its declaration.
 The resident definition arena is 8 KiB. Actual admission also respects the port's
 configuration capacity (8,140 bytes in layout 3). Records occupy variable byte
 extents; there is no fixed array slot per edge or StateId-to-ProgramId registry.
-One incomplete installation owns the remaining tail while it receives bytes.
+One incomplete installation owns a fixed **512-byte** incoming buffer and reserves
+the largest available arena extent. The limit covers the complete incoming LPD,
+including its header, sources and operations. Begin rejects larger fragments with
+Bounds before accepting data. This is a deliberate initial fragment limit; increase
+it only for a demonstrated need. The complete LPD is validated before matching
+computation locally; only its connection record may need resident space. The
+512-byte staging capacity is independent of the 8 KiB resident arena.
 Uncommitted receiving reservations expire after 30 seconds without an accepted
 Begin/Data request. Once persistence begins, ordinary service continues between
 flash steps; a timeout/disconnect does not cancel a committed definition.
+
+If a concrete fragment later exceeds this limit, the planned extension is an
+installation session that stages complete components incrementally. Each completed
+component is checked and stored provisionally, then its receive workspace is reused.
+Provisional records remain outside live dependency lists and cannot execute. Session
+completion checks cross-references and whole-fragment validity by walking staged
+records, then commits and publishes the fragment. Failure discards the session's
+additions, including new connections to shared computation; existing shared users
+remain intact. Receive/validation working memory stays bounded independently of
+total fragment size; provisional storage still consumes capacity. This extension
+is not implemented: today 512 bytes caps the complete incoming fragment.
 
 Each owned state contains its local dependency-list head. A source record has a
 native reference, a local program entry, and its next-sibling word. After commit,
@@ -130,17 +147,44 @@ capacity separately. Firmware callbacks cannot substitute for missing record kin
 
 ## Persistent image
 
-The committed payload starts with `LPG`, version byte 3, followed by local
-definitions and an optional commissioned clock profile. Each has a 24-byte prefix: total prefix-plus-definition length
-(`u16`), enabled flag (`u8`, 0 or 1), record kind zero (`u8`), generation (`u32`),
-installing caller (`u64`), transfer nonce (`u32`), and admission revision (`u32`).
-LPG v1 is read as disabled with admission revision zero. V2 admission is preserved.
-The startup checkpoint upgrades either header and preserves every definition offset and generation. Runtime
-source links and the pending-initial-evaluation flag are excluded from saved/read bytes. Definitions append to this
-image; there is no deletion, live replacement or reuse of occupied extents yet.
-Generations do not wrap. The immutable caller/nonce and canonical definition
-digest distinguish a repeated commit from conflicting work after a lost reply or
-restart. A reservation receipt is not a commit receipt.
+The committed payload starts with `LPG`, version byte **4**. Every extent begins
+with length `u16`, flags `u8`, kind `u8`. A free extent (kind 4) has only this
+four-byte header; occupied extents retain the existing 24-byte prefix: generation
+`u32`, installing caller `u64`, transfer nonce `u32`, admission revision `u32`.
+Flags bit 0 enables a head. Bits 6–7 count 0–3 trailing padding bytes, allowing a
+whole free extent to be consumed without leaving an unusable fragment. RAM-only
+initial-evaluation (bit 1) and staged-install (bit 3) flags are never serialized.
+
+| Kind | Contents after the occupied prefix |
+| --- | --- |
+| 0 inline | Complete LPD v1; its computation and first connection set |
+| 1 clock | Commissioned profile described below |
+| 2 connection | Reference to a computation plus this connection set's source/head/link records |
+| 3 body | Original LPD template retained after its first connection was removed; never active itself |
+| 4 free | No occupied prefix or executable contents |
+
+Matching compares the surface fingerprint, carried/scratch layout, and ordered
+operation payloads, including types, constants and native references. Connections,
+record positions, source subscriptions and head designation are not computation.
+A kind-2 record stores body offset `u16`, body generation `u32`, selected head
+`u16`, original LPD length `u16`, source count `u16`, then its 12-byte source records.
+For each operation it stores the original record offset/length (`u16` each), the
+temporal activation entry if applicable, and that operation's links in LPD encoding.
+The body reference always points directly to kind 0 or 3, never another connection.
+The evaluation view combines those links with the shared operands; it cannot select
+a different connection's destination. Virtual LPD offsets remain exactly as authored.
+
+LPG v1/v2/v3 inline definitions remain readable. The startup checkpoint upgrades
+the header without relocating live definitions or changing generations. V1 starts
+disabled; later admission state is preserved. Removing one connection keeps the
+body while another still references it. Removing the last frees it. Adjacent free
+extents coalesce and an unused tail is trimmed; live extents never move.
+
+Generations derive from the monotonically increasing committed-image generation
+and do not wrap. Reusing an address cannot revive an old continuation or deletion.
+Caller/nonce plus the reconstructed canonical LPD digest still distinguish retry
+from conflicting installation. Read returns Busy during persistence rather than
+exposing an uncommitted reused extent. A reservation is not a commit receipt.
 
 One kind-1 context record uses the same 24-byte prefix followed by a 32-byte clock
 profile. Its length is 56, generation is the profile revision, and other prefix
@@ -171,6 +215,7 @@ the ordinary path-cost field. Host v4 carries these through kinds **7/0x87**.
 | 4 abort | Transfer; only a receiving reservation can be discarded |
 | 5 read | Offset `u16` within the committed local image |
 | 6 dependencies | Native state reference `u64`, source cursor `u16`; `0xffff` starts at the head |
+| 29 remove | Local connection offset `u16`, generation `u32` |
 
 Clock commands 15–18 share this service; layouts and revision semantics are in the
 [time component](../time/README.md#commissioning-and-reacquisition).
@@ -179,7 +224,9 @@ Replies contain status `u8`, offset `u16`, generation `u32`, accepted `u16`, tot
 `u16`, byte count `u8`, and up to 48 bytes. Begin/Data/Commit offsets identify the
 reserved definition; accepted/total count its LPD bytes. Info reports committed
 image length and, while receiving, the current progress; its data contains total
-capacity and maximum record count as two `u16`s. Read reports the requested offset
+image capacity, maximum record count and maximum incoming fragment bytes as three
+`u16`s, in that order. The fragment limit is appended to the earlier two fields.
+Read reports the requested offset
 and complete image length. Dependency replies identify the installed definition
 and carry current cursor, next cursor and entry offset (`u16` each); no data means
 end of list. They enumerate the actual reconstructed native dependency chain.
@@ -187,12 +234,35 @@ end of list. They enumerate the actual reconstructed native dependency chain.
 Receiving, persisting and installed are distinct statuses. Other results report
 busy, unsupported, invalid, bounds, binding, compatibility, storage or conflict.
 Execution adds Enabled (12), Disabled (13), Accepted (14), Stale (15), and Unavailable
-(16); an Accepted visit receipt does not claim that its native operation has finished.
+(16), and Removed (17); an Accepted visit receipt does not claim that its native operation has finished.
 Data ranges are ordered; an identical duplicate is acknowledged without another
 copy. Conflicting bytes/digests fail. Persisting/installed receipts are idempotent
 for the same caller/nonce/definition. An abandoned incomplete reservation cannot
 occupy installation capacity indefinitely. This is structural admission and
 transport integrity, not a new authentication or FSPS proof mechanism.
+
+## Explicit removal
+
+Remove addresses one local connection set, including one stored inline with its
+computation. The handler detaches its state sources, temporal alarms, pending
+activations and visit receipts. Pending source cursors advance to surviving
+siblings before the old storage can be reused. Ready native calls are canceled;
+already-running native calls finish with their continuation detached. Their
+arguments already belong to the native task, so they retain no program-image borrow.
+Other connection sets, native states/functions and commissioned time remain intact.
+
+The reply echoes offset/generation. Persisting means local removal took effect;
+Removed means the reclaimed image committed, or that generation is already absent.
+Retry with the same identity after a timeout. A newer occupant at the same offset
+is untouched. Busy means a different configuration operation owns persistence.
+A power loss before commit can restore the old image; an unconfirmed deletion must
+be retried. No success is reported merely because RAM was reclaimed.
+
+Earlier ready local evaluations run FIFO before a later command. Remote handoffs
+and native calls yield independently; deletion does not wait for the entire graph.
+Traffic already beyond the vertex is not recalled. Removing an entire distributed
+path requires deletion commands to its participating owners; this operation adds
+no global automation registry, deletion crawler, or replacement/drain protocol.
 
 ## Admission and execution
 
@@ -271,6 +341,38 @@ can occupy fixed visit capacity; it does not allocate more memory or silently dr
 that visit. One outgoing exchange is in flight per radio service; local/native
 visits still overlap.
 
+### Network-service readiness
+
+Retained work and runnable work are distinct. Receiving reservations and accepted
+receipts request wakeups at their 30/60-second expiry. A sending visit requests its
+actual retry or two-second reply deadline; a native call waits for completion.
+A visit blocked on unavailable state/capacity keeps its cursor and operands until
+a producer notification, service message or relevant time boundary resumes it.
+Ready local evaluations run in admission order, each with a bounded local turn.
+Reservation alone does not enter that order; complete accepted work does. A later
+command is handled after earlier ready local evaluation has been dispatched.
+
+The transport latches software-work notifications separately from radio-driver
+wakes. This matters when a source baseline, cache publication or resource release
+has no packet/delta queued: the receive wait must still return to the service.
+Native context release, observation/cache/batch completion, flash-access availability
+and startup confirmation supply those wakeups. Configuration writes continue when
+writable and unblocked, without a fixed scanning cadence. Time reacquisition and
+local temporal boundaries contribute their real deadlines to the same wait.
+
+The generic 10 ms pending-work wakeup is removed. Immediate work still gives the
+radio a receive opportunity of at least one tick; normal discovery and RTOS ticks
+remain. Capacity pressure does not cancel finite execution or coalesce registered
+causes. Explicit removal has the distinct semantics above. No extra task or general
+work scheduler is introduced.
+
+The C6/Nordic hardware check retained an accepted receipt after its visit completed:
+radio notification waits were 9/18 over about two seconds, with zero appliance getter
+calls during those windows. Long native calls and the saved two-owner program also
+completed with no execution faults, uncertain handoffs or local overflow. These are
+one-hop, software-backed appliance checks. Captures and injected-IRQ/measurement
+code remain in the external lab, outside kernel source and build dependencies.
+
 Statistics replies contain five `u32` counters (admitted local visits, completed
 local visits, faults, uncertain handoffs, local-cause overflow), followed by the
 last fault status (`u8`), definition (`u16`) and record (`u16`). Local completion
@@ -287,7 +389,38 @@ commit, duplicate/conflict behavior, reservation expiry and reconstruction again
 fresh native storage. Execution checks cover declared-width arithmetic, location
 bounds, commit-before-admission, independent activations despite transport eviction,
 conditional cross-owner execution, partial handoffs, duplicate commits and capacity.
-Shared transport checks cover the command and message boundaries.
+Sharing checks enforce exact bound-path reconstruction, local ownership under
+removal permutations, source-cursor repair, fresh generations on reuse, FIFO ready
+dispatch and publication/recovery at interrupted flash boundaries, including an
+installation in a hole without changing image length. Shared transport checks
+cover the command and message boundaries.
+The C6/Nordic sharing check installed two paths through one Nordic predicate
+computation, each with its own C6 upstream and downstream references. Each produced
+only its addressed target value. Removing the original connection retained the
+shared body and the second path, including after resetting both boards. Removing
+the final connections restored both original image extents; reusing a Nordic
+address rejected the old generation while the new generation executed. Both owners
+also rejected an oversized Begin under the 512-byte incoming-fragment limit.
+
+A temporary lab-only Nordic setter exposed an intermediate running value, delayed
+three seconds, and then established its final value. Radio deletion was accepted
+while it was running; the function finished without its downstream mutation. A
+prior attempt timed out on a remote state read before issuing deletion, and another
+native-command reply timed out after reboot despite the requested and dependent
+states completing. Direct readback and USB observation resolved the check outcomes;
+the later [radio investigation](../radio/TESTING.md#receive-turns-in-the-resident-peer)
+reproduced CCA timing/configuration failures and loss of an ACKed reply in receive
+storage. It corrected those paths and validated maintained images with back-to-back
+calls/reads. This is real-MCU execution with software-backed appliance values,
+not physical-actuator or latency proof.
+
+The maintained images were restored, test fragments removed and original admission
+restored. Saved program bytes changed only for LPG v3-to-v4 migration and the C6
+head's expected disable/re-enable revision. Clock profiles and original references
+were preserved. Captures and the temporary setter/authoring runner remain in the
+external lab under `experiments/fragment-reclamation-20261027`, with no kernel build
+dependency on them.
+
 Both ports' existing radio fixture has a `program-test` feature that starts with
 storage and an ordinary test appliance without a signing policy. It contains no
 installed automation. Build with `--bin radio --features program-test`; the port's

@@ -34,10 +34,11 @@ than exclusively borrowing the whole appliance throughout a long operation.
 
 The kernel starts one acquisition task and two native-call tasks, each currently
 reserving 4 KiB of static stack and an RTOS control block. These kernel build bounds
-live in `config.rs`, alongside the 32-native-state observation capacity and 10 ms
-fallback sampling interval. The interval follows completion of an acquisition pass;
-it is not a guaranteed sample deadline. Direct hardware-event acquisition is future
-port integration, and sampling cannot recover unobserved intervening transitions.
+live in `config.rs`, alongside the 32-native-state observation capacity and the
+10 ms compatibility fallback for getter-only adapters. Each state's acquisition
+source now determines whether the task wakes on an event or a sampling deadline.
+Intervals follow completion of acquisition; they are not guaranteed sample deadlines.
+Sampling cannot recover unobserved intervening transitions.
 
 The acquisition task calls the supplied getters and owns the previous/current
 established observations. Native calls also request acquisition before and after
@@ -70,6 +71,74 @@ With updates enabled, admission holds flash staging/activation until the call
 finishes. Acquisition uses a quiet hold: it excludes conflicting flash/commit work
 without resetting the update quiet interval merely because a getter ran. Actual
 registered changes still count as activity.
+
+## Hardware acquisition sources
+
+`State::acquisition(&'static Appliance)` is called once by the acquisition task at
+startup. It supplies one local `kernel::Acquisition` policy:
+
+| Policy | Acquisition trigger |
+| --- | --- |
+| `Acquisition::Event(&event)` | The bound peripheral event/HAL waker |
+| `Acquisition::periodic(milliseconds)` | That source's next sampling deadline |
+| `Acquisition::OnInvocation` | Startup and kernel acquisition around native calls |
+
+A typical event-backed state's override is just:
+
+```rust,ignore
+fn acquisition(a: &'static Self::Appliance) -> lattice_vertex::kernel::Acquisition {
+    lattice_vertex::kernel::Acquisition::Event(&a.sample_ready)
+}
+```
+
+The hardware binding connects its peripheral-ready interrupt to
+`AcquisitionEvent::notify()`, or registers `event.waker()` with its interrupt-capable
+HAL. It can register that waker in `State::acquisition` while the initialized native
+instance has a stable address. The kernel-owned event contains no value and emits
+no message. It wakes the acquisition task, whose getter comparison establishes
+whether a delta occurred. IRQ priority/configuration stays in the hardware binding;
+use kernel-callable priorities (5..=7 on nRF52840). BASEPRI ports check priority
+before the event enters the raw RTOS notification API.
+
+Several states may return the same event. Its bound bitmap selects that group;
+other getters are not read on that wakeup. One event cannot bind different appliance
+instances. Event, owner and acquisition-task storage remain live for the kernel's
+lifetime. There is no per-state task, executor, heap allocation or event queue.
+The event is two machine-word atomics on the supported 32-bit MCUs. The appliance
+adds a pending bitmap and task pointer; per-source sampling deadlines occupy fixed
+storage on the existing acquisition stack. Each native state handle adds its
+source-binding function pointer. This local policy is absent from the wire surface
+and does not change durable state references or IR definitions.
+
+Every state receives a startup baseline. Subsequent readiness coalesces until the
+getter is acquired; an event raised during a getter remains pending for another
+pass. Actual registered deltas retain their individual records. GPIO edges or ADC
+samples that must all survive need hardware latches/counters/DMA or bounded device
+storage: a readiness bit is not a historical value ledger. Sources with no event
+use their required sampling interval, bounded to 1..=i32::MAX milliseconds. The
+task waits for the earliest one; with only event/call-boundary sources it blocks
+without a periodic acquisition timeout.
+
+Native invocation still acquires all exposed native states before and after the
+hardware function, including when the function returns an error. This preserves
+coupled/partial effects without trusting a declared result as an observation.
+`OnInvocation` is appropriate only when those boundaries suffice; intermediate or
+external changes require events or sampling. A busy acquisition/cache/flash guard
+retains pending readiness and retries after a tick instead of losing the request.
+
+Host property tables cover selective/group acquisition, baseline suppression,
+unchanged/unavailable state, readiness during acquisition, contention retention,
+event ownership and interval wrap/bounds. Release kernel builds pass for C6 and
+nRF52840 with host-link and test-support disabled. Live software-triggered MCU IRQs
+on both boards each caused one acquisition of their shared two-state group; idle
+windows produced no getter calls. The passive test adapter and diagnostics are
+external lab code. Physical GPIO/ADC behavior and sensor qualification remain
+appliance-integration work. General RTOS tick suppression is separate.
+
+The first acquisition baseline and publication after a blocked cache read also wake
+the network service, even when no value delta exists. Registered deltas retain their
+normal notification path. This lets unavailable/capacity-blocked visits resume
+without periodic network checks or invented changes.
 
 ## One frame per call, read, result, or delta
 
@@ -254,7 +323,8 @@ ordering across reboot, compensate for packet loss, or prove physical convergenc
 
 ## Storage and validation
 
-The common forwarder retains its 2,464-byte compile-time ceiling, including three
+The common forwarder has a 2,912-byte compile-time ceiling, including four
+[bound control paths](control/README.md) and three
 owners with two candidate directions each, maintained adjacent links, read/discovery
 records, four call paths with two-way branch bookkeeping, and eight delta duplicate keys. Owner
 invocation history has a 1,280-byte compile-time ceiling, including active-call

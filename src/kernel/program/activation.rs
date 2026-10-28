@@ -56,6 +56,17 @@ pub(super) fn advance(next: u16) {
         }
     });
 }
+/// Repair captured cursors before their storage can be reused. Other pending
+/// causes keep their original order and continue through surviving siblings.
+pub(super) fn redirect(from: u16, to: u16) {
+    access(|p| {
+        for change in p.records.iter_mut().flatten() {
+            if change.cursor == from {
+                change.cursor = to;
+            }
+        }
+    });
+}
 pub(super) fn overflow() -> u32 {
     OVERFLOW.load(Ordering::Relaxed)
 }

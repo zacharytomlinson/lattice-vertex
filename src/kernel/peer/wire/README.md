@@ -20,8 +20,10 @@ deadline task or hardware dependency. [Local time/solar](../../time/README.md) o
 those runtime responsibilities.
 
 `control` defines latest-target sessions and addressed native/observed progress.
-Its inner command tags 19–23 use the existing Program service envelope; they are
-not the retired outer LVT opcodes. The optional host codec adds asynchronous target
+Open now uses inner tag 24 in the Program service envelope; old unbound Open
+tag 19 is rejected. Compact RF targets/progress/receipts/faults use outer opcodes
+25–28 on a bound path, with raw target bytes interpreted by the bound signature.
+Finish/Close retain inner tags 21/22. The optional host codec adds asynchronous target
 kind 8 and progress/fault kinds 146/147. Each record fits the existing frame bounds.
 The [control owner](../control/README.md) implements their runtime and lifetime.
 
@@ -96,3 +98,10 @@ is no longer the routing objective.
 The OTA service preserves these quantities in its transfer replies. Measured local
 costs drive staging admission and automatic activation deferral. Firmware-local
 flash/verification/boot costs remain distinct from communication time.
+
+Program command 29 removes one owner-local connection set by its definition offset
+and generation. Reply status 17 means Removed; Persisting remains unconfirmed.
+This leaves other connection sets sharing its computation intact. See the
+[program component](../../program/README.md#explicit-removal) for lifecycle semantics.
+LPD v1 input is unchanged; the kernel's LPG v4 storage format is internal to its
+persistent image and supports vertex-local computation sharing.

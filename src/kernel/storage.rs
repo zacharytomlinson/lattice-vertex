@@ -77,6 +77,7 @@ mod device {
                     return true;
                 }
                 let startup = &mut *core::ptr::addr_of_mut!(STARTUP);
+                let confirmed = startup.confirmed();
                 if startup.progress(
                     crate::kernel::tasks::xTaskGetTickCount() as u32,
                     radio_completed,
@@ -86,6 +87,9 @@ mod device {
                             .map_err(|_| lattice_peer_wire::update::Status::Storage)
                     },
                 ) {
+                    if !confirmed {
+                        crate::kernel::radio::task::notify_work();
+                    }
                     crate::port::watchdog::feed();
                 }
                 return true;

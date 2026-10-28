@@ -119,7 +119,7 @@ is removed; explicit bounded owner searches and compact arrivals remain supporte
 
 Link storage has a 608-byte compile-time ceiling for eight neighbors, their
 measurement totals/freshness, and bounded update-absence records. It is included
-in the forwarder's 2,464-byte ceiling. No allocator, per-peer task, foreign-surface store,
+in the forwarder's 2,912-byte ceiling, including four bound control paths. No allocator, per-peer task, foreign-surface store,
 new hardware experiment, or test-only receive path is added.
 
 Colocated host checks cover phase/token correlation, simultaneous opens, lost

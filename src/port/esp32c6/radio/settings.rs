@@ -100,7 +100,9 @@ pub(crate) fn ieee802154_pib_init() {
             short_addr: [0u16; IEEE802154_MULTIPAN_MAX],
             ext_addr: [[0xffu8; IEEE802154_FRAME_EXT_ADDR_SIZE]; IEEE802154_MULTIPAN_MAX],
             cca_threshold: CONFIG_IEEE802154_CCA_THRESHOLD,
-            cca_mode: CcaMode::Ed,
+            // A decodable 802.15.4 peer can be below the energy threshold.
+            // Its carrier still makes the channel busy.
+            cca_mode: CcaMode::CarrierOrEd,
         }
     });
 }

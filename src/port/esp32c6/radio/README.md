@@ -18,7 +18,10 @@ with kernel task wakers. The hardware-test workload sends frames without MAC ACK
 Each port transmission is one attempt. Ordinary addressed peer frames enable
 hardware immediate ACK TX/RX, validate the returned ACK sequence, and bound the
 hardware ACK wait to 864 us. CCA-busy and missing-ACK outcomes reach the common
-kernel, which owns the four-attempt limit and backoff. Broadcasts and the raw
+kernel, which owns four frame attempts and a separate bounded channel-access
+budget. CCA uses carrier **or** energy detection: a decodable 802.15.4 peer below
+the energy threshold must still make the medium busy. The energy threshold remains
+−60 dBm and C6 transmit power remains 20 dBm. Broadcasts and the raw
 probe workload do not request ACKs. No application invocation is regenerated.
 
 The linked `esp-wifi-sys-esp32c6` 0.2.0 `libbtbb.a` initializes baseband TX-on
@@ -67,3 +70,15 @@ Channel surveying/selection is common-kernel policy. Prior board bring-up exerci
 ED, retuning, joining, and founder-independent operation; it does not establish
 radio range or the current protocol's complete delivery behavior. The maintained
 [peer check](../../../kernel/peer/TESTING.md) describes the reusable validation path.
+
+The four-record driver RX queue preserves addressed frames under broadcast pressure.
+It discards the oldest non-ACK-requested frame first and keeps the arrival order of
+all survivors. When all retained frames are addressed, it refuses the newcomer.
+The common receive buffer follows the same policy; neither buffer was enlarged.
+
+CCA and the channel survey share the ED duration register. Every CCA transmission
+restores eight symbols (128 microseconds), matching
+[Espressif's transmit path](https://github.com/espressif/esp-idf/blob/v5.5.4/components/ieee802154/driver/esp_ieee802154_dev.c#L956).
+Otherwise a 4,096-microsecond channel survey leaves 256 symbols active for later
+transmissions. The duration setter modifies only its field, preserving the register's
+separate delay bits. Boot-time register capture verified the 256-to-8 transition.

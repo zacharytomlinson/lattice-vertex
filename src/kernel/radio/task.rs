@@ -19,7 +19,7 @@ use core::{
     marker::PhantomData,
     pin::pin,
     ptr,
-    sync::atomic::{AtomicPtr, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
@@ -35,6 +35,7 @@ const STACK_WORDS: usize = if cfg!(feature = "firmware-update") {
 static mut STACK: [StackType_t; STACK_WORDS] = [0; STACK_WORDS];
 static mut CONTROL: tasks::StaticTask_t = tasks::StaticTask_t::new();
 static mut PERIPHERAL: Option<port::RadioPeripheral> = None;
+static WORK_READY: AtomicBool = AtomicBool::new(false);
 static WAKE_TARGET: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static mut NATIVE: Option<&'static dyn crate::kernel::appliance::Native> = None;
 static mut DESCRIPTION: Option<crate::kernel::peer::exposure::Description> = None;
@@ -107,7 +108,9 @@ fn local_pending() -> bool {
     if crate::kernel::peer::host::pending() {
         return true;
     }
-    crate::kernel::change::pending() || crate::kernel::appliance::execution::completion_pending()
+    WORK_READY.load(Ordering::Acquire)
+        || crate::kernel::change::pending()
+        || crate::kernel::appliance::execution::completion_pending()
 }
 
 #[derive(Clone, Copy)]
@@ -180,7 +183,12 @@ pub struct Transport {
     _task_context: PhantomData<*mut ()>,
 }
 
+pub(crate) fn take_work_notification() -> bool {
+    WORK_READY.swap(false, Ordering::AcqRel)
+}
+
 pub(crate) fn notify_work() {
+    WORK_READY.store(true, Ordering::Release);
     let target = WAKE_TARGET.load(Ordering::Acquire);
     if !target.is_null() {
         unsafe {
@@ -300,29 +308,51 @@ impl Transport {
         let mut result = Err(Error::Aborted);
         let mut unconfirmed = false;
         for attempt in 0..attempts {
-            if attempt != 0 {
-                let delay = self
-                    .backoff
-                    .ticks(attempt - 1, crate::configTICK_RATE_HZ as u32);
-                self.capture_for(delay as TickType_t, false);
+            // ChannelBusy means no frame was sent. Channel access has its own
+            // bounded CSMA budget; only a missing ACK retries the frame itself.
+            let channel_attempts = if self.peer_runtime {
+                mac::CHANNEL_ATTEMPTS
+            } else {
+                1
+            };
+            for busy in 0..channel_attempts {
+                if self.peer_runtime || attempt != 0 {
+                    let backoffs = if self.peer_runtime {
+                        busy
+                    } else {
+                        attempt.saturating_sub(1)
+                    };
+                    let delay = self
+                        .backoff
+                        .ticks(backoffs, crate::configTICK_RATE_HZ as u32);
+                    self.capture_for(delay as TickType_t, false);
+                }
+                // The port performs one CCA/TX/ACK operation. Its cancellation
+                // guard stops DMA before a deadline can return its storage.
+                result = wait(
+                    self.radio.transmit(frame, &mut self.received),
+                    &self.waker,
+                    if acknowledged {
+                        mac::attempt_ticks(crate::configTICK_RATE_HZ as u32) as TickType_t
+                    } else {
+                        portMAX_DELAY
+                    },
+                    WaitMode::Transmit,
+                )
+                .unwrap_or(Err(Error::NoAcknowledgement));
+                unconfirmed |= result == Err(Error::NoAcknowledgement);
+                if self.peer_runtime
+                    && matches!(result, Err(Error::NoAcknowledgement | Error::ChannelBusy))
+                {
+                    // A peer may already be replying, or still transmitting the
+                    // frame that made CCA busy. Give it a complete receive turn.
+                    self.receive_turn();
+                }
+                if result != Err(Error::ChannelBusy) {
+                    break;
+                }
             }
-            // The port performs one TX/ACK exchange. Its cancellation guard
-            // stops DMA before a bounded deadline can return its storage.
-            result = wait(
-                self.radio.transmit(frame, &mut self.received),
-                &self.waker,
-                if acknowledged {
-                    mac::attempt_ticks(crate::configTICK_RATE_HZ as u32) as TickType_t
-                } else {
-                    portMAX_DELAY
-                },
-                WaitMode::Transmit,
-            )
-            .unwrap_or(Err(Error::NoAcknowledgement));
-            unconfirmed |= result == Err(Error::NoAcknowledgement);
-            if result.is_ok()
-                || !matches!(result, Err(Error::NoAcknowledgement | Error::ChannelBusy))
-            {
+            if result != Err(Error::NoAcknowledgement) {
                 break;
             }
         }
@@ -378,12 +408,12 @@ impl Transport {
                     if mac::is_ack(&frame[..length]) {
                         continue;
                     }
-                    let evicted = self.received.push(&frame[..length]);
+                    let dropped = self.received.push(&frame[..length]);
                     #[cfg(feature = "test-support")]
-                    if evicted {
+                    if dropped {
                         super::testing::event(super::testing::Event::ReceiveEvicted);
                     }
-                    let _ = evicted;
+                    let _ = dropped;
                     if first_only {
                         return;
                     }

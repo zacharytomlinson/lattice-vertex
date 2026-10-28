@@ -1,5 +1,6 @@
 //! Passive appliance binding, kernel-owned acquisition and native dispatch.
 
+pub(crate) mod acquisition;
 pub(crate) mod execution;
 
 use super::{
@@ -52,7 +53,9 @@ pub struct Appliance<A: 'static, E: 'static> {
     instance: AtomicPtr<()>,
     ready: AtomicU8,
     sampled: AtomicBool,
+    cache_waiting: AtomicBool,
     acquiring: AtomicBool,
+    acquisition: acquisition::Signals,
     installed: AtomicPtr<super::state::Installation<A>>,
 }
 
@@ -77,7 +80,9 @@ impl<A: Send + Sync, E> Appliance<A, E> {
             instance: AtomicPtr::new(ptr::null_mut()),
             ready: AtomicU8::new(0),
             sampled: AtomicBool::new(false),
+            cache_waiting: AtomicBool::new(false),
             acquiring: AtomicBool::new(false),
+            acquisition: acquisition::Signals::new(),
             installed: AtomicPtr::new(ptr::null_mut()),
         }
     }
@@ -137,18 +142,38 @@ impl<A: Send + Sync, E> Appliance<A, E> {
         access(self.native())
     }
 
+    fn state_mask(&self) -> u32 {
+        let count = self.surface.states.len();
+        if count == 0 {
+            0
+        } else {
+            u32::MAX >> (32 - count)
+        }
+    }
     fn sample(&self, context: &TaskContext) {
+        let mask = self.state_mask();
+        if !self.sample_selected(context, mask) {
+            self.acquisition.request(mask);
+        }
+    }
+    fn sample_selected(&self, context: &TaskContext, mask: u32) -> bool {
+        let mask = if self.sampled.load(Ordering::Acquire) {
+            mask & self.state_mask()
+        } else {
+            self.state_mask()
+        };
+
         let native = self.native();
         #[cfg(feature = "firmware-update")]
         let Ok(_hold) = super::update::hold_observation(context) else {
-            return;
+            return false;
         };
         if self
             .acquiring
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            return;
+            return false;
         }
         struct Finish<'a>(&'a AtomicBool);
         impl Drop for Finish<'_> {
@@ -159,21 +184,28 @@ impl<A: Send + Sync, E> Appliance<A, E> {
         let _acquisition = Finish(&self.acquiring);
         let mut after = [None; crate::configLATTICE_NATIVE_STATES];
         for (index, state) in self.surface.states.iter().enumerate() {
-            after[index] = state.read(native);
+            if mask & (1 << index) != 0 {
+                after[index] = state.read(native);
+            }
         }
         // No observation mutex is held during physical I/O. Readers can return
         // the previous established observation while a getter is in progress.
         let Some(mut samples) = self.observations().try_lock(context) else {
-            return;
+            return false;
         };
         let batch = super::change::batch();
-        // Capture every native input before maintenance publishes derived state.
+        // Capture every selected native input before maintenance publishes derived state.
         for (index, state) in self.surface.states.iter().enumerate() {
-            if samples.values[index].is_some_and(|before| before != after[index]) {
+            if mask & (1 << index) != 0
+                && samples.values[index].is_some_and(|before| before != after[index])
+            {
                 state.record_change(native, after[index]);
             }
         }
         for (index, state) in self.surface.states.iter().enumerate() {
+            if mask & (1 << index) == 0 {
+                continue;
+            }
             if let Some(before) = samples.values[index] {
                 if before != after[index] {
                     super::state::maintain(state, native, after[index]);
@@ -182,9 +214,27 @@ impl<A: Send + Sync, E> Appliance<A, E> {
             // First acquisition establishes the baseline, not an invented change.
             samples.values[index] = Some(after[index]);
         }
-        self.sampled.store(true, Ordering::Release);
+        let baseline = !self.sampled.swap(true, Ordering::AcqRel);
         drop(samples);
         drop(batch);
+        let waiting = self.cache_waiting.swap(false, Ordering::AcqRel);
+        if baseline || waiting {
+            #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
+            super::radio::task::notify_work();
+        }
+        true
+    }
+
+    fn try_read_observations(
+        &self,
+        context: &TaskContext,
+    ) -> Option<crate::sync::MutexGuard<'_, Observations>> {
+        self.observations().try_lock(context).or_else(|| {
+            self.cache_waiting.store(true, Ordering::Release);
+            // Register interest before retrying so a concurrent release cannot
+            // leave an event-driven reader waiting for an unrelated future delta.
+            self.observations().try_lock(context)
+        })
     }
 
     pub(crate) fn surface(&self) -> &'static Surface<'static, A, E> {
@@ -321,6 +371,16 @@ pub(crate) trait Native: Sync {
     fn ready(&self) -> bool;
     fn seal(&self) {}
     fn acquire(&self, _context: &TaskContext) {}
+    fn acquire_selected(&self, context: &TaskContext, _mask: u32) -> bool {
+        self.acquire(context);
+        true
+    }
+    fn acquisition_source(&'static self, _index: usize) -> Option<acquisition::Acquisition> {
+        None
+    }
+    fn acquisition_signals(&'static self) -> Option<&'static acquisition::Signals> {
+        None
+    }
     fn owns(&self, instance: *const (), attribute: u64) -> bool;
     fn read(&self, context: &TaskContext, attribute: u64) -> StateReadResult;
     fn invoke(&self, context: &TaskContext, transformer: u64, arguments: &[Value]) -> InvokeStatus;
@@ -375,6 +435,18 @@ impl<A: Send + Sync, E> Native for Appliance<A, E> {
     fn acquire(&self, context: &TaskContext) {
         self.sample(context);
     }
+    fn acquire_selected(&self, context: &TaskContext, mask: u32) -> bool {
+        self.sample_selected(context, mask)
+    }
+    fn acquisition_source(&'static self, index: usize) -> Option<acquisition::Acquisition> {
+        self.surface
+            .states
+            .get(index)
+            .map(|s| s.acquisition(self.native()))
+    }
+    fn acquisition_signals(&'static self) -> Option<&'static acquisition::Signals> {
+        Some(&self.acquisition)
+    }
     fn read(&self, context: &TaskContext, attribute: u64) -> StateReadResult {
         if !self.ready() {
             return StateReadResult::Busy;
@@ -385,7 +457,7 @@ impl<A: Send + Sync, E> Native for Appliance<A, E> {
             .iter()
             .position(|s| s.reference() == attribute)
         {
-            let Some(samples) = self.observations().try_lock(context) else {
+            let Some(samples) = self.try_read_observations(context) else {
                 return StateReadResult::Busy;
             };
             return StateReadResult::Value {
@@ -400,7 +472,7 @@ impl<A: Send + Sync, E> Native for Appliance<A, E> {
         else {
             return StateReadResult::UnknownAttribute;
         };
-        let Some(_guard) = self.observations().try_lock(context) else {
+        let Some(_guard) = self.try_read_observations(context) else {
             return StateReadResult::Busy;
         };
         StateReadResult::Value {

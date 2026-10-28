@@ -337,49 +337,52 @@ fn capacity_and_lifetime() {
 #[cfg(feature = "host-link")]
 #[test]
 fn feedback_acceptance() {
+    use super::super::host;
     let (n, context) = device();
-    super::super::host::disconnect(&context);
-    super::super::host::connect(&context);
-    let generation = super::super::host::session().unwrap();
-    let mut sender = Control::new();
-    assert!(sender.watch(2, 5, 7, generation, 0));
+    host::disconnect(&context);
+    host::connect(&context);
+    let mut source = Control::new();
+    assert!(source.watch(2, 5, 7, host::session().unwrap(), 0));
     let mut receiver = Control::new();
-    let t = open(&mut receiver, n, &context, 5, 0).ticket;
-    let mut bytes = [0; REQUEST_BYTES];
-    let mut out = [0; DATA_BYTES];
-    let (i, _, len) = receiver.outgoing(7, 0, &mut bytes).unwrap();
-    let message = Request::decode(&bytes[..len]).unwrap();
-    receiver.sent(i, 12, 0);
-    let r = sender.receive(2, message, 0, n, &context, 0, &mut out);
-    assert_eq!(r.status, Status::Ok);
+    let state = open(&mut receiver, n, &context, 5, 0);
+    source.opened(2, 5, state);
+    let (i, _, message) = receiver.outgoing(0).unwrap();
+    receiver.sent(i, 0);
+    let receipt = source
+        .receive_stream(2, message, 0, n, &context, 0)
+        .unwrap();
     assert!(
-        matches!(super::super::host::receive(&context),Some(super::super::host::Packet::ControlProgress{feedback}) if feedback.ticket==t)
+        matches!(host::receive(&context), Some(host::Packet::ControlProgress { feedback }) if feedback.ticket == state.ticket)
     );
+    // Lose the first receipt. Repeated feedback is acknowledged without a second host event.
     receiver.retry(i, 2000);
-    let (i, _, len) = receiver.outgoing(7, 2200, &mut bytes).unwrap();
-    receiver.sent(i, 13, 2200);
-    let r = sender.receive(
-        2,
-        Request::decode(&bytes[..len]).unwrap(),
-        0,
-        n,
-        &context,
-        2200,
-        &mut out,
-    );
-    receiver.reply(i, r, 2200);
-    assert!(super::super::host::receive(&context).is_none());
-    assert!(receiver.outgoing(7, 2201, &mut bytes).is_none());
-    super::super::host::disconnect(&context);
+    let (i, _, message) = receiver.outgoing(2200).unwrap();
+    receiver.sent(i, 2200);
     assert_eq!(
-        sender
-            .receive(2, message, 0, n, &context, 2300, &mut out)
-            .status,
-        Status::Stale
+        source.receive_stream(2, message, 0, n, &context, 2200),
+        Some(receipt)
     );
-    // Reclaim an outstanding route on every listener retirement path.
+    receiver.receive_stream(3, receipt, 7, n, &context, 2200);
+    assert!(host::receive(&context).is_none());
+    assert!(receiver.outgoing(2201).is_none());
+    // A sealed finite call keeps its bound path alive without re-invoking it.
+    receiver.slots[0].session.as_mut().unwrap().finishing = true;
+    receiver.slots[0].session.as_mut().unwrap().pending = Some((1, value(1)));
+    for elapsed in [9_999, 10_000] {
+        assert_eq!(
+            receiver.outgoing(2200 + elapsed).is_some(),
+            elapsed >= 10_000
+        );
+    }
+    host::disconnect(&context);
+    assert_eq!(
+        source.receive_stream(2, message, 0, n, &context, 2300),
+        Some(Stream::Fault {
+            stream: 5,
+            status: Status::Stale
+        })
+    );
     for retirement in 0..3 {
-        use super::super::host;
         host::connect(&context);
         let mut c = Control::new();
         assert!(c.watch(2, 5, 7, host::session().unwrap(), 0));
@@ -387,14 +390,14 @@ fn feedback_acceptance() {
             Target {
                 owner: 2,
                 nonce: 5,
-                ticket: t,
+                ticket: state.ticket,
                 sequence: 1,
                 value: value(1),
             },
             0,
         );
-        let (i, _, _) = c.outgoing(7, 0, &mut bytes).unwrap();
-        c.sent(i, 20, 0);
+        let (i, _, _) = c.outgoing(0).unwrap();
+        c.sent(i, 0);
         if retirement == 2 {
             c.listeners[0].as_mut().unwrap().received = 1;
             c.poll(n, &context, IDLE_MS);
@@ -407,10 +410,36 @@ fn feedback_acceptance() {
                 assert!(c.watch(2, 6, 7, host::session().unwrap(), 1));
             }
         }
-        assert_eq!(c.canceled(), Some((20, 2)));
-        assert!(c.canceled().is_none());
+        assert!(c.awaiting(IDLE_MS).is_none());
         host::disconnect(&context);
     }
+    // A source awaiting acceptance must not block local receiver feedback.
+    host::connect(&context);
+    let mut local = Control::new();
+    let state = open(&mut local, n, &context, 1, 0);
+    assert!(local.watch(3, 1, 7, host::session().unwrap(), 0));
+    local.opened(3, 1, state);
+    local.offer(
+        Target {
+            owner: 3,
+            nonce: 1,
+            ticket: state.ticket,
+            sequence: 1,
+            value: value(1),
+        },
+        0,
+    );
+    local.turn = COUNT;
+    let (i, _, packet) = local.outgoing(0).unwrap();
+    local.sent(i, 0);
+    assert!(local.receive_stream(3, packet, 7, n, &context, 0).is_none());
+    assert_eq!(local.wait_ms(0), Some(0));
+    let (i, _, packet) = local.outgoing(0).unwrap();
+    local.sent(i, 0);
+    let receipt = local.receive_stream(3, packet, 7, n, &context, 0).unwrap();
+    local.receive_stream(3, receipt, 7, n, &context, 0);
+    assert!(local.awaiting(0).is_none());
+    host::disconnect(&context);
     execution::reset();
 }
 #[cfg(feature = "host-link")]
@@ -423,9 +452,9 @@ fn latest_intent_delivery() {
         host::connect(&context);
         let mut source = Control::new();
         let mut receiver = Control::new();
-        let ticket = open(&mut receiver, n, &context, 1, 0).ticket;
+        let state = open(&mut receiver, n, &context, 1, 0);
         assert!(source.watch(2, 1, 7, host::session().unwrap(), 0));
-        // An ordinary host request may be outstanding while scalar input arrives.
+        source.opened(2, 1, state);
         host::submit(&context, host::Packet::Status { token: 7 }).unwrap();
         for sequence in 1..=3 {
             host::submit(
@@ -434,7 +463,7 @@ fn latest_intent_delivery() {
                     target: Target {
                         owner: 2,
                         nonce: 1,
-                        ticket,
+                        ticket: state.ticket,
                         sequence,
                         value: value(sequence),
                     },
@@ -445,49 +474,27 @@ fn latest_intent_delivery() {
         let target = host::take_target().unwrap();
         assert_eq!(target.sequence, 3);
         assert!(host::take_target().is_none());
-        assert!(source.offer(target, 0).is_none());
-        let mut bytes = [0; REQUEST_BYTES];
-        let mut out = [0; DATA_BYTES];
-        let (i, owner, len) = source.outgoing(0, 0, &mut bytes).unwrap();
+        source.offer(target, 0);
+        let (i, owner, packet) = source.outgoing(0).unwrap();
         assert_eq!(owner, 2);
-        source.sent(i, 10, 0);
+        source.sent(i, 0);
         if delivered {
-            receiver.receive(
-                3,
-                Request::decode(&bytes[..len]).unwrap(),
-                7,
-                n,
-                &context,
-                0,
-                &mut out,
-            );
+            receiver.receive_stream(3, packet, 7, n, &context, 0);
         }
-        // Either the old request or its reply is lost. New intent takes its place
-        // immediately, rather than waiting for the old delivery timeout.
-        assert_eq!(
-            source.offer(
-                Target {
-                    sequence: 4,
-                    value: value(4),
-                    ..target
-                },
-                1
-            ),
-            Some((10, 2))
-        );
-        let (i, _, len) = source.outgoing(0, 1, &mut bytes).unwrap();
-        source.sent(i, 11, 1);
-        let reply = receiver.receive(
-            3,
-            Request::decode(&bytes[..len]).unwrap(),
-            7,
-            n,
-            &context,
+        // Lost old data or old progress cannot hold up newer intent.
+        source.offer(
+            Target {
+                sequence: 4,
+                value: value(4),
+                ..target
+            },
             1,
-            &mut out,
         );
-        source.reply(i, reply, 1);
-        assert!(source.outgoing(0, 2, &mut bytes).is_none());
+        let (i, _, packet) = source.outgoing(1).unwrap();
+        source.sent(i, 1);
+        assert!(receiver
+            .receive_stream(3, packet, 7, n, &context, 1)
+            .is_none());
         receiver.poll(n, &context, 2);
         execution::run_ready(&context);
         receiver.poll(n, &context, 3);
@@ -498,24 +505,17 @@ fn latest_intent_delivery() {
             ),
             (1, 4)
         );
-        let (i, _, len) = receiver.outgoing(7, 3, &mut bytes).unwrap();
-        receiver.sent(i, 12, 3);
-        let reply = source.receive(
-            2,
-            Request::decode(&bytes[..len]).unwrap(),
-            0,
-            n,
-            &context,
-            3,
-            &mut out,
-        );
-        receiver.reply(i, reply, 3);
+        let (i, _, packet) = receiver.outgoing(3).unwrap();
+        receiver.sent(i, 3);
+        let receipt = source.receive_stream(2, packet, 0, n, &context, 3).unwrap();
+        receiver.receive_stream(3, receipt, 7, n, &context, 3);
+        assert!(source.outgoing(4).is_none());
         assert!(
-            matches!(host::receive(&context),Some(host::Packet::ControlProgress{feedback}) if feedback.progress.received==4&&feedback.progress.completed==4)
+            matches!(host::receive(&context),Some(host::Packet::ControlProgress { feedback }) if feedback.progress.received==4 && feedback.progress.completed==4)
         );
         host::disconnect(&context);
         source.poll(n, &context, 4);
-        assert!(source.outgoing(0, 4, &mut bytes).is_none());
+        assert!(source.outgoing(4).is_none());
         execution::reset();
     }
 }

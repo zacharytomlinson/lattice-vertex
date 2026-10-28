@@ -4,14 +4,20 @@ use crate::{
     ir::{Binary, Type},
     kernel::appliance::Native,
 };
-use lattice_peer_wire::program::{
-    Definition, Error, Link, Location, Operand, Operation, Region, NONE,
-};
+use lattice_peer_wire::program::{Error, Link, Location, Operand, Operation, Region, NONE};
+
+use super::image::Definition;
 
 pub(super) const MAX_RECORDS: usize = 128;
 
 pub(super) fn validate(bytes: &[u8], native: &dyn Native, surface: &[u8; 32]) -> Result<(), Error> {
-    let d = Definition::parse(bytes)?;
+    validate_definition(Definition::parse(bytes)?, native, surface)
+}
+pub(super) fn validate_definition(
+    d: Definition<'_>,
+    native: &dyn Native,
+    surface: &[u8; 32],
+) -> Result<(), Error> {
     if d.surface() != surface {
         return Err(Error::Compatibility);
     }

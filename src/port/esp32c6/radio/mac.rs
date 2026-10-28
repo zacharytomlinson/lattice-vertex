@@ -97,6 +97,15 @@ pub struct RawReceived {
     pub channel: u8,
 }
 
+impl RawReceived {
+    fn frame(&self) -> &[u8] {
+        let length = (self.data[0] as usize)
+            .saturating_sub(2)
+            .min(FRAME_SIZE - 1);
+        &self.data[1..1 + length]
+    }
+}
+
 pub(crate) fn esp_ieee802154_enable(
     radio: IEEE802154<'_>,
 ) -> (PhyClockGuard<'_>, PhyInitGuard<'_>) {
@@ -230,6 +239,9 @@ fn transmit_internal(state: &mut IeeeState, frame: *const u8, cca: bool) {
     ieee802154_set_txrx_pti(Ieee802154TxRxScene::Tx);
 
     if cca {
+        // CCA and energy surveys share this register. The survey duration must
+        // not leak into channel access: IEEE 802.15.4 CCA is eight symbols.
+        set_ed_duration(8);
         set_cmd(Command::CcaTxStart);
     } else {
         set_cmd(Command::TxStart);
@@ -417,9 +429,21 @@ fn stop_rx_ack(state: &mut IeeeState) {
 
 fn receive_done(state: &mut IeeeState) {
     if state.rx_queue.is_full() {
-        state.rx_queue.pop_front(); // Evict oldest transport frame; retain newest.
         #[cfg(feature = "test-support")]
         crate::kernel::radio::testing::event(crate::kernel::radio::testing::Event::ReceiveEvicted);
+        let Some(remove) = crate::kernel::radio::receive::oldest_best_effort(
+            state.rx_queue.iter().map(RawReceived::frame),
+        ) else {
+            return;
+        };
+        // Rotate the bounded queue once, omitting only the selected broadcast.
+        // Retained addressed frames keep their original arrival order.
+        for i in 0..state.rx_queue.len() {
+            let item = state.rx_queue.pop_front().unwrap();
+            if i != remove {
+                let _ = state.rx_queue.push_back(item);
+            }
+        }
     }
     let item = RawReceived {
         data: unsafe { RX_BUFFER.0 },

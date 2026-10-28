@@ -24,6 +24,7 @@ pub enum Status {
     Accepted = 14,
     Stale = 15,
     Unavailable = 16,
+    Removed = 17,
 }
 impl Status {
     pub fn decode(byte: u8) -> Option<Self> {
@@ -45,6 +46,7 @@ impl Status {
             14 => Status::Accepted,
             15 => Status::Stale,
             16 => Status::Unavailable,
+            17 => Status::Removed,
             _ => return None,
         })
     }
@@ -54,6 +56,11 @@ pub enum Request<'a> {
     Clock(crate::clock::Request),
     Control(crate::control::Request),
     Execution(super::execution::Request<'a>),
+    /// Remove only the addressed local connection set.
+    Remove {
+        definition: u16,
+        generation: u32,
+    },
     Info,
     Begin {
         transfer: u32,
@@ -90,6 +97,15 @@ impl Request<'_> {
                 out[1..9].copy_from_slice(&state.to_le_bytes());
                 out[9..11].copy_from_slice(&after.to_le_bytes());
                 11
+            }
+            Self::Remove {
+                definition,
+                generation,
+            } => {
+                out[0] = 29;
+                out[1..3].copy_from_slice(&definition.to_le_bytes());
+                out[3..7].copy_from_slice(&generation.to_le_bytes());
+                7
             }
             Self::Info => {
                 out[0] = 0;
@@ -135,6 +151,12 @@ impl Request<'_> {
 }
 impl<'a> Request<'a> {
     pub fn decode(b: &'a [u8]) -> Option<Self> {
+        if b.first() == Some(&29) {
+            return (b.len() == 7).then(|| Self::Remove {
+                definition: u16::from_le_bytes(b[1..3].try_into().unwrap()),
+                generation: u32::from_le_bytes(b[3..7].try_into().unwrap()),
+            });
+        }
         if b.first().is_some_and(|tag| *tag >= 19) {
             return crate::control::Request::decode(b).map(Self::Control);
         }
@@ -290,6 +312,13 @@ mod tests {
             (Request::Execution(E::Statistics), 1),
             (Request::Info, 1),
             (
+                Request::Remove {
+                    definition: 4,
+                    generation: 1,
+                },
+                7,
+            ),
+            (
                 Request::Begin {
                     transfer: 1,
                     length: 114,
@@ -351,7 +380,7 @@ mod tests {
             for end in 0..n {
                 assert!(Reply::decode(&bytes[..end]).is_none());
             }
-            bytes[0] = 17;
+            bytes[0] = 18;
             assert!(Reply::decode(&bytes[..n]).is_none());
         }
     }

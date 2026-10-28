@@ -1,5 +1,6 @@
 //! Bounded visits and complete receiver-reserved handoffs. Each visit owns its
 //! compiler-sized working extent until completion or acknowledged transfer.
+use super::image::Definition;
 use super::{
     evaluation::{self, Values},
     Configuration,
@@ -15,7 +16,7 @@ use crate::{
 use lattice_peer_wire::program::{
     execution::{Cause, Entry, Request, Ticket, CHUNK_BYTES},
     transfer::{Reply, Status, DATA_BYTES, REQUEST_BYTES},
-    Definition, Link, Operation, Reference,
+    Link, Operation, Reference,
 };
 use sha2::{Digest, Sha256};
 
@@ -78,6 +79,8 @@ struct Visit {
     length: u16,
     carried: u16,
     phase: Phase,
+    blocked: bool,
+    order: u64,
 }
 #[derive(Clone, Copy)]
 struct Receipt {
@@ -125,7 +128,7 @@ pub(super) struct Traversals {
     pub statistics: Statistics,
     recovery: u16,
     recovered: bool,
-    turn: usize,
+    admission_order: u64,
 }
 impl Traversals {
     pub const fn new() -> Self {
@@ -147,13 +150,55 @@ impl Traversals {
             },
             recovery: 0,
             recovered: false,
-            turn: 0,
+            admission_order: 0,
         }
     }
     pub fn pending(&self) -> bool {
         self.visits.iter().any(Option::is_some)
             || self.receipts.iter().any(|s| s.receipt.is_some())
             || (!self.recovered && self.epoch != 0)
+    }
+    pub fn wake(&mut self) {
+        for visit in self.visits.iter_mut().flatten() {
+            visit.blocked = false;
+        }
+    }
+    fn capacity_changed(&mut self) {
+        self.wake();
+        #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
+        crate::kernel::radio::task::notify_work();
+    }
+    pub fn wait_ms(&self, now: u32, can_send: bool) -> Option<u32> {
+        let mut next = None;
+        let mut include = |ms: u32| next = Some(next.map_or(ms, |n: u32| n.min(ms)));
+        let sending = can_send && self.awaiting().is_none();
+        for v in self.visits.iter().flatten() {
+            match v.phase {
+                Phase::Upstream | Phase::Forward if !v.blocked => include(0),
+                Phase::Sending(s) if s.waiting.is_some() => {
+                    include(2000u32.saturating_sub(now.wrapping_sub(s.sent)))
+                }
+                Phase::Sending(s) if sending => {
+                    include(if s.backoff == 0 || now.wrapping_sub(s.due) < 1 << 31 {
+                        0
+                    } else {
+                        s.due.wrapping_sub(now)
+                    })
+                }
+                _ => {} // incoming data and native calls wake through their producers
+            }
+        }
+        for r in self.receipts.iter().filter_map(|s| s.receipt) {
+            include(
+                (if r.digest.is_some() {
+                    RECEIPT_MS
+                } else {
+                    RECEIVING_MS
+                })
+                .saturating_sub(now.wrapping_sub(r.touched)),
+            );
+        }
+        next
     }
     fn next(&mut self) -> Result<u32, Status> {
         self.sequence = self.sequence.checked_add(1).ok_or(Status::Bounds)?;
@@ -224,6 +269,8 @@ impl Traversals {
             length: capacity as u16,
             carried: length,
             phase: Phase::Reserved,
+            blocked: false,
+            order: 0,
         });
         Ok(slot)
     }
@@ -237,13 +284,56 @@ impl Traversals {
             sequence: self.next()?,
         };
         let slot = self.reserve(programs, entry, cause, true, 0)?;
-        self.visits[slot].as_mut().unwrap().phase = Phase::Upstream;
+        self.admit(slot, Phase::Upstream);
         self.statistics.admitted = self.statistics.admitted.wrapping_add(1);
         Ok(())
+    }
+    fn admit(&mut self, index: usize, phase: Phase) {
+        // Re-rank the bounded resident set instead of allowing a lifetime
+        // counter to wrap. No admitted visit can change its relative order.
+        if self.admission_order == u64::MAX {
+            let mut order = [usize::MAX; COUNT];
+            let mut n = 0;
+            for i in 0..COUNT {
+                if self.visits[i].is_some_and(|v| v.order != 0) {
+                    order[n] = i;
+                    n += 1;
+                }
+            }
+            order[..n].sort_unstable_by_key(|i| self.visits[*i].unwrap().order);
+            for (rank, i) in order[..n].iter().enumerate() {
+                self.visits[*i].as_mut().unwrap().order = rank as u64 + 1;
+            }
+            self.admission_order = n as u64;
+        }
+        self.admission_order += 1;
+        let v = self.visits[index].as_mut().unwrap();
+        v.phase = phase;
+        v.order = self.admission_order;
+    }
+    pub fn remove(&mut self, definition: u16, generation: u32) {
+        for slot in &mut self.receipts {
+            if slot.receipt.is_some_and(|r| {
+                r.entry.definition == definition && r.entry.generation == generation
+            }) {
+                slot.receipt = None;
+            }
+        }
+        for visit in &mut self.visits {
+            if visit.is_some_and(|v| {
+                v.entry.definition == definition && v.entry.generation == generation
+            }) {
+                if let Phase::Calling { ticket, .. } = visit.take().unwrap().phase {
+                    execution::detach(ticket);
+                }
+            }
+        }
+        self.capacity_changed();
     }
     fn fail(&mut self, index: usize, status: Status) {
         let v = self.visits[index].take().unwrap();
         self.fault(v.entry, status);
+        self.capacity_changed();
     }
     pub fn fault(&mut self, entry: Entry, status: Status) {
         self.statistics.faults = self.statistics.faults.wrapping_add(1);
@@ -257,6 +347,7 @@ impl Traversals {
     fn finish(&mut self, index: usize) {
         self.visits[index] = None;
         self.statistics.completed = self.statistics.completed.wrapping_add(1);
+        self.capacity_changed();
     }
     fn enter_forward(&mut self, index: usize, d: Definition<'_>) -> Result<(), Status> {
         let mut v = self.visits[index].unwrap();
@@ -346,10 +437,12 @@ impl Traversals {
         native: &'static dyn Native,
         context: &TaskContext,
         now: u32,
-    ) {
+    ) -> bool {
         if self.epoch == 0 || self.local == 0 {
-            return;
+            return false;
         }
+        let mut again = false;
+        let mut released = false;
         for slot in &mut self.receipts {
             if let Some(r) = slot.receipt {
                 if now.wrapping_sub(r.touched)
@@ -361,10 +454,14 @@ impl Traversals {
                 {
                     if r.digest.is_none() {
                         self.visits[r.visit] = None;
+                        released = true;
                     }
                     slot.receipt = None;
                 }
             }
+        }
+        if released {
+            self.capacity_changed();
         }
         if crate::kernel::change::committed() {
             if let Some(entry) = programs.initial() {
@@ -374,7 +471,8 @@ impl Traversals {
                         if let Err(error) = result {
                             self.fault(entry, error);
                         }
-                        programs.bytes[entry.definition as usize + 2] &= 1;
+                        programs.bytes[entry.definition as usize + 2] &= !2;
+                        again = true;
                     }
                 }
             }
@@ -387,29 +485,91 @@ impl Traversals {
                                 self.fault(entry, error);
                             }
                             self.recovery = cursor;
+                            again = true;
                         }
                     },
                     None => self.recovered = true,
                 }
             }
         }
-        let index = self.turn;
-        self.turn = (self.turn + 1) % COUNT;
-        // The validated local graph has at most MAX_RECORDS forward records.
-        // One visit receives a bounded turn; native work runs in RTOS call tasks.
-        for _ in 0..super::validation::MAX_RECORDS {
-            let Some(v) = self.visits[index] else { break };
-            let result = self.step(index, v, programs, native, context);
-            match result {
-                Ok(true) => {}
-                Ok(false) => break,
-                Err(Status::Busy | Status::Unavailable) => break,
-                Err(e) => {
-                    self.fail(index, e);
+        self.dispatch(programs, native, context);
+        again
+    }
+    /// Process ready local work in admission order. A visit waiting on a radio
+    /// handoff or a native task yields; it never holds the whole vertex hostage.
+    pub fn dispatch(
+        &mut self,
+        programs: &Configuration,
+        native: &'static dyn Native,
+        context: &TaskContext,
+    ) {
+        for _ in 0..COUNT {
+            // Completion is an event: finish its selected local continuation
+            // once available, without spinning while hardware work runs.
+            for i in 0..COUNT {
+                if let Some(Visit {
+                    phase:
+                        Phase::Calling {
+                            ticket,
+                            success,
+                            failure,
+                        },
+                    entry,
+                    ..
+                }) = self.visits[i]
+                {
+                    // This also covers a storage failure after local detachment,
+                    // before removal could return a persistence receipt.
+                    if let Err(error) = programs.part(entry.definition, entry.generation) {
+                        execution::detach(ticket);
+                        self.fail(i, error);
+                        continue;
+                    }
+                    if let Some(result) = execution::take_result(ticket) {
+                        let link = if result == InvokeStatus::Invoked {
+                            success
+                        } else {
+                            failure
+                        };
+                        if let Err(e) = self.follow(i, link, false, programs) {
+                            self.fail(i, e);
+                        }
+                    }
+                }
+            }
+            let index = self.ready();
+            let Some(index) = index else {
+                break;
+            };
+            for _ in 0..super::validation::MAX_RECORDS {
+                let Some(v) = self.visits[index] else {
                     break;
+                };
+                match self.step(index, v, programs, native, context) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(Status::Busy | Status::Unavailable) => {
+                        self.visits[index].as_mut().unwrap().blocked = true;
+                        break;
+                    }
+                    Err(e) => {
+                        self.fail(index, e);
+                        break;
+                    }
                 }
             }
         }
+    }
+    fn ready(&self) -> Option<usize> {
+        self.visits
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| {
+                v.filter(|v| !v.blocked && matches!(v.phase, Phase::Upstream | Phase::Forward))
+                    .map(|v| (i, v.order))
+            })
+            .min_by_key(|(_, order)| *order)
+            .map(|(i, _)| i)
     }
     fn step(
         &mut self,
@@ -419,28 +579,10 @@ impl Traversals {
         native: &'static dyn Native,
         context: &TaskContext,
     ) -> Result<bool, Status> {
-        if let Phase::Calling {
-            ticket,
-            success,
-            failure,
-        } = v.phase
-        {
-            let Some(status) = execution::take_result(ticket) else {
-                return Ok(false);
-            };
-            self.follow(
-                index,
-                if status == InvokeStatus::Invoked {
-                    success
-                } else {
-                    failure
-                },
-                false,
-                programs,
-            )?;
-            return Ok(true);
-        }
-        if matches!(v.phase, Phase::Reserved | Phase::Sending(_)) {
+        if matches!(
+            v.phase,
+            Phase::Calling { .. } | Phase::Reserved | Phase::Sending(_)
+        ) {
             return Ok(false);
         }
         let d = programs
@@ -470,7 +612,9 @@ impl Traversals {
         let mut values = Values { carried, scratch };
         let next = match op {
             Operation::Temporal { yes, no, .. } => {
-                let source = v.entry.definition + super::PREFIX as u16 + v.entry.record;
+                let source = v.entry.definition
+                    + super::PREFIX as u16
+                    + d.storage_record(v.entry.record).ok_or(Status::Binding)?;
                 if super::runtime::temporal_value(source).ok_or(Status::Unavailable)? {
                     yes
                 } else {
@@ -806,11 +950,14 @@ impl Traversals {
                             values.read(operand).map_err(super::status)?;
                         }
                     }
-                    self.visits[r.visit].as_mut().unwrap().phase = if r.upstream {
-                        Phase::Upstream
-                    } else {
-                        Phase::Forward
-                    };
+                    self.admit(
+                        r.visit,
+                        if r.upstream {
+                            Phase::Upstream
+                        } else {
+                            Phase::Forward
+                        },
+                    );
                     r.digest = Some(digest);
                     r.touched = now;
                     self.receipts[ticket.slot as usize].receipt = Some(r);
@@ -856,7 +1003,7 @@ impl Traversals {
             if s.waiting.is_some() {
                 return None;
             }
-            if s.due != 0 && now.wrapping_sub(s.due) >= 1 << 31 {
+            if s.backoff != 0 && now.wrapping_sub(s.due) >= 1 << 31 {
                 continue;
             }
             let request = match s.stage {
@@ -1010,6 +1157,144 @@ impl Traversals {
                 }
             }
             Err(e) => self.fail(index, e),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "port-test"))]
+mod wake_tests {
+    use super::*;
+    #[test]
+    fn admission_order_and_removal() {
+        let mut t = Traversals::new();
+        for (slot, definition) in [(2, 4), (0, 8), (1, 4)] {
+            t.visits[slot] = Some(Visit {
+                entry: Entry {
+                    definition,
+                    generation: 1,
+                    record: 60,
+                },
+                cause: Cause {
+                    owner: 1,
+                    epoch: 1,
+                    sequence: 1,
+                },
+                start: 0,
+                length: 0,
+                carried: 0,
+                phase: Phase::Reserved,
+                blocked: false,
+                order: 0,
+            });
+            t.admit(slot, Phase::Forward);
+        }
+        assert_eq!(t.ready(), Some(2));
+        t.visits[2].as_mut().unwrap().blocked = true;
+        assert_eq!(t.ready(), Some(0)); // a hardware wait does not block other work
+        t.admission_order = u64::MAX;
+        t.admit(2, Phase::Forward);
+        assert_eq!(t.ready(), Some(0));
+        t.remove(4, 2);
+        assert!(t.visits[1].is_some()); // stale deletion
+        t.remove(4, 1);
+        assert!(t.visits[1].is_none() && t.visits[2].is_none());
+        assert_eq!(t.ready(), Some(0));
+    }
+    #[test]
+    fn work_and_deadlines() {
+        let entry = Entry {
+            definition: 0,
+            generation: 1,
+            record: 0,
+        };
+        let cause = Cause {
+            owner: 1,
+            epoch: 1,
+            sequence: 1,
+        };
+        for start in [0u32, u32::MAX - 99] {
+            let at = |n| start.wrapping_add(n);
+            let send = Sending {
+                target: Reference {
+                    owner: 2,
+                    definition: 0,
+                    generation: 1,
+                    record: 0,
+                },
+                upstream: true,
+                sequence: 1,
+                stage: Stage::Session,
+                ticket: Ticket {
+                    epoch: 0,
+                    slot: 0,
+                    generation: 0,
+                },
+                waiting: None,
+                sent: start,
+                due: at(100),
+                backoff: 1,
+            };
+            for (phase, blocked, expected) in [
+                (Phase::Reserved, false, None),
+                (Phase::Upstream, false, Some(0)),
+                (Phase::Forward, false, Some(0)),
+                (Phase::Forward, true, None),
+                (Phase::Sending(send), false, Some(100)),
+                (
+                    Phase::Sending(Sending {
+                        waiting: Some(3),
+                        ..send
+                    }),
+                    false,
+                    Some(2000),
+                ),
+            ] {
+                let mut t = Traversals::new();
+                t.recovered = true;
+                t.visits[0] = Some(Visit {
+                    entry,
+                    cause,
+                    start: 0,
+                    length: 0,
+                    carried: 0,
+                    phase,
+                    blocked,
+                    order: 1,
+                });
+                assert!(t.pending());
+                assert_eq!(t.wait_ms(start, true), expected);
+                if blocked {
+                    t.wake();
+                    assert_eq!(t.wait_ms(start, true), Some(0));
+                }
+                if matches!(phase,Phase::Sending(s) if s.waiting.is_none()) {
+                    assert_eq!(t.wait_ms(at(99), true), Some(1));
+                    assert_eq!(t.wait_ms(at(100), true), Some(0));
+                    assert_eq!(t.wait_ms(start, false), None);
+                }
+            }
+            for accepted in [false, true] {
+                let mut t = Traversals::new();
+                t.recovered = true;
+                t.receipts[0].receipt = Some(Receipt {
+                    caller: 2,
+                    sender_epoch: 1,
+                    sequence: 1,
+                    cause,
+                    entry,
+                    upstream: true,
+                    length: 0,
+                    received: 0,
+                    visit: 0,
+                    digest: accepted.then_some([0; 32]),
+                    touched: start,
+                });
+                let limit = if accepted { RECEIPT_MS } else { RECEIVING_MS };
+                assert!(t.pending());
+                assert_eq!(t.wait_ms(start, true), Some(limit));
+                assert_eq!(t.wait_ms(at(limit - 1), true), Some(1));
+                assert_eq!(t.wait_ms(at(limit), true), Some(0));
+            }
         }
     }
 }

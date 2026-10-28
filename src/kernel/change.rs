@@ -21,6 +21,7 @@ struct Outgoing {
     sequence: u32,
     evicted: u32,
     batches: u32,
+    commit_waiting: bool,
 }
 impl Outgoing {
     const fn new() -> Self {
@@ -32,6 +33,7 @@ impl Outgoing {
             sequence: 0,
             evicted: 0,
             batches: 0,
+            commit_waiting: false,
         }
     }
 }
@@ -101,12 +103,14 @@ pub(crate) fn batch() -> Batch {
 }
 impl Drop for Batch {
     fn drop(&mut self) {
-        access(|out| {
+        let waiting = access(|out| {
             assert!(out.batches != 0);
             out.batches -= 1;
+            out.batches == 0 && core::mem::take(&mut out.commit_waiting)
         });
+        let _ = waiting;
         #[cfg(any(feature = "port-esp32c6", feature = "port-nrf52840"))]
-        if pending() {
+        if waiting || pending() {
             super::radio::task::notify_work();
         }
     }
@@ -115,8 +119,16 @@ impl Drop for Batch {
 pub(crate) fn pending() -> bool {
     access(|out| out.count != 0 && out.batches == 0)
 }
+/// Observe the publication boundary and request a wakeup if it is still held.
 pub(crate) fn committed() -> bool {
-    access(|out| out.batches == 0)
+    access(|out| {
+        if out.batches == 0 {
+            true
+        } else {
+            out.commit_waiting = true;
+            false
+        }
+    })
 }
 
 /// Latest registered local change, including records already sent or evicted.

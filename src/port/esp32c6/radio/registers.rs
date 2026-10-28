@@ -271,7 +271,7 @@ pub(crate) fn set_ed_sample_rate(rate: EdSampleRate) {
 pub(crate) fn set_ed_duration(symbols: u16) {
     IEEE802154::regs()
         .ed_scan_duration()
-        .write(|w| unsafe { w.bits(symbols as u32) });
+        .modify(|_, w| unsafe { w.ed_scan_duration().bits(symbols as u32) });
 }
 
 pub(crate) fn ed_rssi() -> i8 {

@@ -3,6 +3,8 @@
 
 pub(crate) mod activation;
 mod evaluation;
+mod image;
+use image::Definition;
 pub(crate) mod runtime;
 mod traversal;
 mod validation;
@@ -12,16 +14,31 @@ use core::sync::atomic::Ordering;
 use embedded_storage::nor_flash::NorFlash;
 use lattice_peer_wire::program::{
     transfer::{Reply, Request, Status, DATA_BYTES},
-    Definition, Error, Source, NONE,
+    Definition as WireDefinition, Error, Source, NONE,
 };
 use lattice_storage::configuration::Configuration as Snapshot;
 use sha2::{Digest, Sha256};
 
-const CAPACITY: usize = 8192;
-const _: () = assert!(CAPACITY < super::time::SOURCE as usize);
+const IMAGE_CAPACITY: usize = 8192;
+// One complete incoming LPD, including its header, sources and operations.
+// Independent of the space reserved for all resident definitions.
+const FRAGMENT_CAPACITY: usize = 512;
+const _: () = assert!(IMAGE_CAPACITY < super::time::SOURCE as usize);
 const PREFIX: usize = 24;
-const MAGIC: [u8; 4] = *b"LPG\x03";
+const MAGIC: [u8; 4] = *b"LPG\x04";
 const CLOCK_BYTES: usize = PREFIX + lattice_peer_wire::clock::PROFILE_BYTES;
+
+struct InterruptMask(crate::types::UBaseType_t);
+impl InterruptMask {
+    fn new() -> Self {
+        Self(crate::port::portSET_INTERRUPT_MASK_FROM_ISR())
+    }
+}
+impl Drop for InterruptMask {
+    fn drop(&mut self) {
+        crate::port::portCLEAR_INTERRUPT_MASK_FROM_ISR(self.0);
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Part<'a> {
@@ -32,54 +49,29 @@ struct Part<'a> {
     definition: Definition<'a>,
 }
 fn parts(bytes: &[u8]) -> impl Iterator<Item = Result<Part<'_>, Status>> {
-    let mut at = 4;
-    core::iter::from_fn(move || loop {
-        if at >= bytes.len() {
+    image::extents(bytes).filter_map(move |record| {
+        let e = match record {
+            Ok(e) => e,
+            Err(e) => return Some(Err(status(e))),
+        };
+        if !matches!(e.kind, image::INLINE | image::CONNECTION) || e.flags & image::STAGING != 0 {
             return None;
         }
-        let result = (|| {
-            let prefix = bytes.get(at..at + PREFIX).ok_or(Status::Invalid)?;
-            let length = u16::from_le_bytes(prefix[..2].try_into().unwrap()) as usize;
-            if length < PREFIX || at + length > bytes.len() || prefix[2] & !3 != 0 || prefix[3] > 1
-            {
-                return Err(Status::Invalid);
-            }
-            let generation = u32::from_le_bytes(prefix[4..8].try_into().unwrap());
-            if generation == 0 {
-                return Err(Status::Invalid);
-            }
-            if prefix[3] == 1 {
-                if length != CLOCK_BYTES
-                    || prefix[2] != 0
-                    || lattice_peer_wire::clock::Profile::decode(&bytes[at + PREFIX..at + length])
-                        .is_none()
-                {
-                    return Err(Status::Invalid);
-                }
-                at += length;
-                return Ok(None);
-            }
-            let part = Part {
-                offset: at as u16,
-                generation,
-                caller: u64::from_le_bytes(prefix[8..16].try_into().unwrap()),
-                transfer: u32::from_le_bytes(prefix[16..20].try_into().unwrap()),
-                definition: Definition::parse(
-                    bytes.get(at + PREFIX..at + length).ok_or(Status::Invalid)?,
-                )
-                .map_err(status)?,
-            };
-            at += length;
-            Ok(Some(part))
-        })();
-        if result.is_err() {
-            at = bytes.len();
-        }
-        match result {
-            Ok(Some(part)) => return Some(Ok(part)),
-            Ok(None) => continue,
-            Err(e) => return Some(Err(e)),
-        }
+        let prefix = &bytes[e.at..e.at + PREFIX];
+        let generation = u32::from_le_bytes(prefix[4..8].try_into().unwrap());
+        Some(if generation == 0 {
+            Err(Status::Invalid)
+        } else {
+            image::definition(bytes, e)
+                .map(|definition| Part {
+                    offset: e.at as u16,
+                    generation,
+                    caller: u64::from_le_bytes(prefix[8..16].try_into().unwrap()),
+                    transfer: u32::from_le_bytes(prefix[16..20].try_into().unwrap()),
+                    definition,
+                })
+                .map_err(status)
+        })
     })
 }
 fn clock_bytes(revision: u32, profile: lattice_peer_wire::clock::Profile) -> [u8; CLOCK_BYTES] {
@@ -93,32 +85,28 @@ fn clock_bytes(revision: u32, profile: lattice_peer_wire::clock::Profile) -> [u8
 fn context_record(
     bytes: &[u8],
 ) -> Result<Option<(u16, u32, lattice_peer_wire::clock::Profile)>, Status> {
-    let mut at = 4;
     let mut found = None;
-    while at < bytes.len() {
-        let prefix = bytes.get(at..at + PREFIX).ok_or(Status::Invalid)?;
-        let n = u16::from_le_bytes(prefix[..2].try_into().unwrap()) as usize;
-        if n < PREFIX || at + n > bytes.len() || prefix[3] > 1 {
+    for e in image::extents(bytes) {
+        let e = e.map_err(status)?;
+        if e.kind != image::CLOCK {
+            continue;
+        }
+        let prefix = &bytes[e.at..e.at + PREFIX];
+        let revision = u32::from_le_bytes(prefix[4..8].try_into().unwrap());
+        if found.is_some()
+            || e.span != CLOCK_BYTES
+            || e.flags != 0
+            || revision == 0
+            || prefix[8..].iter().any(|b| *b != 0)
+        {
             return Err(Status::Invalid);
         }
-        if prefix[3] == 1 {
-            let revision = u32::from_le_bytes(prefix[4..8].try_into().unwrap());
-            if found.is_some()
-                || n != CLOCK_BYTES
-                || revision == 0
-                || prefix[2] != 0
-                || prefix[8..].iter().any(|b| *b != 0)
-            {
-                return Err(Status::Invalid);
-            }
-            found = Some((
-                at as u16,
-                revision,
-                lattice_peer_wire::clock::Profile::decode(&bytes[at + PREFIX..at + n])
-                    .ok_or(Status::Invalid)?,
-            ));
-        }
-        at += n;
+        found = Some((
+            e.at as u16,
+            revision,
+            lattice_peer_wire::clock::Profile::decode(&bytes[e.at + PREFIX..e.end()])
+                .ok_or(Status::Invalid)?,
+        ));
     }
     Ok(found)
 }
@@ -161,16 +149,21 @@ struct Pending {
     generation: u32,
     phase: Phase,
     digest: Option<[u8; 32]>,
+    offset: u16,
+    capacity: u16,
+    image_used: u16,
 }
 #[derive(Clone, Copy)]
 struct Checkpoint {
     target: Option<(u16, bool, u32)>,
     clock: Option<(u16, u32, lattice_peer_wire::clock::Profile)>,
+    removed: Option<(u16, u32)>,
     phase: Phase,
 }
 
 pub(crate) struct Configuration {
-    bytes: [u8; CAPACITY],
+    bytes: [u8; IMAGE_CAPACITY],
+    incoming: [u8; FRAGMENT_CAPACITY],
     reply: [u8; DATA_BYTES],
     used: u16,
     store: Option<Snapshot>,
@@ -228,7 +221,7 @@ impl Configuration {
                 let Some(store) = self.store.as_mut() else {
                     return Reply::status(Status::Unsupported);
                 };
-                if total > store.capacity().min(CAPACITY as u32) as usize {
+                if total > store.capacity().min(IMAGE_CAPACITY as u32) as usize {
                     return Reply::status(Status::Bounds);
                 }
                 if store.begin(total as u32).is_err() {
@@ -237,6 +230,7 @@ impl Configuration {
                 self.checkpoint_pending = Some(Checkpoint {
                     target: None,
                     clock: Some((at, next, profile)),
+                    removed: None,
                     phase: Phase::Erasing,
                 });
                 return Reply {
@@ -269,7 +263,12 @@ impl Configuration {
                     if let lattice_peer_wire::program::Operation::Temporal { predicate, .. } =
                         r.operation
                     {
-                        Some((p.offset + PREFIX as u16 + r.offset, predicate))
+                        Some((
+                            p.offset
+                                + PREFIX as u16
+                                + p.definition.storage_record(r.offset).unwrap(),
+                            predicate,
+                        ))
                     } else {
                         None
                     }
@@ -278,17 +277,17 @@ impl Configuration {
     }
     fn temporal_entry(&self, source: u16) -> Option<lattice_peer_wire::program::execution::Entry> {
         for p in parts(&self.bytes[..self.used as usize]).filter_map(Result::ok) {
-            let start = p.offset as usize + PREFIX;
-            if (source as usize) >= start && (source as usize) < start + p.definition.bytes().len()
-            {
-                if let lattice_peer_wire::program::Operation::Temporal { entry, .. } =
-                    p.definition.record(source - start as u16).ok()?.operation
-                {
-                    return Some(lattice_peer_wire::program::execution::Entry {
-                        definition: p.offset,
-                        generation: p.generation,
-                        record: entry,
-                    });
+            for r in p.definition.records().filter_map(Result::ok) {
+                if p.offset + PREFIX as u16 + p.definition.storage_record(r.offset)? == source {
+                    if let lattice_peer_wire::program::Operation::Temporal { entry, .. } =
+                        r.operation
+                    {
+                        return Some(lattice_peer_wire::program::execution::Entry {
+                            definition: p.offset,
+                            generation: p.generation,
+                            record: entry,
+                        });
+                    }
                 }
             }
         }
@@ -296,7 +295,8 @@ impl Configuration {
     }
     pub(crate) const fn new() -> Self {
         Self {
-            bytes: [0; CAPACITY],
+            bytes: [0; IMAGE_CAPACITY],
+            incoming: [0; FRAGMENT_CAPACITY],
             reply: [0; DATA_BYTES],
             used: 0,
             store: None,
@@ -323,7 +323,7 @@ impl Configuration {
         self.state = Status::Storage;
         let store = Snapshot::open(flash).map_err(|_| Status::Storage)?;
         let used = store.current().map_or(4, |i| i.length() as usize);
-        if !(4..=CAPACITY).contains(&used) {
+        if !(4..=IMAGE_CAPACITY).contains(&used) {
             return Err(Status::Bounds);
         }
         if store.current().is_some() {
@@ -337,11 +337,20 @@ impl Configuration {
         self.store = Some(store);
         let legacy = self.bytes[..4] == *b"LPG\x01";
         let older = legacy || self.bytes[..4] == *b"LPG\x02";
-        if self.bytes[..4] != MAGIC && !older {
+        let version3 = self.bytes[..4] == *b"LPG\x03";
+        if self.bytes[..4] != MAGIC && !older && !version3 {
             self.state = Status::Invalid;
             return Err(self.state);
         }
         let result = (|| {
+            for e in image::extents(&self.bytes[..used]) {
+                let e = e.map_err(status)?;
+                if e.flags & image::STAGING != 0
+                    || ((older || version3) && (e.kind > image::CLOCK || e.flags & 0xc0 != 0))
+                {
+                    return Err(Status::Invalid);
+                }
+            }
             let clock = context_record(&self.bytes[..used])?;
             if older && clock.is_some() {
                 return Err(Status::Invalid);
@@ -362,7 +371,8 @@ impl Configuration {
                 {
                     return Err(Status::Invalid);
                 }
-                validation::validate(part.definition.bytes(), native, surface).map_err(status)?;
+                validation::validate_definition(part.definition, native, surface)
+                    .map_err(status)?;
             }
             Ok(())
         })();
@@ -378,33 +388,33 @@ impl Configuration {
         Ok(())
     }
     fn wire(&mut self, native: &dyn Native) {
+        let _mask = InterruptMask::new();
         self.temporal_dirty = true;
         native.clear_dependencies();
-        let mut part_offset = 4;
-        while part_offset < self.used as usize {
-            let length =
-                u16::from_le_bytes(self.bytes[part_offset..part_offset + 2].try_into().unwrap())
-                    as usize;
-            if self.bytes[part_offset + 3] != 0 {
-                part_offset += length;
-                continue;
+        let mut at = 4;
+        while at < self.used as usize {
+            let e = image::extent(&self.bytes[..self.used as usize], at as u16)
+                .expect("validated extent");
+            if matches!(e.kind, image::INLINE | image::CONNECTION) && e.flags & image::STAGING == 0
+            {
+                let mut index = 0;
+                loop {
+                    let source = image::definition(&self.bytes[..self.used as usize], e)
+                        .expect("validated definition")
+                        .sources()
+                        .nth(index);
+                    let Some(source) = source else {
+                        break;
+                    };
+                    let cursor = at + PREFIX + source.offset as usize;
+                    let (_, head) = native.state_binding(source.state).expect("validated state");
+                    self.bytes[cursor + 10..cursor + 12]
+                        .copy_from_slice(&head.load(Ordering::Relaxed).to_le_bytes());
+                    head.store(cursor as u16, Ordering::Release);
+                    index += 1;
+                }
             }
-            let start = part_offset + PREFIX;
-            let count =
-                u16::from_le_bytes(self.bytes[start + 8..start + 10].try_into().unwrap()) as usize;
-            for index in 0..count {
-                let at = start
-                    + lattice_peer_wire::program::HEADER_BYTES
-                    + index * lattice_peer_wire::program::SOURCE_BYTES;
-                let state = u64::from_le_bytes(self.bytes[at..at + 8].try_into().unwrap());
-                let (_, head) = native
-                    .state_binding(state)
-                    .expect("validated native binding");
-                self.bytes[at + 10..at + 12]
-                    .copy_from_slice(&head.load(Ordering::Relaxed).to_le_bytes());
-                head.store(at as u16, Ordering::Release);
-            }
-            part_offset += length;
+            at += e.span;
         }
     }
     pub(crate) fn dependency(&self, offset: u16) -> Option<(u16, u32, Source, u16)> {
@@ -431,7 +441,7 @@ impl Configuration {
         if let Some(p) = self.pending {
             Reply {
                 status: state,
-                offset: self.used,
+                offset: p.offset,
                 generation: p.generation,
                 accepted: p.accepted,
                 total: p.length,
@@ -454,6 +464,9 @@ impl Configuration {
         surface: &[u8; 32],
     ) -> Reply<'a> {
         if let Request::Read { offset } = request {
+            if self.pending_write() {
+                return Reply::status(Status::Busy);
+            }
             if offset > self.used {
                 return Reply::status(Status::Bounds);
             }
@@ -473,6 +486,17 @@ impl Configuration {
         }
         if self.state != Status::Ok {
             return self.progress(self.state);
+        }
+        if let Request::Remove {
+            definition,
+            generation,
+        } = request
+        {
+            return Reply {
+                offset: definition,
+                generation,
+                ..Reply::status(self.remove(definition, generation, native))
+            };
         }
         if let Request::Clock(request) = request {
             return self.clock_request(request);
@@ -510,10 +534,16 @@ impl Configuration {
         }
         if let Request::Info = request {
             self.reply[..2].copy_from_slice(
-                &(self.store.as_ref().unwrap().capacity().min(CAPACITY as u32) as u16)
+                &(self
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .capacity()
+                    .min(IMAGE_CAPACITY as u32) as u16)
                     .to_le_bytes(),
             );
             self.reply[2..4].copy_from_slice(&(validation::MAX_RECORDS as u16).to_le_bytes());
+            self.reply[4..6].copy_from_slice(&(FRAGMENT_CAPACITY as u16).to_le_bytes());
             let mut reply = self.progress(self.pending.map_or(Status::Ok, |p| {
                 if p.phase == Phase::Receiving {
                     Status::Receiving
@@ -521,7 +551,7 @@ impl Configuration {
                     Status::Persisting
                 }
             }));
-            reply.bytes = &self.reply[..4];
+            reply.bytes = &self.reply[..6];
             return reply;
         }
         let transfer = match request {
@@ -542,7 +572,7 @@ impl Configuration {
             .find(|p| p.caller == caller && p.transfer == transfer)
         {
             let matches = match request {
-                Request::Begin { length, .. } => length as usize == part.definition.bytes().len(),
+                Request::Begin { length, .. } => length as usize == part.definition.len(),
                 Request::Commit { digest, .. } => canonical_digest(part.definition) == digest,
                 _ => false,
             };
@@ -554,8 +584,8 @@ impl Configuration {
                 },
                 offset: part.offset,
                 generation: part.generation,
-                accepted: part.definition.bytes().len() as u16,
-                total: part.definition.bytes().len() as u16,
+                accepted: part.definition.len() as u16,
+                total: part.definition.len() as u16,
                 bytes: &[],
             };
         }
@@ -576,8 +606,7 @@ impl Configuration {
                         Status::Persisting
                     }
                 } else if (length as usize) < lattice_peer_wire::program::HEADER_BYTES
-                    || self.used as usize + PREFIX + length as usize
-                        > self.store.as_ref().unwrap().capacity().min(CAPACITY as u32) as usize
+                    || length as usize > FRAGMENT_CAPACITY
                 {
                     Status::Bounds
                 } else {
@@ -591,7 +620,21 @@ impl Configuration {
                     else {
                         return self.progress(Status::Bounds);
                     };
+                    let (at, capacity) = match image::vacancy(
+                        &self.bytes[..self.used as usize],
+                        self.store
+                            .as_ref()
+                            .unwrap()
+                            .capacity()
+                            .min(IMAGE_CAPACITY as u32) as usize,
+                    ) {
+                        Ok(v) if v.1 >= PREFIX + 12 => v,
+                        _ => return self.progress(Status::Bounds),
+                    };
                     self.pending = Some(Pending {
+                        offset: at as u16,
+                        capacity: capacity as u16,
+                        image_used: self.used,
                         caller,
                         transfer,
                         length,
@@ -608,13 +651,13 @@ impl Configuration {
                     return self.progress(Status::Conflict);
                 };
                 let end = offset as usize + bytes.len();
-                let start = self.used as usize + PREFIX;
+                let start = 0;
                 if p.phase != Phase::Receiving {
                     Status::Busy
                 } else if bytes.is_empty() || bytes.len() > DATA_BYTES || end > p.length as usize {
                     Status::Bounds
                 } else if end <= p.accepted as usize {
-                    if self.bytes[start + offset as usize..start + end] == *bytes {
+                    if self.incoming[start + offset as usize..start + end] == *bytes {
                         Status::Receiving
                     } else {
                         Status::Conflict
@@ -622,7 +665,7 @@ impl Configuration {
                 } else if offset != p.accepted {
                     Status::Conflict
                 } else {
-                    self.bytes[start + offset as usize..start + end].copy_from_slice(bytes);
+                    self.incoming[start + offset as usize..start + end].copy_from_slice(bytes);
                     p.accepted = end as u16;
                     Status::Receiving
                 }
@@ -640,41 +683,47 @@ impl Configuration {
                 } else if p.accepted != p.length {
                     Status::Invalid
                 } else {
-                    let start = self.used as usize + PREFIX;
-                    let bytes = &self.bytes[start..start + p.length as usize];
+                    let bytes = &self.incoming[..p.length as usize];
                     let hash: [u8; 32] = Sha256::digest(bytes).into();
                     if hash != digest {
                         Status::Conflict
                     } else if let Err(error) = validation::validate(bytes, native, surface) {
                         status(error)
-                    } else if temporal_count(&self.bytes[..self.used as usize]).unwrap_or(usize::MAX).saturating_add(Definition::parse(bytes).unwrap().records().filter(|r| matches!(r,Ok(r) if matches!(r.operation,lattice_peer_wire::program::Operation::Temporal {..}))).count()) > super::time::CAPACITY {
-                        Status::Bounds
-                    } else if Definition::parse(bytes)
-                        .unwrap()
-                        .sources()
-                        .any(|s| bytes[s.offset as usize + 10..s.offset as usize + 12] != [0xff; 2])
-                    {
-                        Status::Invalid
                     } else {
-                        let prefix = &mut self.bytes[self.used as usize..start];
-                        prefix.fill(0);
-                        prefix[..2].copy_from_slice(&(PREFIX as u16 + p.length).to_le_bytes());
-                        prefix[4..8].copy_from_slice(&p.generation.to_le_bytes());
-                        prefix[8..16].copy_from_slice(&p.caller.to_le_bytes());
-                        prefix[16..20].copy_from_slice(&p.transfer.to_le_bytes());
-                        if self
-                            .store
-                            .as_mut()
-                            .unwrap()
-                            .begin((start + p.length as usize) as u32)
-                            .is_err()
-                        {
-                            Status::Storage
+                        let source = WireDefinition::parse(bytes).unwrap();
+                        if temporal_count(&self.bytes[..self.used as usize]).unwrap_or(usize::MAX)
+                            .saturating_add(source.records().filter(|r| matches!(r,Ok(r) if matches!(r.operation,lattice_peer_wire::program::Operation::Temporal{..}))).count()) > super::time::CAPACITY
+                            || source.sources().any(|s|bytes[s.offset as usize+10..s.offset as usize+12]!=[255;2]) {
+                            Status::Bounds
                         } else {
-                            p.phase = Phase::Erasing;
-                            p.digest = Some(digest);
-                            self.pending = Some(p);
-                            Status::Persisting
+                            let shared=image::extents(&self.bytes[..self.used as usize]).filter_map(Result::ok)
+                                .filter(|e|matches!(e.kind,image::INLINE|image::BODY))
+                                .find_map(|e|{let generation=u32::from_le_bytes(self.bytes[e.at+4..e.at+8].try_into().unwrap());image::code(&self.bytes[..self.used as usize],e.at as u16,generation).ok()
+                                    .filter(|d|image::same_computation(*d,source)).map(|_|(e.at as u16,generation))});
+                            let content=shared.map_or(p.length as usize, |_|image::connection_len(source));
+                            let wanted=PREFIX+content;
+                            if wanted>p.capacity as usize { Status::Bounds } else {
+                                let span=if p.capacity as usize-wanted<4{p.capacity as usize}else{wanted};
+                                let at=p.offset as usize;
+                                self.bytes[at..at+span].fill(0);
+                                self.bytes[at..at+2].copy_from_slice(&(span as u16).to_le_bytes());
+                                self.bytes[at+2]=(((span-wanted)as u8)<<6)|image::STAGING;
+                                self.bytes[at+3]=if shared.is_some(){image::CONNECTION}else{image::INLINE};
+                                self.bytes[at+4..at+8].copy_from_slice(&p.generation.to_le_bytes());
+                                self.bytes[at+8..at+16].copy_from_slice(&p.caller.to_le_bytes());
+                                self.bytes[at+16..at+20].copy_from_slice(&p.transfer.to_le_bytes());
+                                if let Some((body,generation))=shared { image::write_connections(source,body,generation,&mut self.bytes[at+PREFIX..at+PREFIX+content]); }
+                                else { self.bytes[at+PREFIX..at+PREFIX+content].copy_from_slice(bytes); }
+                                let old_end=(at+p.capacity as usize).min(self.used as usize);
+                                p.image_used=self.used.max((at+span)as u16);
+                                if at+span<old_end {
+                                    let remainder=old_end-at-span;
+                                    if remainder>=4 {image::free_header(&mut self.bytes[at+span..old_end],remainder);}
+                                    else { p.image_used=(at+span)as u16; }
+                                }
+                                if self.store.as_mut().unwrap().begin(p.image_used as u32).is_err(){ self.state=Status::Storage;Status::Storage }
+                                else {p.phase=Phase::Erasing;p.digest=Some(digest);self.pending=Some(p);Status::Persisting}
+                            }
                         }
                     }
                 }
@@ -695,6 +744,14 @@ impl Configuration {
         (self.checkpoint_pending.is_some()
             || self.pending.is_some_and(|p| p.phase != Phase::Receiving))
             && self.state == Status::Ok
+    }
+    fn wait_ms(&self, now: u32, writable: bool) -> Option<u32> {
+        if self.pending_write() {
+            return writable.then_some(0);
+        }
+        self.pending
+            .filter(|p| p.phase == Phase::Receiving)
+            .map(|_| 30_000u32.saturating_sub(now.wrapping_sub(self.last_activity)))
     }
     pub(crate) fn expire(&mut self, now: u32) {
         if self.pending.is_some_and(|p| p.phase == Phase::Receiving)
@@ -718,7 +775,7 @@ impl Configuration {
             return Err(self.state);
         }
         let store = self.store.as_mut().unwrap();
-        let total = self.used as usize + PREFIX + p.length as usize;
+        let total = p.image_used as usize;
         let result = (|| {
             match p.phase {
                 Phase::Receiving => {}
@@ -744,16 +801,18 @@ impl Configuration {
                 }
                 Phase::Committing => {
                     store.commit(flash)?;
-                    self.used = total as u16;
+                    return Ok(true);
                 }
             }
-            Ok::<(), lattice_storage::Error>(())
+            Ok::<bool, lattice_storage::Error>(false)
         })();
         if result.is_err() {
             self.state = Status::Storage;
             return Err(Status::Storage);
         }
-        if p.phase == Phase::Committing && self.used as usize == total {
+        if matches!(result, Ok(true)) {
+            self.used = total as u16;
+            self.bytes[p.offset as usize + 2] &= !image::STAGING;
             self.pending = None;
             self.wire(native);
         } else {
@@ -797,9 +856,65 @@ impl Configuration {
         self.checkpoint_pending = Some(Checkpoint {
             target,
             clock: None,
+            removed: None,
             phase: Phase::Erasing,
         });
         Ok(())
+    }
+    /// Explicit removal takes effect in this vertex's event handler. Flash commit
+    /// confirms durability; it does not wait for a distributed traversal to drain.
+    fn remove(&mut self, offset: u16, generation: u32, native: &dyn Native) -> Status {
+        if let Some(c) = self.checkpoint_pending {
+            return if c.removed == Some((offset, generation)) {
+                Status::Persisting
+            } else {
+                Status::Busy
+            };
+        }
+        if self.pending.is_some() {
+            return Status::Busy;
+        }
+        if offset < 4
+            || offset as usize >= IMAGE_CAPACITY
+            || generation == 0
+            || generation as u64 > self.epoch()
+        {
+            return Status::Binding;
+        }
+        // A repeated command for an absent generation is already satisfied. A
+        // reused address with a newer generation must never be touched.
+        let Ok(part) = self.part(offset, generation) else {
+            return Status::Removed;
+        };
+        let _mask = InterruptMask::new();
+        for source in part.definition.sources() {
+            let cursor = offset + PREFIX as u16 + source.offset;
+            let next = u16::from_le_bytes(
+                self.bytes[cursor as usize + 10..cursor as usize + 12]
+                    .try_into()
+                    .unwrap(),
+            );
+            activation::redirect(cursor, next);
+        }
+        for r in part.definition.records().filter_map(Result::ok) {
+            if matches!(
+                r.operation,
+                lattice_peer_wire::program::Operation::Temporal { .. }
+            ) {
+                let source =
+                    offset + PREFIX as u16 + part.definition.storage_record(r.offset).unwrap();
+                activation::redirect(source | super::time::SOURCE, NONE);
+            }
+        }
+        self.used = image::remove(&mut self.bytes[..self.used as usize], offset)
+            .expect("validated connection") as u16;
+        self.wire(native);
+        if let Err(e) = self.checkpoint(None) {
+            self.state = e;
+            return e;
+        }
+        self.checkpoint_pending.as_mut().unwrap().removed = Some((offset, generation));
+        Status::Persisting
     }
     fn admission(
         &mut self,
@@ -902,15 +1017,17 @@ impl Configuration {
                         }
                     }
                     if let Some((target, enabled, revision)) = control.target {
-                        for (at, value) in core::iter::once((target as usize + 2, enabled as u8))
-                            .chain(
-                                revision
-                                    .to_le_bytes()
-                                    .into_iter()
-                                    .enumerate()
-                                    .map(|(i, v)| (target as usize + 20 + i, v)),
-                            )
-                        {
+                        for (at, value) in core::iter::once((
+                            target as usize + 2,
+                            (self.bytes[target as usize + 2] & 0xc0) | enabled as u8,
+                        ))
+                        .chain(
+                            revision
+                                .to_le_bytes()
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, v)| (target as usize + 20 + i, v)),
+                        ) {
                             if at >= offset as usize && at < end {
                                 bytes[at - offset as usize] = value;
                             }
@@ -949,7 +1066,8 @@ impl Configuration {
                     self.clock_offset = at;
                 }
                 if let Some((target, enabled, revision)) = control.target {
-                    self.bytes[target as usize + 2] = if enabled { 3 } else { 0 };
+                    self.bytes[target as usize + 2] =
+                        (self.bytes[target as usize + 2] & 0xc0) | if enabled { 3 } else { 0 };
                     self.initial_pending |= enabled;
                     self.bytes[target as usize + 20..target as usize + 24]
                         .copy_from_slice(&revision.to_le_bytes());
@@ -1008,7 +1126,8 @@ impl Configuration {
             }
             for r in p.definition.records().filter_map(Result::ok) {
                 if let lattice_peer_wire::program::Operation::Temporal { entry, .. } = r.operation {
-                    let at = p.offset + PREFIX as u16 + r.offset;
+                    let at =
+                        p.offset + PREFIX as u16 + p.definition.storage_record(r.offset).unwrap();
                     if at > after {
                         return Some((
                             at,
@@ -1027,15 +1146,14 @@ impl Configuration {
 }
 fn canonical_digest(definition: Definition<'_>) -> [u8; 32] {
     let mut hash = Sha256::new();
-    let bytes = definition.bytes();
+    let mut b = [0; 256];
     let mut at = 0;
-    for source in definition.sources() {
-        let next = source.offset as usize + 10;
-        hash.update(&bytes[at..next]);
-        hash.update([0xff; 2]);
-        at = next + 2;
+    while at < definition.len() {
+        let n = (definition.len() - at).min(b.len());
+        definition.copy_range(at, &mut b[..n]);
+        hash.update(&b[..n]);
+        at += n;
     }
-    hash.update(&bytes[at..]);
     hash.finalize().into()
 }
 
@@ -1045,19 +1163,23 @@ fn canonical_range(image: &[u8], offset: usize, output: &mut [u8]) {
         let n = output.len().min(image.len() - offset);
         output[..n].copy_from_slice(&image[offset..offset + n]);
     }
-    for part in parts(image) {
-        let Ok(part) = part else {
-            break;
-        };
-        let flags = part.offset as usize + 2;
+    for e in image::extents(image).filter_map(Result::ok) {
+        let flags = e.at + 2;
         if flags >= offset && flags - offset < output.len() {
-            output[flags - offset] &= 1;
+            output[flags - offset] &= !(2 | image::STAGING);
         }
-        for source in part.definition.sources() {
-            let link = part.offset as usize + PREFIX + source.offset as usize + 10;
-            for at in link..link + 2 {
-                if at >= offset && at - offset < output.len() {
-                    output[at - offset] = 0xff;
+        let definition = match e.kind {
+            image::INLINE | image::BODY => Definition::parse(&image[e.at + PREFIX..e.end()]),
+            image::CONNECTION => image::definition(image, e),
+            _ => continue,
+        };
+        if let Ok(definition) = definition {
+            for source in definition.sources() {
+                let link = e.at + PREFIX + source.offset as usize + 10;
+                for at in link..link + 2 {
+                    if at >= offset && at - offset < output.len() {
+                        output[at - offset] = 255;
+                    }
                 }
             }
         }

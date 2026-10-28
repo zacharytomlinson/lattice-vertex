@@ -1,8 +1,14 @@
-//! Frames captured while a peer gives its neighbors a receive turn after TX.
+//! Frames captured during receive opportunities and channel-access backoff.
 //! These are owned wire bytes, awaiting ordinary peer validation and dispatch.
 use super::MAX_FRAME_SIZE;
 
 const CAPACITY: usize = 4;
+
+/// Broadcast pressure must not evict a frame the peer sent with a MAC ACK request.
+/// If every retained frame is addressed, discard the newcomer instead.
+pub(crate) fn oldest_best_effort<'a>(mut frames: impl Iterator<Item = &'a [u8]>) -> Option<usize> {
+    frames.position(|frame| !super::mac::requests_ack(frame))
+}
 
 pub(crate) struct ReceiveBuffer {
     frames: [[u8; MAX_FRAME_SIZE]; CAPACITY],
@@ -22,12 +28,24 @@ impl ReceiveBuffer {
             count: 0,
         }
     }
-    /// Keep the latest frames under pressure. Return whether the oldest was evicted.
+    /// Retain FIFO order, replacing the oldest best-effort frame under pressure.
+    /// Return whether any frame was dropped, including a refused newcomer.
     pub(crate) fn push(&mut self, frame: &[u8]) -> bool {
         assert!(frame.len() <= MAX_FRAME_SIZE);
         let evicted = self.count == CAPACITY;
         if evicted {
-            self.first = (self.first + 1) % CAPACITY;
+            let Some(remove) = oldest_best_effort((0..self.count).map(|i| {
+                let at = (self.first + i) % CAPACITY;
+                &self.frames[at][..self.lengths[at] as usize]
+            })) else {
+                return true;
+            };
+            for i in remove..self.count - 1 {
+                let at = (self.first + i) % CAPACITY;
+                let next = (at + 1) % CAPACITY;
+                self.frames[at] = self.frames[next];
+                self.lengths[at] = self.lengths[next];
+            }
             self.count -= 1;
         }
         let at = (self.first + self.count) % CAPACITY;
@@ -105,6 +123,45 @@ mod tests {
         assert!(!buffer.push(&[7, 8]));
         assert_eq!(buffer.pop(&mut dma), Some(2));
         assert_eq!(&dma[..2], &[7, 8]);
+    }
+
+    #[test]
+    fn addressed_retention_and_fifo() {
+        fn frame(id: u8, addressed: bool) -> [u8; 22] {
+            let mut bytes = [0; 22];
+            bytes[..2].copy_from_slice(if addressed {
+                &[0x61, 0xdc]
+            } else {
+                &[0x41, 0xd8]
+            });
+            bytes[21] = id;
+            bytes
+        }
+        for first in 0..CAPACITY {
+            for mask in 0u8..16 {
+                for incoming in [false, true] {
+                    let mut buffer = ReceiveBuffer::new();
+                    let mut out = [0; MAX_FRAME_SIZE];
+                    for _ in 0..first {
+                        buffer.push(&frame(9, false));
+                        buffer.pop(&mut out);
+                    }
+                    for i in 0..CAPACITY {
+                        assert!(!buffer.push(&frame(i as u8, mask & (1 << i) != 0)));
+                    }
+                    assert!(buffer.push(&frame(4, incoming)));
+                    let removed = (0..CAPACITY).find(|i| mask & (1 << i) == 0);
+                    for i in 0..=CAPACITY {
+                        if removed == Some(i) || (i == CAPACITY && removed.is_none()) {
+                            continue;
+                        }
+                        assert_eq!(buffer.pop(&mut out), Some(22));
+                        assert_eq!(out[21], i as u8);
+                    }
+                    assert_eq!(buffer.pop(&mut out), None);
+                }
+            }
+        }
     }
 
     #[test]

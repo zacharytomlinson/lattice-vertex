@@ -1,7 +1,7 @@
 //! Flash admission and measured pacing on the existing peer task. No queued
 //! operation is retained: a deferred immutable request returns Busy to its sender.
 use super::{activation, package::Costs, Status};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 // Enough space between flash steps for a maximum 802.15.4 frame/turnaround.
 const RECEIVE_TURN_MS: u32 = crate::kernel::radio::receive::receive_turn_ticks(1000);
@@ -84,10 +84,15 @@ impl Staging {
 // from activation holds: an operation may tolerate staging but prohibit reboot.
 const FLASH: u32 = 1 << 31;
 static ACCESS: AtomicU32 = AtomicU32::new(0);
+static FLASH_WAITING: AtomicBool = AtomicBool::new(false);
 struct Access;
 impl Drop for Access {
     fn drop(&mut self) {
-        ACCESS.fetch_sub(1, Ordering::AcqRel);
+        if ACCESS.fetch_sub(1, Ordering::AcqRel) == 1 && FLASH_WAITING.swap(false, Ordering::AcqRel)
+        {
+            #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
+            crate::kernel::radio::task::notify_work();
+        }
     }
 }
 
@@ -125,6 +130,10 @@ impl FlashStep {
     pub fn enter() -> Option<Self> {
         ACCESS
             .compare_exchange(0, FLASH, Ordering::AcqRel, Ordering::Acquire)
+            .or_else(|_| {
+                FLASH_WAITING.store(true, Ordering::Release);
+                ACCESS.compare_exchange(0, FLASH, Ordering::AcqRel, Ordering::Acquire)
+            })
             .ok()
             .map(|_| Self { _private: () })
     }
@@ -195,6 +204,7 @@ mod tests {
         let epoch = activation::epoch();
         let observation = hold_observation(&context).unwrap();
         assert!(FlashStep::enter().is_none());
+        assert!(FLASH_WAITING.load(Ordering::Acquire));
         assert!(activation::Commit::enter().is_none());
         assert_eq!(activation::epoch(), epoch);
         assert!(
@@ -202,6 +212,7 @@ mod tests {
             "sampling must not restart the quiet interval"
         );
         drop(observation);
+        assert!(!FLASH_WAITING.load(Ordering::Acquire));
         assert_eq!(
             activation::epoch(),
             epoch,

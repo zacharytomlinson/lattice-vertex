@@ -579,6 +579,17 @@ impl Host {
                     now,
                     &mut response,
                 );
+                if let lattice_peer_wire::program::transfer::Request::Control(
+                    lattice_peer_wire::control::Request::Open { nonce, .. },
+                ) = operation
+                {
+                    if let Some(state) =
+                        lattice_peer_wire::program::transfer::Reply::decode(&response[..n])
+                            .and_then(lattice_peer_wire::control::State::decode)
+                    {
+                        control.opened(owner, nonce, state);
+                    }
+                }
                 deliver(
                     generation,
                     Packet::ProgramResult {

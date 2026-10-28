@@ -309,6 +309,86 @@ fn installation_publication() {
 }
 
 #[test]
+fn incoming_fragment_bounds() {
+    let native = Device::new();
+    for (length, accepted) in [
+        (0, false),
+        (47, false),
+        (48, true),
+        (511, true),
+        (512, true),
+        (513, false),
+        (8192, false),
+        (u16::MAX, false),
+    ] {
+        let mut flash = Flash::new();
+        let mut p = Configuration::new();
+        p.restore(&mut flash, &native, &SURFACE).unwrap();
+        let info = p.receive(5, Request::Info, &native, &SURFACE);
+        assert_eq!(
+            u16::from_le_bytes(info.bytes[4..6].try_into().unwrap()),
+            512
+        );
+        assert!(u16::from_le_bytes(info.bytes[..2].try_into().unwrap()) > 512);
+        assert_eq!(
+            p.receive(
+                5,
+                Request::Begin {
+                    transfer: 1,
+                    length
+                },
+                &native,
+                &SURFACE
+            )
+            .status,
+            if accepted {
+                Status::Receiving
+            } else {
+                Status::Bounds
+            }
+        );
+        assert_eq!(p.pending.is_some(), accepted);
+        if accepted {
+            let bytes = [0; DATA_BYTES];
+            for offset in (0..length as usize).step_by(DATA_BYTES) {
+                let end = (length as usize - offset).min(DATA_BYTES);
+                assert_eq!(
+                    p.receive(
+                        5,
+                        Request::Data {
+                            transfer: 1,
+                            offset: offset as u16,
+                            bytes: &bytes[..end]
+                        },
+                        &native,
+                        &SURFACE
+                    )
+                    .status,
+                    Status::Receiving
+                );
+            }
+            assert_eq!(
+                p.receive(
+                    5,
+                    Request::Data {
+                        transfer: 1,
+                        offset: length,
+                        bytes: &[0]
+                    },
+                    &native,
+                    &SURFACE
+                )
+                .status,
+                Status::Bounds
+            );
+            assert_eq!(p.pending.unwrap().accepted, length);
+        }
+        assert!(p.store.as_ref().unwrap().current().is_none());
+        assert_eq!(native.head.load(Ordering::Acquire), NONE);
+    }
+}
+
+#[test]
 fn partial_installation() {
     for accepted in [0, 1, 48, 113, 114] {
         let native = Device::new();
@@ -386,28 +466,24 @@ fn reservation_expiry() {
     }
 }
 
-fn install(bytes: &[u8], native: &dyn Native, flash: &mut Flash) -> Configuration {
-    let mut p = Configuration::new();
-    p.restore(flash, native, &SURFACE).unwrap();
-    assert_eq!(
-        p.receive(
-            5,
-            Request::Begin {
-                transfer: 1,
-                length: bytes.len() as u16
-            },
-            native,
-            &SURFACE
-        )
-        .status,
-        Status::Receiving
+fn stage(p: &mut Configuration, bytes: &[u8], transfer: u32, native: &dyn Native) -> (u16, u32) {
+    let r = p.receive(
+        5,
+        Request::Begin {
+            transfer,
+            length: bytes.len() as u16,
+        },
+        native,
+        &SURFACE,
     );
+    assert_eq!(r.status, Status::Receiving);
+    let identity = (r.offset, r.generation);
     for (i, b) in bytes.chunks(DATA_BYTES).enumerate() {
         assert_eq!(
             p.receive(
                 5,
                 Request::Data {
-                    transfer: 1,
+                    transfer,
                     offset: (i * DATA_BYTES) as u16,
                     bytes: b
                 },
@@ -422,7 +498,7 @@ fn install(bytes: &[u8], native: &dyn Native, flash: &mut Flash) -> Configuratio
         p.receive(
             5,
             Request::Commit {
-                transfer: 1,
+                transfer,
                 digest: Sha256::digest(bytes).into()
             },
             native,
@@ -431,9 +507,18 @@ fn install(bytes: &[u8], native: &dyn Native, flash: &mut Flash) -> Configuratio
         .status,
         Status::Persisting
     );
+    identity
+}
+fn persist(p: &mut Configuration, flash: &mut Flash, native: &dyn Native) {
     while p.pending_write() {
         p.poll(flash, native).unwrap();
     }
+}
+fn install(bytes: &[u8], native: &dyn Native, flash: &mut Flash) -> Configuration {
+    let mut p = Configuration::new();
+    p.restore(flash, native, &SURFACE).unwrap();
+    stage(&mut p, bytes, 1, native);
+    persist(&mut p, flash, native);
     p
 }
 #[test]
@@ -515,7 +600,7 @@ fn admission_commit() {
 
 #[test]
 fn configuration_versions() {
-    for version in [1, 2, 3, 4] {
+    for version in [1, 2, 3, 4, 5] {
         let native = Device::new();
         let mut flash = Flash::new();
         let mut p = install(&definition(true), &native, &mut flash);
@@ -526,8 +611,8 @@ fn configuration_versions() {
         }
         let mut restored = Configuration::new();
         let result = restored.restore(&mut flash, &native, &SURFACE);
-        assert_eq!(result.is_ok(), version <= 3);
-        if version <= 3 {
+        assert_eq!(result.is_ok(), version <= 4);
+        if version <= 4 {
             assert_eq!(&restored.bytes[..4], &MAGIC);
             assert_eq!(restored.part(4, 1).unwrap().definition.head(), Some(60));
             let before = restored.epoch();
@@ -1003,5 +1088,239 @@ fn dependent_delivery() {
             crate::kernel::change::reset();
             execution::reset();
         }
+    }
+}
+
+/// Different continuation widths change record offsets, but not computation.
+fn connected_definition(upstream: bool, owner: u64) -> Vec<u8> {
+    let mut bytes = definition(true);
+    // Entry's upstream Stop becomes a remote reference, shifting all later records.
+    if upstream {
+        bytes[10..12].fill(255);
+        bytes.splice(
+            63..64,
+            [2].into_iter()
+                .chain(owner.to_le_bytes())
+                .chain(4u16.to_le_bytes())
+                .chain(1u32.to_le_bytes())
+                .chain(60u16.to_le_bytes()),
+        );
+        bytes[60..62].copy_from_slice(&24u16.to_le_bytes());
+        for (at, value) in [(82, 84u16), (100, 102), (110, 113)] {
+            bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    let shift = if upstream { 16 } else { 0 };
+    bytes[97 + shift..99 + shift].copy_from_slice(&33u16.to_le_bytes());
+    bytes.splice(
+        112 + shift..113 + shift,
+        [2].into_iter()
+            .chain((owner + 1).to_le_bytes())
+            .chain(4u16.to_le_bytes())
+            .chain(1u32.to_le_bytes())
+            .chain(60u16.to_le_bytes()),
+    );
+    bytes
+}
+#[test]
+fn computation_and_connections() {
+    let base = definition(true);
+    let code = WireDefinition::parse(&base).unwrap();
+    for (upstream, owner, downstream) in [(false, 10, 11), (true, 20, 21), (true, 20, 31)] {
+        let mut authored = connected_definition(upstream, owner);
+        let at = 113 + if upstream { 16 } else { 0 };
+        authored[at..at + 8].copy_from_slice(&u64::to_le_bytes(downstream));
+        assert_eq!(
+            validation::validate(&authored, &Device::new(), &SURFACE),
+            Ok(())
+        );
+        let input = WireDefinition::parse(&authored).unwrap();
+        assert!(image::same_computation(code, input));
+        let mut metadata = vec![0; image::connection_len(input)];
+        image::write_connections(input, 4, 1, &mut metadata);
+        let bound = Definition::connected(code, &metadata).unwrap();
+        assert_eq!(
+            validation::validate_definition(bound, &Device::new(), &SURFACE),
+            Ok(())
+        );
+        let mut reconstructed = vec![0; authored.len()];
+        for (i, chunk) in reconstructed.chunks_mut(7).enumerate() {
+            bound.copy_range(i * 7, chunk);
+        }
+        assert_eq!(reconstructed, authored);
+        assert_eq!(
+            canonical_digest(bound),
+            <[u8; 32]>::from(Sha256::digest(&authored))
+        );
+        for end in 0..metadata.len() {
+            assert!(Definition::connected(code, &metadata[..end])
+                .and_then(|d| validation::validate_definition(d, &Device::new(), &SURFACE))
+                .is_err());
+        }
+    }
+    assert!(!image::same_computation(
+        code,
+        WireDefinition::parse(&definition(false)).unwrap()
+    ));
+}
+#[test]
+fn shared_ownership_and_reuse() {
+    for removal_order in [[0, 1, 2], [1, 2, 0], [2, 0, 1]] {
+        crate::port::test_port_reset();
+        activation::reset();
+        let native = Device::new();
+        let mut flash = Flash::new();
+        let mut p = install(&definition(true), &native, &mut flash);
+        let mut refs = vec![(4, 1)];
+        for owner in [10, 20] {
+            let bytes = connected_definition(true, owner);
+            let reference = stage(&mut p, &bytes, owner as u32, &native);
+            assert!(p.part(reference.0, reference.1).is_err());
+            persist(&mut p, &mut flash, &native);
+            refs.push(reference);
+        }
+        let kinds: Vec<_> = image::extents(&p.bytes[..p.used as usize])
+            .map(|e| e.unwrap().kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![image::INLINE, image::CONNECTION, image::CONNECTION]
+        );
+        let mut active = [true; 3];
+        for index in removal_order {
+            let (offset, generation) = refs[index];
+            let source = p
+                .part(offset, generation)
+                .unwrap()
+                .definition
+                .sources()
+                .next()
+                .unwrap();
+            let cursor = offset + PREFIX as u16 + source.offset;
+            let next = p.dependency(cursor).unwrap().3;
+            activation::record(cursor);
+            let command = Request::Remove {
+                definition: offset,
+                generation,
+            };
+            assert_eq!(
+                p.receive(5, command, &native, &SURFACE).status,
+                Status::Persisting
+            );
+            assert!(p.part(offset, generation).is_err());
+            assert_eq!(activation::first().unwrap().cursor, next);
+            activation::advance(NONE);
+            persist(&mut p, &mut flash, &native);
+            assert_eq!(
+                p.receive(5, command, &native, &SURFACE).status,
+                Status::Removed
+            );
+            active[index] = false;
+            p.restore(&mut flash, &native, &SURFACE).unwrap();
+            for (i, (at, gen)) in refs.iter().enumerate() {
+                assert_eq!(p.part(*at, *gen).is_ok(), active[i]);
+            }
+        }
+        assert_eq!(p.used, 4);
+        assert_eq!(native.head.load(Ordering::Acquire), NONE);
+        let replacement = stage(&mut p, &definition(false), 99, &native);
+        persist(&mut p, &mut flash, &native);
+        assert_eq!(replacement.0, 4);
+        assert!(replacement.1 > refs[2].1);
+        assert_eq!(
+            p.receive(
+                5,
+                Request::Remove {
+                    definition: 4,
+                    generation: 1
+                },
+                &native,
+                &SURFACE
+            )
+            .status,
+            Status::Removed
+        );
+        assert!(p.part(replacement.0, replacement.1).is_ok());
+    }
+}
+#[test]
+fn reclamation_commit_boundary() {
+    // Every flash phase recovers either the complete old image or the complete
+    // reclaimed image. Publication cannot be inferred from unchanged used size.
+    for steps in 0..=5 {
+        let native = Device::new();
+        let mut flash = Flash::new();
+        let mut p = install(&definition(true), &native, &mut flash);
+        let survivor = stage(&mut p, &definition(false), 2, &native);
+        persist(&mut p, &mut flash, &native);
+        assert_eq!(
+            p.receive(
+                5,
+                Request::Remove {
+                    definition: 4,
+                    generation: 1
+                },
+                &native,
+                &SURFACE
+            )
+            .status,
+            Status::Persisting
+        );
+        for _ in 0..steps {
+            p.poll(&mut flash, &native).unwrap();
+        }
+        let committed = !p.pending_write();
+        let mut restored = Configuration::new();
+        restored.restore(&mut flash, &native, &SURFACE).unwrap();
+        assert_eq!(restored.part(4, 1).is_err(), committed);
+        assert!(restored.part(survivor.0, survivor.1).is_ok());
+    }
+}
+
+#[test]
+fn reused_extent_publication() {
+    let native = Device::new();
+    let mut flash = Flash::new();
+    let mut p = install(&definition(true), &native, &mut flash);
+    // A live record at the end bounds an internal free extent. Existing live
+    // offsets remain fixed; the next installation cannot append to the image.
+    let capacity = p
+        .store
+        .as_ref()
+        .unwrap()
+        .capacity()
+        .min(IMAGE_CAPACITY as u32) as usize;
+    let at = capacity - CLOCK_BYTES;
+    let used = p.used as usize;
+    image::free_header(&mut p.bytes[used..at], at - used);
+    let profile = lattice_peer_wire::clock::Profile {
+        latitude: 0,
+        longitude: 0,
+        zone: lattice_peer_wire::clock::Zone::UTC,
+    };
+    p.bytes[at..capacity].copy_from_slice(&clock_bytes(1, profile));
+    p.used = capacity as u16;
+    p.clock_offset = at as u16;
+    p.checkpoint(None).unwrap();
+    persist(&mut p, &mut flash, &native);
+    assert_eq!(p.remove(4, 1, &native), Status::Persisting);
+    persist(&mut p, &mut flash, &native);
+    let baseline = flash.0.clone();
+    for steps in 0..=36 {
+        let mut flash = Flash(baseline.clone());
+        let mut p = Configuration::new();
+        p.restore(&mut flash, &native, &SURFACE).unwrap();
+        let reference = stage(&mut p, &definition(false), 4, &native);
+        assert_eq!(reference.0, 4);
+        assert_eq!(p.used, capacity as u16);
+        for _ in 0..steps {
+            p.poll(&mut flash, &native).unwrap();
+        }
+        let committed = !p.pending_write();
+        assert_eq!(p.part(reference.0, reference.1).is_ok(), committed);
+        let mut restored = Configuration::new();
+        restored.restore(&mut flash, &native, &SURFACE).unwrap();
+        assert_eq!(restored.part(reference.0, reference.1).is_ok(), committed);
+        assert_eq!(restored.clock(), Some((1, profile)));
     }
 }

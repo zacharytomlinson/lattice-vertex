@@ -48,7 +48,8 @@ must show increasing `received`, `replies_sent`, and `replies_received`; a
 transmitted count alone establishes no peer reception. `transmit_errors` records
 failed send attempts, `receive_errors` records rejected driver receives,
 `ignored` records frames outside this diagnostic exchange, and `evicted` counts
-oldest-frame eviction in the C6's fixed receive buffer.
+frame loss in bounded receive storage (discarding an older broadcast or, when
+only addressed frames remain, refusing the new frame).
 
 ## One-board run
 
@@ -129,16 +130,28 @@ scheduler-only test is required.
 
 ## Receive turns in the resident peer
 
-Ordinary peer startup enables a receive opportunity after each successful TX.
+Ordinary peer startup enables a receive opportunity after successful TX and after
+a channel-busy or missing-ACK outcome before retrying.
 It is independent of pending local deltas and returns the first valid captured
 frame through the ordinary receive path. The maximum wait accounts for a full
 250-kbit/s frame, turnaround, and tick quantization; at 1 kHz it is six ticks.
 An in-progress PHY frame gets a bounded completion interval before cancellation
 for a deadline or new local work. Four owned frame records preserve captures across consecutive send calls, with
-oldest eviction under pressure. Addressed peer frames request MAC ACKs and have
-at most four identical transmission attempts with bounded randomized backoff.
-Broadcasts remain single attempts. Native execution is not separately retried.
-Raw probe workloads and bootstrap retain their own receive windows.
+FIFO order among retained frames. At capacity the oldest non-ACK-requested frame
+is discarded first. If every retained frame is addressed, the newcomer is dropped;
+existing addressed frames are never displaced by broadcast pressure. The C6 driver
+queue uses the same retention policy. Capacity stays four frames per buffer.
+
+Addressed peer frames request MAC ACKs and have at most four identical frame
+attempts. Before each attempt, ordinary peers use randomized 320-us CSMA slots
+(BE=3..5, rounded to ticks), retaining reception during backoff. Channel access has
+its own five-assessment limit: a busy channel has not transmitted a frame and does
+not spend a frame retry. Failed attempts also give the peer a maximum-frame receive
+opportunity; an ACK may have been lost while an application reply is already on air.
+Duplicate retention covers the resulting bounded retry window, including receive
+completion at deadlines. Broadcasts get one frame attempt with bounded channel
+access; native functions are never re-invoked by MAC retries. Raw probe workloads
+and bootstrap retain their earlier direct-attempt/receive-window behavior.
 
 Portable checks beside `mac.rs` cover ACK target/sequence validation, duplicate
 suppression after lost ACKs, distinct senders, DSN/timer wrap, bounded history
@@ -153,6 +166,26 @@ the cap on a stuck receiver. C6 and Nordic
 builds check the common integration. Hardware validation must use ordinary peers,
 not assume that a successful spaced probe covers back-to-back state changes.
 
-Residual RF losses and absolute RSSI/range remain unresolved. Diagnostic images,
+Matched captures reproduced two timeout mechanisms: competing replies exhausted
+the MAC retry budget, and a received/ACKed invocation result was evicted from the
+common receive buffer by later broadcasts. The C6 port also retained the channel
+survey's 256-symbol ED duration during CCA instead of restoring eight symbols;
+register capture confirmed the corrected 256-to-8 transition. Carrier-or-energy
+assessment recognizes decodable peers below the energy threshold. Together with
+separate channel-access accounting, receive turns after failures and addressed
+frame retention, these changes address concrete configuration and buffering faults.
+Physical receiver sensitivity and absolute RSSI/range remain separate investigations.
+
+The final maintained-image check completed 50 native calls and 50 immediate state
+reads in each direction (200 exchanges total) without a timeout. The C6-to-Nordic
+call median/max were 62/85 ms; Nordic-to-C6 were 47/75 ms. The workload toggled the
+software appliance's level/power, generating normal derived deltas and installed
+upstream activations; it did not pause between call/read pairs. C6 power stayed at
+20 dBm. Receive buffers stayed at four records and frame attempts stayed at four.
+Original programs, admission and clock profiles were preserved byte-for-byte;
+both boards were left running maintained images without the temporary recorder.
+Matched captures and source variants remain outside this repo under the lab's
+`experiments/reply-timeout-20261027`. This is bounded one-hop validation, not a claim
+of loss-free delivery under arbitrary load or of physical actuator behavior. Diagnostic images,
 controlled comparisons, and traces are preserved in the external lab; their
 packet counts are not delivery guarantees for the maintained transport.

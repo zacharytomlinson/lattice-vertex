@@ -111,6 +111,7 @@ pub(super) struct LinkRead {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Content<'a> {
+    Stream(lattice_peer_wire::control::Stream),
     Program {
         network: Network,
         read: ProgramRead,
@@ -242,6 +243,12 @@ impl<'a> Message<'a> {
         let mut payload = [0; MAX_PAYLOAD];
         payload[..4].copy_from_slice(MAGIC);
         let mut size = match self.content {
+            Content::Stream(stream) => {
+                let mut bytes = [0; lattice_peer_wire::program::transfer::REQUEST_BYTES];
+                let n = stream.encode(&mut bytes);
+                payload[4..4 + n].copy_from_slice(&bytes[..n]);
+                4 + n
+            }
             Content::Program {
                 network,
                 read,
@@ -621,6 +628,9 @@ impl<'a> Message<'a> {
             (payload, TimePerByte::UNKNOWN)
         };
         let content = match (p[4], p.len(), destination) {
+            (25..=28, _, Some(_)) => Content::Stream(
+                lattice_peer_wire::control::Stream::decode(&p[4..]).ok_or(InvalidFrame)?,
+            ),
             (21, 34..=89, _) | (22, 45..=93, Some(_)) => {
                 let network = Network {
                     founder: u64::from_le_bytes(p[5..13].try_into().unwrap()),
@@ -1200,6 +1210,33 @@ mod program_bounds {
     use lattice_peer_wire::program::transfer::{
         Reply, Request, Status, DATA_BYTES, REPLY_BYTES, REQUEST_BYTES,
     };
+    #[test]
+    fn stream_bounds() {
+        use lattice_peer_wire::control::{Argument, Stream};
+        for value in [
+            Value::boolean(true),
+            Value::integer(crate::ir::Integer::U64, u64::MAX as i128).unwrap(),
+        ] {
+            let argument = Argument::from_value(value);
+            let packet = Stream::Target {
+                stream: 5,
+                sequence: 1,
+                argument,
+            };
+            let message = Message {
+                source: 1,
+                destination: Some(2),
+                path_cost: TimePerByte::UNKNOWN,
+                content: Content::Stream(packet),
+            };
+            let mut bytes = [0; MAX_FRAME_SIZE];
+            let n = message.encode(0, &mut bytes);
+            assert_eq!(n, 21 + 4 + 13 + argument.bytes().len());
+            assert_eq!(Message::decode(&bytes[..n], 2, 15).unwrap(), message);
+            assert!(Message::decode(&bytes[..n], 3, 15).is_err());
+            assert!(Message::decode(&bytes[..n], 1, 15).is_err());
+        }
+    }
     #[test]
     fn record_bounds() {
         let network = Network {
