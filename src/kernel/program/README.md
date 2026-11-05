@@ -1,5 +1,12 @@
 # Resident programs
 
+This documents the **current software record/visit engine**, including its deployed
+LPD/LPG formats and validation evidence. The accepted target is now
+[compile-time circuit assembly and maintained signals](../../../docs/ARCHITECTURE.md#maintained-circuits-and-delta-propagation).
+The [two-chip implementation plan](../../../docs/PROGRAM_DESIGN.md) replaces that
+execution model; it is not implemented here yet. Preserve explicit version/migration
+handling rather than silently assigning these records different behavior.
+
 This component receives previously unknown local program definitions, validates
 them, commits them to protected storage, and attaches their source relationships
 to the appliance's owned states. Startup rebuilds those links from committed
@@ -235,8 +242,11 @@ Receiving, persisting and installed are distinct statuses. Other results report
 busy, unsupported, invalid, bounds, binding, compatibility, storage or conflict.
 Execution adds Enabled (12), Disabled (13), Accepted (14), Stale (15), and Unavailable
 (16), and Removed (17); an Accepted visit receipt does not claim that its native operation has finished.
-Data ranges are ordered; an identical duplicate is acknowledged without another
-copy. Conflicting bytes/digests fail. Persisting/installed receipts are idempotent
+Installation Data ranges may arrive out of order through the common Unique + Complete
+channel. A 64-byte coverage map tracks the existing 512-byte staging buffer; progress
+reports its contiguous accepted prefix and Commit still requires the full definition
+and matching digest. An already-covered range is acknowledged without another copy.
+Issued transmission contents are immutable. Persisting/installed receipts are idempotent
 for the same caller/nonce/definition. An abandoned incomplete reservation cannot
 occupy installation capacity indefinitely. This is structural admission and
 transport integrity, not a new authentication or FSPS proof mechanism.

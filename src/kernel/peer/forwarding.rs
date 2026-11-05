@@ -2,6 +2,7 @@
 //! Return paths and duplicate records are communication state, never semantic
 //! edges or queued graph activations.
 
+use crate::kernel::radio::channel::{Channel, Latest, Received, Temporal, Unique, Update};
 use crate::kernel::radio::cost::{TimePerByte, Transmission};
 
 use super::{
@@ -222,13 +223,15 @@ impl CallPath {
 #[derive(Clone, Copy)]
 struct ChangeNotice {
     owner: u64,
-    sequence: u32,
+    attribute: u64,
+    channel: Channel<Update<()>, (Unique, Temporal), Latest<()>>,
     received: u32,
 }
 impl ChangeNotice {
     const EMPTY: Self = Self {
         owner: 0,
-        sequence: 0,
+        attribute: 0,
+        channel: Channel::new(Latest::new()),
         received: 0,
     };
 }
@@ -252,7 +255,9 @@ pub(super) struct Forwarder {
 
 // Existing path budgets plus bounded per-neighbor update absence records.
 // Peer, route, and return-path capacities are unchanged.
-const _: () = assert!(core::mem::size_of::<Forwarder>() <= 2912);
+// Each of the eight notice records now identifies its attribute and retains a
+// channel sequence. This adds at most 128 bytes; payloads are still not cached.
+const _: () = assert!(core::mem::size_of::<Forwarder>() <= 3040);
 
 impl Forwarder {
     pub(super) fn ordinary_work_pending(&self) -> bool {
@@ -1180,7 +1185,7 @@ impl Forwarder {
         now: u32,
     ) -> Message<'static> {
         self.expire(now);
-        self.change_seen(self.local, sequence, now);
+        self.register_change(self.local, attribute, sequence, now);
         Message {
             path_cost: TimePerByte::UNKNOWN,
             source: self.local,
@@ -1215,7 +1220,7 @@ impl Forwarder {
         };
         if network != self.network
             || delta.owner == self.local
-            || !self.change_seen(delta.owner, delta.sequence, now)
+            || !self.register_change(delta.owner, delta.attribute, delta.sequence, now)
         {
             return None;
         }
@@ -1234,13 +1239,17 @@ impl Forwarder {
         Some(delta)
     }
 
-    fn change_seen(&mut self, owner: u64, sequence: u32, now: u32) -> bool {
-        if self
+    fn register_change(&mut self, owner: u64, attribute: u64, sequence: u32, now: u32) -> bool {
+        if let Some(record) = self
             .changes
-            .iter()
-            .any(|c| c.owner == owner && c.sequence == sequence)
+            .iter_mut()
+            .find(|c| c.owner == owner && c.attribute == attribute)
         {
-            return false;
+            let accepted = record.channel.receive(&(sequence, ())) == Ok(Received::Accepted);
+            if accepted {
+                record.received = now;
+            }
+            return accepted;
         }
         let slot = self
             .changes
@@ -1253,10 +1262,11 @@ impl Forwarder {
             });
         self.changes[slot] = ChangeNotice {
             owner,
-            sequence,
+            attribute,
+            channel: Channel::new(Latest::new()),
             received: now,
         };
-        true
+        self.changes[slot].channel.receive(&(sequence, ())) == Ok(Received::Accepted)
     }
 
     pub(super) fn announce(
@@ -2544,6 +2554,25 @@ mod tests {
     }
 
     #[test]
+    fn attribute_sequences() {
+        let mut node = Forwarder::new(2, NET);
+        for (owner, attribute, sequence, accepted) in [
+            (4, 1, 10, true),
+            (4, 1, 11, true),
+            (4, 1, 10, false),
+            (4, 1, 11, false),
+            (4, 2, 3, true),
+            (5, 1, 3, true),
+            (4, 2, 2, false),
+        ] {
+            assert_eq!(
+                node.register_change(owner, attribute, sequence, 0),
+                accepted
+            );
+        }
+    }
+
+    #[test]
     fn discovery_scope() {
         for network in [NET, Network { founder: 9, ..NET }] {
             for seeker in [1, 2] {
@@ -2657,7 +2686,7 @@ mod tests {
             );
             node.remember_discovery(1, i as u16, 1, now);
             node.notice(owner, 1, 1, now);
-            node.change_seen(owner, 1, now);
+            node.register_change(owner, 1, 1, now);
             node.learn(owner, 3, 2, now, TimePerByte::UNKNOWN);
             for (count, capacity) in [
                 (
@@ -2717,7 +2746,7 @@ mod tests {
                 node.remember_call(CALL, &[0], 1, [0; 2], 8, start);
                 node.remember_discovery(1, 7, 1, start);
                 node.notice(4, 1, 7, start);
-                node.change_seen(4, 7, start);
+                node.register_change(4, 1, 7, start);
                 node.learn(4, 3, 2, start, TimePerByte::UNKNOWN);
                 node.expire(start.wrapping_add(elapsed));
                 for live in [

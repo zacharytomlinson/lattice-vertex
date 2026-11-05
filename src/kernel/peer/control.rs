@@ -1,5 +1,6 @@
 //! Bounded native setpoint sessions. One latest pending target per session;
 //! running native calls remain owned by the existing RTOS call tasks.
+use crate::kernel::radio::channel::{Channel, Latest, Received, Temporal, Unique, Update};
 use crate::{
     ir::{Type, Value},
     kernel::appliance::{execution, Native},
@@ -12,6 +13,7 @@ use lattice_peer_wire::{
     program::transfer::{Reply, Status, DATA_BYTES},
     InvokeStatus, StateReadResult,
 };
+type Targets = Channel<Update<Value>, (Unique, Temporal), Latest<Value>>;
 const COUNT: usize = 4;
 const IDLE_MS: u32 = 30_000;
 #[derive(Clone, Copy)]
@@ -22,7 +24,7 @@ struct Session {
     attribute: u64,
     input: Type,
     touched: u32,
-    target: Option<(u32, Value)>,
+    target: Targets,
     pending: Option<(u32, Value)>,
     running: Option<(u32, execution::Ticket)>,
     completed: u32,
@@ -39,7 +41,7 @@ struct Session {
 impl Session {
     fn progress(self) -> Progress {
         Progress {
-            received: self.target.map_or(0, |t| t.0),
+            received: self.target.current().map_or(0, |t| t.0),
             completed: self.completed,
             result: self.result,
             finished: self.finishing && self.pending.is_none() && self.running.is_none(),
@@ -168,16 +170,11 @@ impl Control {
             super::host::control_fault(l.generation, t.owner, t.nonce, Status::Invalid);
             return;
         }
-        if let Some(old) = l.target {
-            if t.sequence < old.sequence {
-                return;
-            }
-            if t.sequence == old.sequence {
-                if t.value != old.value {
-                    super::host::control_fault(l.generation, t.owner, t.nonce, Status::Conflict);
-                }
-                return;
-            }
+        let input = Channel::<Update<()>, (Unique, Temporal), _>::new(Latest {
+            current: l.target.map(|old| (old.sequence, ())),
+        });
+        if input.inspect(&(t.sequence, ())) != Ok(Received::Accepted) {
+            return;
         }
         l.ticket = Some(t.ticket);
         l.target = Some(t);
@@ -317,7 +314,7 @@ impl Control {
                         attribute: state,
                         input,
                         touched: now,
-                        target: None,
+                        target: Targets::new(Latest::new()),
                         pending: None,
                         running: None,
                         completed: 0,
@@ -368,18 +365,15 @@ impl Control {
                 if value.ty() != s.input || sequence == 0 {
                     return Reply::status(Status::Invalid);
                 }
-                let old = s.target.map_or(0, |t| t.0);
-                if sequence == old && s.target.unwrap().1 != value {
-                    return Reply::status(Status::Conflict);
-                }
-                if sequence > old {
+                let update = (sequence, value);
+                if s.target.inspect(&update) == Ok(Received::Accepted) {
                     if s.finishing {
                         return Reply::status(Status::Conflict);
                     }
                     if s.revision == u32::MAX {
                         return Reply::status(Status::Bounds);
                     }
-                    s.target = Some((sequence, value));
+                    s.target.receive(&update).expect("validated target");
                     s.changed();
                     if s.running
                         .is_some_and(|(_, ticket)| execution::replace_target(ticket, value))
@@ -387,14 +381,14 @@ impl Control {
                         s.running.as_mut().unwrap().0 = sequence;
                         s.pending = None;
                     } else {
-                        s.pending = s.target;
+                        s.pending = s.target.current();
                     }
                 }
                 // Old retransmissions can report current progress but never restore old intent.
                 Status::Accepted
             }
             Request::Finish { sequence, .. } => {
-                if s.target.map_or(0, |t| t.0) != sequence {
+                if s.target.current().map_or(0, |t| t.0) != sequence {
                     return Reply::status(Status::Conflict);
                 }
                 if !s.finishing {

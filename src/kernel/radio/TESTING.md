@@ -1,5 +1,31 @@
 # Kernel radio receive/reply test
 
+## Logical channel admission
+
+The shared channel in [channel.rs](channel.rs) binds a decoded message definition,
+composable policies and storage. It adds no task or physical transceiver. Update
+definitions supply a logical sequence; piece definitions supply byte positions.
+Temporal requires a sequenced definition at construction. Policy tuples are
+compile-time combinations, not an interpreted rule list.
+
+Control targets and the peer's bounded state-notice cache use Unique + Temporal.
+Temporal uses wrapping serial arithmetic within a half-range and rejects older or
+equal updates; a rejected update does not replace the stored value. The notice
+cache keeps its existing eight-entry/ten-second scope and oldest-record replacement.
+It filters relayed observations, not a permanent registry of remote attributes.
+Retained circuit inputs must own their channels for their binding lifetime.
+
+Program-fragment, update-header and firmware-window assembly use Unique + Complete.
+The occupied-byte map supplies both deduplication and completeness; payload storage
+is borrowed from its existing owner. Coverage advances after bytes are stored.
+Object verification, installation and activation remain with the corresponding owner.
+Common checks cover sequence boundaries, piece permutations, incomplete coverage,
+window capacity and committed-prefix reuse. Owner checks exercise reordered fragment
+installation and signed firmware staging/recovery. These are host properties, not
+radio-delivery or hardware timing measurements.
+
+## Hardware workload
+
 The `radio` binaries in the C6 and Nordic ports' `tests/` crates use the shared
 [`lattice-radio-test`](tests) workload. That crate owns probe encoding, cadence,
 replies, channel/PAN test settings, and counter storage. The board binaries supply

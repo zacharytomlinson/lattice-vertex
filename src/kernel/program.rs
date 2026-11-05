@@ -10,6 +10,7 @@ mod traversal;
 mod validation;
 
 use super::appliance::Native;
+use super::radio::channel::{Bytes, Channel, Complete, Coverage, Piece, Unique};
 use core::sync::atomic::Ordering;
 use embedded_storage::nor_flash::NorFlash;
 use lattice_peer_wire::program::{
@@ -164,6 +165,7 @@ struct Checkpoint {
 pub(crate) struct Configuration {
     bytes: [u8; IMAGE_CAPACITY],
     incoming: [u8; FRAGMENT_CAPACITY],
+    received: Coverage<{ FRAGMENT_CAPACITY / 8 }>,
     reply: [u8; DATA_BYTES],
     used: u16,
     store: Option<Snapshot>,
@@ -297,6 +299,7 @@ impl Configuration {
         Self {
             bytes: [0; IMAGE_CAPACITY],
             incoming: [0; FRAGMENT_CAPACITY],
+            received: Coverage::new(),
             reply: [0; DATA_BYTES],
             used: 0,
             store: None,
@@ -631,6 +634,7 @@ impl Configuration {
                         Ok(v) if v.1 >= PREFIX + 12 => v,
                         _ => return self.progress(Status::Bounds),
                     };
+                    self.received.clear();
                     self.pending = Some(Pending {
                         offset: at as u16,
                         capacity: capacity as u16,
@@ -651,23 +655,24 @@ impl Configuration {
                     return self.progress(Status::Conflict);
                 };
                 let end = offset as usize + bytes.len();
-                let start = 0;
                 if p.phase != Phase::Receiving {
                     Status::Busy
                 } else if bytes.is_empty() || bytes.len() > DATA_BYTES || end > p.length as usize {
                     Status::Bounds
-                } else if end <= p.accepted as usize {
-                    if self.incoming[start + offset as usize..start + end] == *bytes {
-                        Status::Receiving
-                    } else {
-                        Status::Conflict
-                    }
-                } else if offset != p.accepted {
-                    Status::Conflict
                 } else {
-                    self.incoming[start + offset as usize..start + end].copy_from_slice(bytes);
-                    p.accepted = end as u16;
-                    Status::Receiving
+                    let mut channel = Channel::<Piece, (Unique, Complete), _>::new(Bytes {
+                        data: &mut self.incoming[..p.length as usize],
+                        coverage: &mut self.received,
+                        base: 0,
+                        total: p.length.into(),
+                    });
+                    match channel.receive(&(offset.into(), bytes)) {
+                        Ok(_) => {
+                            p.accepted = self.received.prefix(p.length as usize) as u16;
+                            Status::Receiving
+                        }
+                        Err(_) => Status::Bounds,
+                    }
                 }
             }
             Request::Commit { digest, .. } => {

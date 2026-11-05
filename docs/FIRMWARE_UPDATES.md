@@ -15,6 +15,25 @@ An ordinary supplying peer, including a computer with a USB companion, transfers
 peer forwarding. No tablet, nucleus, router, Internet connection, or permanent
 update coordinator is required. Receivers do not yet serve retained images onward.
 
+## Selectable Shelly stock backup (planned)
+
+For installed Shelly testing, retain a bootable stock image locally, with its
+required filesystem and device-specific data. Reserve it outside Lattice's normal
+update destinations so subsequent Lattice updates cannot erase the return path.
+Selecting stock from Lattice should record the boot choice and perform a software
+reset into that retained image, without downloading or reflashing stock each time.
+
+This is not implemented. First inspect a unit's complete stock dump, partition map
+and boot/security configuration, then establish compatible placement and boot
+selection. The current C6 backend alternates between two writable OTA slots;
+putting stock in the otherwise inactive slot would not preserve it across updates.
+No flash addresses or stock-image relocation are assumed before that inspection.
+
+The Wi-Fi recovery environment and single-slot rewrite proposal are outside this
+selected scope. Returning from stock to Lattice and automatic stock-fallback
+triggers remain separate boot-policy work; selecting stock alone does not establish
+either behavior.
+
 ## Ownership
 
 | Owner | Responsibility |
@@ -73,6 +92,18 @@ vectors/header must match before readiness.
 | Data | Accept at most 48 image bytes with package identity and offset |
 | Finish | Advance verification; phase 7 (`Verifying`) requires another Finish |
 | Status | Read retained progress without advancing it |
+
+Header and image Data use the shared Unique + Complete channel policy. Header
+ranges may arrive in any order. Image ranges are accepted within a 192-byte receive
+window ahead of the contiguous written prefix; farther ranges return Busy without
+advancing acceptance. The window and its 24-byte coverage map are independent of
+image size. An identical retransmission consumes no additional slot or flash write.
+
+When a gap is filled, the complete contiguous window prefix is written through the
+existing storage owner. Flash pacing accounts for that entire write, not merely the
+size of the packet that filled the gap. The reported accepted offset remains the
+contiguous written prefix; buffered later ranges do not imply durable progress.
+Whole-image verification and package authorization remain mandatory.
 
 Busy means no flash progress occurred for that request. The largest radio frame
 is 124 bytes before FCS, within the 125-byte MAC limit. LVT v7 opcodes 16/17 and

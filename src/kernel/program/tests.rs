@@ -221,7 +221,7 @@ fn installation_publication() {
                 .status,
             Status::Busy
         );
-        for (i, chunk) in bytes.chunks(DATA_BYTES).enumerate() {
+        for (i, chunk) in bytes.chunks(DATA_BYTES).enumerate().rev() {
             let request = Request::Data {
                 transfer,
                 offset: (i * DATA_BYTES) as u16,

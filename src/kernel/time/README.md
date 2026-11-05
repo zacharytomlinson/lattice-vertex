@@ -1,5 +1,10 @@
 # Local time and solar predicates
 
+The deadline/clock facilities below are implemented. Their current program integration
+uses the software traversal engine. The planned
+[maintained-circuit backend](../../../docs/PROGRAM_DESIGN.md) will consume these
+deadlines as local input transitions instead; no such conversion is claimed here.
+
 Every participating kernel supplies these inputs; an author places a temporal
 record at the evaluation owner where it belongs in the program. There is no
 special time vertex. Appliance HALs gain no timer-program or calendar callback.

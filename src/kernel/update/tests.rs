@@ -184,7 +184,7 @@ fn header(image: &[u8], p: &Policy, key: &SigningKey) -> [u8; HEADER_BYTES] {
 fn offer(r: &mut Receiver<Backend>, b: &[u8; HEADER_BYTES]) -> Progress {
     let id = package::identity(b);
     let mut response = Progress::unsupported(id);
-    for (i, data) in b.chunks(48).enumerate() {
+    for (i, data) in b.chunks(48).enumerate().rev() {
         response = r.handle(Request::Header {
             package: id,
             offset: (i * 48) as u8,
@@ -293,25 +293,46 @@ fn local_cost_estimates_preserve_unknown_and_overflow() {
 }
 
 #[test]
-fn acknowledged_bytes_and_durable_pages_survive_restart_and_duplicate_delivery() {
+fn transfer_commit_boundaries() {
     let (policy, key) = policy();
-    let image = vec![0x55; 4168];
+    let image: Vec<u8> = (0..4168)
+        .map(|i| ((i * 37 + i / 251) % 256) as u8)
+        .collect();
     let b = header(&image, &policy, &key);
     let id = package::identity(&b);
     let flash = Flash::new();
     let mut r = Receiver::new(Backend::new(flash.clone()), policy);
     assert_eq!(offer(&mut r, &b).status, Status::Ok);
     prepare(&mut r, id);
-    for offset in (0..4128).step_by(48) {
-        assert_eq!(
-            r.handle(Request::Data {
+    let before = flash.0.borrow().writes;
+    assert_eq!(
+        r.handle(Request::Data {
+            package: id,
+            offset: RECEIVE_BYTES as u32,
+            data: &image[..48],
+        })
+        .status,
+        Status::Busy
+    );
+    assert_eq!((r.accepted, flash.0.borrow().writes), (0, before));
+    for base in (0usize..4128).step_by(RECEIVE_BYTES) {
+        for offset in (base..(base + RECEIVE_BYTES).min(4128)).step_by(48).rev() {
+            let request = Request::Data {
                 package: id,
                 offset: offset as u32,
-                data: &image[offset..offset + 48]
-            })
-            .status,
-            Status::Ok
-        );
+                data: &image[offset..offset + 48],
+            };
+            if base == 0 {
+                if offset == base {
+                    assert!(
+                        matches!(r.staging_work(request), Some((staging::Work::Write(n), _)) if n == RECEIVE_BYTES as u32)
+                    );
+                } else {
+                    assert!(r.staging_work(request).is_none());
+                }
+            }
+            assert_eq!(r.handle(request).status, Status::Ok);
+        }
     }
     let p = r.handle(Request::Status { package: id });
     assert_eq!((p.accepted, p.committed), (4128, 4096));

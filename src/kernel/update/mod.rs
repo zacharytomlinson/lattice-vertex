@@ -50,6 +50,11 @@ pub trait Storage {
 /// expanding this shared format to other page sizes requires an explicit revision.
 pub const PAGE_BYTES: u32 = 4096;
 
+use crate::kernel::radio::channel::{Bytes, Channel, Complete, Coverage, Piece, Unique};
+// Four incoming data payloads, independent of total image size. The updater
+// still writes contiguous bytes to its existing flash/journal owner.
+const RECEIVE_BYTES: usize = 4 * lattice_peer_wire::update::DATA_BYTES;
+
 /// Fingerprint the supplied mathematical definitions and durable native bindings.
 /// Compatible relocation preserves this value; definition order remains encoded.
 /// Packaging must preserve this surface in the candidate for this initial ABI.
@@ -94,6 +99,9 @@ pub struct Receiver<S: Storage> {
     assembling: PackageId,
     header_bytes: [u8; HEADER_BYTES],
     header_length: usize,
+    header_received: Coverage<{ HEADER_BYTES.div_ceil(8) }>,
+    received: Coverage<{ RECEIVE_BYTES.div_ceil(8) }>,
+    window: [u8; RECEIVE_BYTES],
 }
 
 impl<S: Storage> Receiver<S> {
@@ -111,20 +119,19 @@ impl<S: Storage> Receiver<S> {
                     staging::Work::ErasePage
                 }
             }
-            Request::Data { offset, data, .. }
-                if self.phase == Phase::Receiving && offset == self.accepted =>
-            {
-                let end = offset.checked_add(data.len() as u32)?;
-                if data.is_empty() || end > header.image_bytes {
+            Request::Data { offset, data, .. } if self.phase == Phase::Receiving => {
+                let length = self.writable_after(offset, data.len())?;
+                if length == 0 {
                     return None;
                 }
+                let end = self.accepted + length as u32;
                 let completed = if end == header.image_bytes {
                     end
                 } else {
                     end / PAGE_BYTES * PAGE_BYTES
                 };
                 staging::Work::Write(
-                    (data.len() as u32).div_ceil(4) * 4
+                    (length as u32).div_ceil(4) * 4
                         + if completed > self.committed { 8 } else { 0 },
                 )
             }
@@ -155,6 +162,9 @@ impl<S: Storage> Receiver<S> {
             assembling: [0; 16],
             header_bytes: [0; HEADER_BYTES],
             header_length: 0,
+            header_received: Coverage::new(),
+            received: Coverage::new(),
+            window: [0; RECEIVE_BYTES],
         };
         // Recovery verifies the stored signature and applicability again. Invalid
         // or consumed metadata does not authorize any image writes or activation.
@@ -175,7 +185,7 @@ impl<S: Storage> Receiver<S> {
         } else {
             Progress {
                 package,
-                phase: if self.assembling == package && self.header_length != 0 {
+                phase: if self.assembling == package && !self.header_received.is_empty() {
                     Phase::Header
                 } else {
                     Phase::Idle
@@ -226,25 +236,30 @@ impl<S: Storage> Receiver<S> {
         if self.header.is_some_and(|h| h.id == id) && self.phase != Phase::Fault {
             return Ok(());
         }
-        if offset == 0 && (self.assembling != id || self.header_length == HEADER_BYTES) {
+        if self.assembling != id || self.header_length == HEADER_BYTES {
+            // Offset zero remains the explicit replacement offer. A delayed
+            // nonzero piece from another partial offer cannot steal this buffer.
+            if self.assembling != id
+                && offset != 0
+                && !self.header_received.is_empty()
+                && self.header_length < HEADER_BYTES
+            {
+                return Err(Status::Busy);
+            }
             self.assembling = id;
             self.header_length = 0;
+            self.header_received.clear();
         }
-        if self.assembling != id {
-            return Err(Status::Order);
-        }
-        if offset + data.len() <= self.header_length {
-            return if &self.header_bytes[offset..offset + data.len()] == data {
-                Ok(())
-            } else {
-                Err(Status::Order)
-            };
-        }
-        if offset != self.header_length {
-            return Err(Status::Order);
-        }
-        self.header_bytes[offset..offset + data.len()].copy_from_slice(data);
-        self.header_length += data.len();
+        let mut channel = Channel::<Piece, (Unique, Complete), _>::new(Bytes {
+            data: &mut self.header_bytes,
+            coverage: &mut self.header_received,
+            base: 0,
+            total: HEADER_BYTES as u32,
+        });
+        channel
+            .receive(&(offset as u32, data))
+            .map_err(|_| Status::Invalid)?;
+        self.header_length = self.header_received.prefix(HEADER_BYTES);
         if self.header_length != HEADER_BYTES {
             return Ok(());
         }
@@ -269,6 +284,7 @@ impl<S: Storage> Receiver<S> {
         self.header = Some(header);
         self.phase = Phase::Preparing;
         self.accepted = 0;
+        self.received.clear();
         self.committed = 0;
         self.next_record = journal::RECORDS;
         self.journal_pages = 0;
@@ -289,6 +305,7 @@ impl<S: Storage> Receiver<S> {
             .map_err(|_| Status::Storage)?;
         self.header = Some(saved.header);
         self.accepted = saved.committed;
+        self.received.clear();
         self.committed = saved.committed;
         self.next_record = saved.next;
         self.initialize_journal = false;
@@ -335,25 +352,61 @@ impl<S: Storage> Receiver<S> {
         Ok(())
     }
 
+    fn writable_after(&self, offset: u32, length: usize) -> Option<usize> {
+        let total = self.header?.image_bytes;
+        let end = offset.checked_add(u32::try_from(length).ok()?)?;
+        if length == 0 || end > total {
+            return None;
+        }
+        if end <= self.accepted {
+            return Some(0);
+        }
+        let mut coverage = self.received;
+        coverage
+            .mark(
+                offset.saturating_sub(self.accepted) as usize,
+                (end - self.accepted) as usize,
+            )
+            .ok()?;
+        Some(coverage.prefix(RECEIVE_BYTES.min((total - self.accepted) as usize)))
+    }
+
     fn write(&mut self, offset: u32, data: &[u8]) -> Result<(), Status> {
-        if self.phase != Phase::Receiving {
+        if !matches!(
+            self.phase,
+            Phase::Receiving | Phase::Verifying | Phase::Ready
+        ) {
             return Err(Status::Order);
         }
         let header = self.header.unwrap();
-        let end = offset
-            .checked_add(data.len() as u32)
-            .ok_or(Status::Invalid)?;
-        if end > header.image_bytes
-            || offset > self.accepted
-            || (offset < self.accepted && end > self.accepted)
-        {
-            return Err(Status::Order);
+        let length = RECEIVE_BYTES.min((header.image_bytes - self.accepted) as usize);
+        let mut channel = Channel::<Piece, (Unique, Complete), _>::new(Bytes {
+            data: &mut self.window[..length],
+            coverage: &mut self.received,
+            base: self.accepted,
+            total: header.image_bytes,
+        });
+        channel
+            .receive(&(offset, data))
+            .map_err(|error| match error {
+                crate::kernel::radio::channel::Error::Capacity => Status::Busy,
+                crate::kernel::radio::channel::Error::Invalid => Status::Invalid,
+            })?;
+        let written = self.received.prefix(length);
+        if written == 0 {
+            return Ok(());
         }
-        if self.storage.write(offset, data).is_err() {
+        if self
+            .storage
+            .write(self.accepted, &self.window[..written])
+            .is_err()
+        {
             self.phase = Phase::Fault;
             return Err(Status::Storage);
         }
-        self.accepted = self.accepted.max(end);
+        self.accepted += written as u32;
+        self.window.copy_within(written.., 0);
+        self.received.discard_prefix(written);
         let completed = if self.accepted == header.image_bytes {
             self.accepted
         } else {

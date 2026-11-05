@@ -138,9 +138,9 @@ fn target_order_and_dispatch() {
                 Request::Target {
                     ticket,
                     sequence: 4,
-                    value: value(5),
+                    value: value(4),
                 },
-                Status::Conflict,
+                Status::Accepted,
             ),
             (
                 3,

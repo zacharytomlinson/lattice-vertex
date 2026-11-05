@@ -6,7 +6,7 @@ Each document has one owner and purpose:
 | --- | --- |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Canonical system semantics, ownership, interfaces and architectural requirements |
 | [KERNEL_DIRECTION.md](KERNEL_DIRECTION.md) | Current implementation map, capability gaps and immediate next work |
-| [PROGRAM_DESIGN.md](PROGRAM_DESIGN.md) | Remaining execution integration and its worked traversal; implemented loader/ABI details live beside the component |
+| [PROGRAM_DESIGN.md](PROGRAM_DESIGN.md) | Maintained software connections on nRF52840 and ESP32-C6, subsequent LLVM/native lowering, open mechanics and deferred hardware mappings |
 | [AGENTS.md](../AGENTS.md) | Collaboration, code organization, test discipline and review procedure |
 | [FIRMWARE_UPDATES.md](FIRMWARE_UPDATES.md) | Implemented updater behavior, wire/storage boundaries and remaining limits |
 | Component notes beside source | Current APIs, protocols and maintained usage/validation procedures |
@@ -15,8 +15,13 @@ Each document has one owner and purpose:
 Architectural requirements do not imply implementation. The direction distinguishes
 working facilities from missing ones. Current user decisions supersede older notes;
 reconcile a disagreement into its owner rather than retaining two authorities.
-As the program design is implemented, move its accepted mechanics beside their
-code and retire the proposal; do not maintain a parallel specification.
+The architecture specifies maintained circuit signals and prepared implementations.
+The immediate migration establishes maintained connections in software, then lowers
+local computation through LLVM to native code. Hardware selection is separate.
+The current program component still documents the implemented LPD/LPG record
+interpreter and traversal protocol. Its existing test evidence does not establish
+maintained connections or a hardware backend. As the plan is implemented, move mechanics
+beside their code and retire the proposal; do not maintain a parallel specification.
 
 Useful component entry points:
 

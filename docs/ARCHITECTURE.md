@@ -10,42 +10,47 @@ whose implementation is still pending; it is not a progress report.
 
 ## Purpose and architectural contract
 
-The objective is a general substrate for distributed physical computation. A home,
-industrial assembly, instrument network, or machine hosting a language model supplies a
-particular collection of peripherals and definitions. None changes the fundamental
-ownership or execution model. A touchscreen, compiler host, scheduler, and actuator are
-distinguishable by their exposed capabilities, not by exceptions to the peripheral
-interface.
+Lattice is a constrained distributed physical-control system implemented by cooperating
+vertices. An installed automation is a circuit distributed across the owners of its
+inputs and outputs. Each owner maintains its local part; directed connections convey
+changes in circuit signals. There is no central executor or mandatory system-wide
+state replica. A tablet, compiler host, sensor and actuator differ in their exposed
+capabilities, not in their authority over ordinary operation.
 
-Hardware integration proceeds in meaningful stages implementing permanent components of
-this model. Jarvis is a reference implementation, not the DRTOS specification or an
-intermediate product. Development and test discipline are defined in
-[AGENTS.md](../AGENTS.md).
+The kernel's value is automatic participation from an appliance HAL and a formal surface
+definition. The implementor declares the encapsulated state, available transformations
+and operating invariants. Lattice realizes that model on the board and supplies
+enumeration, communication, installation and propagation. It is not a general-purpose
+process environment or a library the appliance must drive from its own main loop.
+
+Jarvis remains a source of useful mathematics and device knowledge, not the DRTOS
+specification. Development discipline belongs in [AGENTS.md](../AGENTS.md).
 
 ### Status of the specification
 
-This document records the intended model. A requirement here is not a claim that code
-already implements it. Concrete formats and mechanisms remain open where stated;
-implementation status and the immediate work are tracked only in [the kernel
-direction](KERNEL_DIRECTION.md). External research informs the design rather than proving
-this implementation.
+This is the accepted target model, not a claim of implementation. Maintained circuit
+signals and compile-time hardware assembly supersede the earlier upstream-to-head,
+forward-visit execution model. The current kernel still contains that record interpreter
+and traversal engine; its formats and evidence remain in component notes until migration.
+[The kernel direction](KERNEL_DIRECTION.md) distinguishes that baseline from planned work.
 
-| **Requirement** | **Architectural consequence** |
-|----|----|
-| Local ownership | A node owns its state and driver. Ordinary execution does not require a replicated image of other nodes or of the entire system. |
-| Change delineation | A registered change starts dependent evaluation. There is no global polling cycle over every program. |
-| Graph execution | Bindings contain the relationships and predicates. Successful traversal reaches mutation handles directly. |
-| Peer operation | Execution and forwarding continue through peers without a mandatory router, Internet service, or central executor. |
-| Bounded local resources | Kernel traffic uses fixed pools and ring buffers. Relay placement and overload behavior must respect explicit capacity. |
-| Explicit semantics | Safety, arithmetic, lifecycle, and temporal behavior come from declared contracts. The substrate does not infer domain policy. |
-| Independent changes | A later ordinary change initiates another traversal. It does not retroactively cancel a decision already propagated. |
-| Complete implementation scope | Persistence, replacement, faults, and verification belong to the implementation baseline, not a later rewrite. |
+| Requirement | Architectural consequence |
+| --- | --- |
+| Local ownership | A node owns its appliance signals and the incoming/outgoing relationships of its circuit fragments. |
+| Maintained circuits | Local input changes update connected outputs; no fresh whole-DAG traversal is required. |
+| Separate kinds of change | Appliance-state notices and addressed circuit-signal updates have different recipients and execution meaning. |
+| Compile-time assembly | The build/authoring toolchain constructs typed components and target mappings; a vertex applies prepared configuration. |
+| Hardware realization | Pins, latches, comparators, timers, event routes and DMA implement the model wherever the target mapping permits. |
+| Minimal firmware boundary | HAL plus formal surface; no appliance-owned networking, circuit evaluator, notification loop or resource arbitration. |
+| Bounded ownership | Peripheral resources, signal storage and accepted delivery state have explicit local limits. |
+| Independent changes | Connections preserve their own state; later changes do not cancel hardware calls already running. |
+| Explicit semantics | Arithmetic, qualification, active/resting targets and fault behavior are declared, not guessed by the kernel. |
 
-Lattice is neither an entity-component system nor a virtual machine that maintains a
-second version of the physical world. Its IR and execution machinery describe and traverse
-relationships among existing state locations and available operations. Local schedulers
-and communication buffers remain necessary implementation mechanisms; they do not create a
-central queue of successfully evaluated mutation tails.
+The objective is minimal CPU work during ordinary Lattice operation. Hardware setup,
+installation, delivery management and explicitly required native operations still exist.
+Their existence does not justify a per-delta bytecode interpreter, a program counter for
+each circuit, or periodic scans of every predicate. A hardware claim requires a concrete
+peripheral mapping and evidence on that target.
 
 ## The distributed kernel and its nodes
 
@@ -92,70 +97,53 @@ storage.
 
 ### Local driver responsibility
 
-Appliance firmware is a passive Lattice-native HAL over the board/appliance HAL.
-It supplies callable initialization, typed getters and native mutation functions,
-with their mathematical meanings and operating constraints. It has no independent
-runtime, main loop, monitoring loop or reporting tasks. The kernel owns startup,
-the main service loop, RTOS execution contexts and every acquisition/invocation.
-An entry stub may connect the hardware bindings; it does not become an application
-runtime that periodically calls Lattice as a library.
+Appliance firmware supplies the board/appliance HAL and the formal surface: typed inputs
+and outputs, transformation meanings, calibration, qualification and operating invariants.
+It has no independent main loop, circuit evaluation loop or reporting task. The kernel
+owns startup, physical resource allocation, network participation and any required RTOS
+execution contexts. An entry stub connects the supplied hardware; it does not turn
+Lattice into a periodically called library.
 
-User requests and installed programs cause the kernel to invoke mutation handles.
-The adapter performs the requested hardware operation and returns. It does not
-independently schedule state mutations or publish changes. It needs no special
-mutable field, report call, message construction or automation callback. The kernel
-owns monitoring, change detection, retained-state maintenance, dependency activation
-and communication through the supplied functions.
+The surface is also a declarative resource request. Its realization should use the
+actual electrical or peripheral representation of state: a qualified pin level, output
+latch, analog signal, comparator result, PWM setting, counter or DMA-backed measurement.
+Software-maintained state is appropriate for a remote appliance or a logical quantity
+without an accessible physical representation. Directly attached digital sensors may
+use bus peripherals and buffers; an analog pin is not a requirement for participation.
 
-The kernel retains the last established local observation needed to detect change.
-It reads through the getter on relevant hardware events or through kernel-owned
-monitoring when the device supplies no change event. Device acquisition and
-qualification remain hardware-specific; monitoring cadence belongs to that
-acquisition path, not to each automation. Sampling only observes the values it
-actually acquires; hardware event/latching support is needed where intervening
-transitions must be retained. This local observation record is not a replicated
-world model. An unchanged observation does not activate programs.
+Types and formulas alone cannot identify which appliance pin or peripheral supplies an
+input. That association comes through the HAL/surface binding already supplied by the
+implementor. The target implementation must preserve enough of that association for
+compilation and allocation; it must not attempt to infer hardware from an opaque getter's
+machine code. The implementor does not choose circuit-specific PPI/ETM channels, allocate
+comparator resources for unknown future automations, or author a second software model
+solely to notify the kernel.
 
-Use the MCU's event routing, timer compare, capture/counter, DMA and waveform
-peripherals where they implement the hardware binding's behavior directly.
-Event-capable acquisition is a required kernel path; a uniform periodic scan is
-not its substitute. Acquisition sources and any necessary sampling cadence belong
-to the hardware binding. The kernel owns their wakeup, observation and delta flow.
-Keep an interrupt notification distinct from an acquired state change, and retain
-events or samples in hardware/bounded storage when their individual values matter.
+The hardware value and its declared meaning remain distinct. A relay-drive output is
+not evidence that contacts closed or a load drew current. A dimmer's setting is its
+duty/phase configuration, not every edge of its switching waveform. Physical feedback
+is a separate source when the appliance has it. Calibration and declared resolution
+connect an electrical quantity to the surface's mathematical value.
 
-A mutation calls the supplied hardware function. Subsequent acquisition establishes
-what actually changed, including partial effects of a failed operation. Returning
-success does not manufacture the desired observed state. The kernel propagates
-established changes through the same path whether they followed a native command
-or originated in the environment. The program evaluator runs on activations and
-incoming visits, not as a continuous scan of every predicate.
+Qualification belongs to the source model: edge polarity, debounce, hysteresis, resolution
+and sampling where required. A comparator crossing may establish a predicate without
+first materializing a scalar in a software observation cache. A numerical report may
+still require ADC conversion or a bus read. Raw noise and repeated above-threshold sample
+events are not automatically distinct system deltas. Preserve required intervening changes
+through the available latch, counter, FIFO or bounded storage.
 
-A native function can remain active for the duration of a finite physical operation.
-The kernel must provide its execution context while continuing peer service and
-hardware monitoring. Do not require the adapter to return promptly, create its own
-task or split the operation into a firmware-owned runtime. Synchronization protects
-actual hardware critical sections; holding the entire appliance exclusively for a
-long call would defeat concurrent monitoring. This does not create program-wide
-serialization, supersession or cancellation of an earlier traversal.
+The kernel configures event paths and data buffers from compiled definitions. When a
+physical task can implement a mutation, that task is the endpoint. Where an adapter must
+perform a finite native operation, existing RTOS contexts let it run while acquisition,
+communication and unrelated circuits continue. It must not supply its own scheduler or
+manually publish resulting changes. Returning success does not manufacture observed
+physical completion, and a later input change does not preempt a running native call.
 
-The firmware implementation is the kernel's userspace boundary. Keep its hardware/state
-interfaces small and stable, following the SAS-style goal of a few primitive bindings for
-a new board. Framing, serialization, addressing, transport limits and program execution
-belong inside the kernel and its backend. Changing from IEEE 802.15.4 to a different
-medium must not require changes to existing appliance source or the common adapter
-interface; new physical hardware supplies another adapter implementation. Byte FIFOs,
-packet buffers and DMA are internal mechanisms, not an obligation to author packets.
-Matter, GPIO and other local appliance interfaces remain encapsulated behind the same
-state/mutation model. The hardware and state interfaces must make participation automatic
-without a separate firmware send/notification ritual or firmware-owned monitoring loop.
-Kernel-owned physical acquisition is distinct from polling programs for truth.
-Each state identifies its physical acquisition source: an event, a sampling interval,
-or acquisition at kernel invocation boundaries. A readiness event can be shared by
-coupled states. The kernel takes the startup baseline, selects getters and maintains
-the observation/delta path. Existing getter-only adapters may retain their fallback
-sampling behavior without changing their source. Peripheral register/interrupt
-wiring belongs to the hardware binding; it introduces no networking responsibility.
+The firmware is the stable userspace boundary. Communication medium, framing, retries,
+message sizes, peer paths, circuit installation and storage remain kernel responsibilities.
+A transport change must not make every appliance author rewrite their surface. The
+common boundary must make declaring a relay, dimmer or diffuser materially simpler than
+implementing its network behavior and peripheral coordination manually.
 
 ### Independently replaceable kernel and appliance code
 
@@ -172,12 +160,13 @@ make the deferred binary interface a prerequisite for program execution.
 
 ## References and resident graph structure
 
-A binding is an attachment to an already existing state location, operation, or relay
-slot. The graph stores the relationships among those attachments. Enumeration reveals the
+A binding identifies an appliance signal, a configured component, an operation or a relay
+relationship. The graph stores the connections among them. Enumeration reveals the
 surface and makes its bindings available; it does not manufacture a second object model of
 the peripheral.
 
-Within a node, an attachment can resolve to a direct memory reference or function pointer.
+Within a node, a binding can resolve to a peripheral endpoint, bounded data location or
+native function pointer.
 Across nodes, a reference must identify an owning peer and a binding within that peer. A
 foreign address is never dereferenced as local RAM. This distinction is an addressing
 requirement of separated machines, not a requirement for a registry of copied peripheral
@@ -186,12 +175,13 @@ entities.
 | **Resident information** | **Purpose** |
 |----|----|
 | Local attribute or mutation reference | Connect an edge to the state or callable handle already owned by the node. |
-| Local predicate and value operations | Define the local test, value transfer, branch, or invocation associated with the binding. |
-| Directed neighbor references | Identify the next semantic binding and the upstream activation relationship toward a program head. |
-| Program revision association | Keep each admitted traversal on compatible installed fragments during replacement. |
+| Compiled local components | Describe prepared predicates, calculations and output actions with their resource requirements. |
+| Paired neighbor references | Identify the incoming signal and its connected outgoing destination; retain their association. |
+| Circuit revision association | Keep signal updates attached to compatible installed connections during replacement. |
 | Optional relay binding | Represent an established communication path without changing the program predicate. |
 | Optional safety and watchdog slot | Declare fault behavior and retain the bounded state needed while a protected condition is open. |
-| Head enablement | Make admission eligibility resident in the graph rather than an external AutomationID lookup table. |
+| Head enablement | Supply the circuit's enabling signal without a global AutomationID lookup on every update. |
+| Connection signal state | Retain established incoming continuity, required typed values and emitted output state; validity is distinct from low. |
 
 These are logical requirements, not a demand for heap-allocated objects or one large
 structure at every attachment. Concrete layouts may use fixed arrays, compact indices,
@@ -201,18 +191,19 @@ complete executable.
 
 ### Semantic and communication paths
 
-A semantic edge connects the program bindings whose relationship matters to evaluation. A
-communication path may include additional relay bindings that carry the activation between
-them. Removing relay-only vertices from a path must recover the same semantic
-relationship. A relay must not silently become an extra predicate, alter a retained
-operand, or substitute for an unavailable state owner.
+A semantic edge connects components whose signals depend on each other. A communication
+path may include additional relays. Relays preserve the addressed update and its meaning;
+they do not become predicates, alter values or substitute for an unavailable owner.
 
-The graph can contain branches and multiple dependencies even when one particular
-traversal is serial. Each node therefore needs explicit directional references for the
-edges it owns. An XOR-linked representation is an optional local packing technique, not
-the semantic definition of the graph or a promise that raw pointers can cross machines.
-Its suitability depends on branching, reconstruction, and the required direction of
-traversal.
+Each vertex knows the directed connections it owns. Receiving an update for one pair
+does not authorize propagation through unrelated pairs. Fan-out and Boolean combination
+are authored circuit relationships, not an accidental consequence of sharing storage.
+Physical input availability, transport delivery and circuit continuity are distinct.
+Radio propagation is not instantaneous global electrical continuity.
+
+Packing local links into indices or offsets is an implementation choice. A local list
+link is not a foreign memory pointer or an additional semantic edge. Discovery can still
+walk adjacency references; retiring execution traversal does not remove network discovery.
 
 ### Durable identity and runtime address
 
@@ -224,7 +215,7 @@ Compatible firmware relocation must preserve those references. Reusing a name fo
 a different physical meaning is an incompatible change, even if its type matches.
 Duplicate references must be rejected rather than ambiguously dispatched.
 
-On reconstruction, graph traversal resolves saved native bindings and fixes local
+On reconstruction, the loader resolves saved native bindings and fixes local
 relationships after checking types and compatibility. A multi-node reference adds
 the owning node's identity to this reconstruction domain. Mathematical definitions
 and surface compatibility fingerprints must not depend on firmware addresses.
@@ -236,29 +227,64 @@ with the kernel implementation.
 
 ## The common IR and peripheral semantics
 
-The common intermediate representation (IR) defines typed state, arithmetic, comparisons,
-Boolean composition, operation effects, and invariants. Appliance implementors supply the
-mathematical meaning of their native state and functions, not the automations that will
-later use them. Compilation connects owner-local predicates, value calculations and native
-mutation endpoints through resident graph edges. Definitions supplied after firmware
-compilation select and bind the kernel's native primitives; they do not require a
-firmware-authored Rust evaluator for each automation. The common IR is not an interpreter
-hosted on every vertex. Concrete resident-record and installation formats are
-maintained with the kernel implementation.
+The shared IR defines typed state, arithmetic, comparisons, Boolean composition,
+transformation effects and invariants. Appliance authors describe their hardware's
+mathematical surface, not automations that might later use it. Nucleus may prove and
+synthesize circuits; a basic-install authoring peer can compile a graph without a solver.
+Neither service becomes an execution coordinator.
 
-Definitions are composed from the language's primitives rather than added as new
-domain-specific opcodes. Duration, duty fraction, warmth, illumination preference, or a
-learned intent score belongs in definitions authored using the IR. A reusable duration
-definition receives the relevant scope; separate compiler features for television duration
-and diffuser duration would violate that abstraction. Definitions are submitted as typed
-structured data or compiled artifacts, not strings that the kernel reparses as ad hoc
-source.
+The circuit primitive vocabulary uses those same types and meanings. Typed sources,
+Boolean gates, comparisons, supported value transformations and output endpoints form a
+small circuit instruction set. Each target port supplies concrete implementations and
+resource requirements. There is no separate domain opcode for every appliance behavior
+and no competing arithmetic language beside lattice-ir.
 
-There is no privileged tablet SDK. A tablet is an ordinary peripheral with a relatively
-broad surface. An authenticated binding can connect a user action directly to an
-authorized mutation handle. A language model may contribute structured intent definitions
-through the same mechanism. Authentication, admission, and safety still apply to those
-contributions; a natural-language interpretation does not become an unchecked executable.
+### Compile-time circuit assembly
+
+Circuit assembly and native code generation occur before activation, never on each delta.
+Target-lowering placement remains open: an authoring-peer compiler can use LLVM, or a
+bounded vertex-local translator can realize portable binary definitions at installation.
+Chip-specific mapping knowledge is unavoidable; where selection runs is not settled.
+Selection uses the typed IR, not disassembly of previously emitted native code.
+
+The appliance build realizes its surface through the supplied HAL and target components.
+Later authoring partitions circuit logic by ownership without a firmware rebuild or a
+firmware-authored evaluator per automation. The selected lowering path prepares physical
+configuration and any required native instruction sequences before activation.
+
+| Stage | Responsibility |
+| --- | --- |
+| Appliance build | Resolve physical sources/actions and their mathematical meaning; prepare the local surface realization. |
+| Circuit authoring and target lowering | Partition logic and resolve implementations, constants, data locations, connections and resource requirements. Backend placement remains open. |
+| Boot or installation | Validate, complete local translation if selected, bind resources, apply setup and establish valid inputs before activation. |
+| Ordinary operation | Propagate qualified input/output changes through the established hardware and communication paths. |
+
+Installation may validate, relocate handles, reserve resources and write configuration
+registers. A selected local translator can match known implementations and emit native
+code once; it does not run FSPS, invent an automation or interpret operations per delta.
+Concrete peripheral assignments must respect resources
+already used by the RTOS, radio and other installed connections. Prepared setup is limited
+to admitted HAL resources and target operations, not arbitrary MCU register writes.
+The resource description and relocation format remain implementation work; no fixed recipe
+or new wire ABI is selected by this specification.
+
+PPI, ETM, comparators, timers and DMA must be considered together when mapping components.
+A lack of a general LUT fabric does not prove that a composed hardware implementation is
+impossible. Conversely, an event matrix alone does not prove arbitrary value comparison,
+packet classification or arithmetic is implemented in hardware. Required CPU operations
+must be explicit target implementations chosen during compilation, with bounded cost;
+there is no silent fallback to the current record interpreter. Unsupported semantics or
+insufficient resources must be reported rather than weakened.
+
+The required association is between a signal and the hardware capable of acting on it,
+not a requirement to reserve CPU registers for every state. Typed values may live in
+peripheral registers, analog signals, latches or bounded DMA buffers. SRAM used directly
+by peripheral producers/consumers does not imply software evaluation or per-event copying.
+
+Definitions arrive as compiled structured artifacts, never ad hoc strings reparsed on
+each update. Enumeration can expose static IR definitions without shipping the solver,
+compiler or an IR interpreter on a vertex. The tablet uses the same authorized surface
+and mutation interfaces as other peers.
 
 ### Multiple effects from one invocation
 
@@ -295,123 +321,156 @@ results. Solver defaults and native instruction behavior are not substitutes for
 contract. The shared IR owns arithmetic/type rules. The compiler and installed-program ABI
 must preserve them rather than importing host defaults.
 
-Each admitted traversal has bounded local work. Continuing behavior is expressed through
-explicit future activations or state-dependent recurrence. The presence of a scheduler
+Each component update has bounded local work. Continuing behavior is expressed through
+qualified input changes, declared feedback or local deadline events. The presence of a scheduler
 does not by itself prove that the total communicating system lacks unbounded computation.
 The relevant implementation obligations are bounded resources and progress for admitted
 operations, not an informal claim about Turing completeness.
 
-## Change activation and distributed execution
+## Maintained circuits and delta propagation
 
-A registered change identifies the resident dependency relationships affected by that
-attribute. For each affected program, activation travels upstream along the installed
-relationships toward its head. A target within direct reach can receive the transmission
-immediately; otherwise peers relay it. Each logical hop uses the same acknowledged
-delivery rules. Routing upstream activation is not itself a substitute for the program's
-forward conditional evaluation.
+An automation is a maintained distributed circuit. Its head supplies enablement; it is
+not a central evaluator or the destination of a round trip on every change. For a serial
+AND path, a component's outgoing continuity is its established upstream continuity AND
+its local predicate. A true local predicate alone cannot power the circuit.
 
-At the enabled head, an admitted activation begins traversal of the installed program
-revision. Each visited conditional binding reads the appropriate currently exposed local
-value and evaluates its predicate. A true result advances to the declared next binding; a
-false result terminates that path or takes the explicitly authored alternative. Values are
-discarded once no longer needed. There is no global snapshot assembled before evaluation.
+Each connection retains the relevant incoming signal and its established outgoing state.
+A local source transition or an incoming circuit update can change the local result.
+Only affected connections respond. No backward activation, per-visit program counter or
+fresh whole-DAG evaluation is required. A change propagates as far as it affects connected
+outputs; every vertex needs only its owned portion of the circuit.
 
-![Traversal](assets/architecture/traversal.png)
+Both high and low propagate. If a previously conductive path becomes low, the downstream
+owner must learn that transition even though the gate is now closed. Dropping traffic at
+the first false predicate would leave the rest of the circuit incorrectly high.
 
-Figure 2. One change activates a program through its upstream relationships. Forward
-traversal evaluates the program and reaches its mutation binding only along a successful
-path. Every hop uses the common delivery protocol.
+Boolean composition can use serial short-circuit connections. With upstream continuity
+established, AND proceeds to the second condition only when the first is true; otherwise
+the result is low. OR bypasses the second condition when the first is true and lets the
+second determine the result when the first is false. Neither requires simultaneous
+evaluation, a parallel fan-in component or a separately dispatched Boolean opcode.
+Co-located conditions use the same relationships through local connections.
+
+Serial dependency order does not restore the old whole-DAG traversal engine. The installed
+connections maintain their selected paths as inputs change. A bypassed source still owns
+its physical state; when it becomes relevant, its current condition must be established.
+Path handover must propagate the correct resulting output, including low, and delayed
+updates from a formerly selected path must not override the active path. The exact
+binding/delivery mechanism belongs to the implementation plan, not an assumed parallel join.
+
+Circuit activation initializes LOW. Each vertex evaluates its local predicate,
+but local truth alone cannot activate its output while upstream activation is LOW.
+Only an enabled head whose predicate is true can originate the initial HIGH.
+Otherwise the default LOW is already correct and requires no startup transmission.
+A received upstream HIGH causes the next local fragment to evaluate; it propagates
+HIGH only if its predicate permits it. Initialization requires no neighbor-state
+announcement or query. Later genuine high-to-low transitions still propagate.
+
+Adjacent activation and carried values are volatile current context, not persisted
+copies of a neighbor's pre-reboot state. Reconstruct the installed relationships,
+not their former activation. Missing scalar measurements are still unavailable;
+the LOW activation default does not fabricate an appliance measurement or infer a
+new resting mutation. Circuit state reflects received changes, not a simultaneous
+system-wide snapshot.
+
+The interim software implementation retains activation between changes. An active
+path's periodic end-to-end heartbeat is deferred until after that implementation;
+it will provide a way to detect lost continuity when no LOW update was issued.
+ACK/retry provides delivery of issued messages, not evidence that a silent source
+is still operating. The interim model does not claim to handle isolated power loss
+as an actual powered wire would.
+
+### System-state and circuit-state changes
+
+| Change | Meaning | Recipients |
+| --- | --- | --- |
+| System-state delta | A qualified exposed appliance value changed. | Observation consumers, ordinarily through broadcast; explicit subscriptions can have stronger delivery. |
+| Circuit-state delta | An installed connection's continuity or relevant typed output values changed. | Its named downstream dependent, directly or through a relay. |
+
+A source can publish an observation without causing an action. The same appliance state
+may feed several circuits with different upstream conditions, so one activation bit on
+the general observation broadcast cannot describe them all. Continuity is per connection.
+Transport batching may share an envelope where recipients and delivery rules permit it;
+the logical distinctions must survive. Neither table row defines a new packet format.
+
+### Digital and analog outputs
+
+Digital and analog describe the effective signal, not separate general-purpose execution
+engines or a restriction on all upstream input types. A scalar comparison can produce a
+digital result. An analog output carries continuity plus the computed target arguments.
+Those values remain numeric on the network; "analog" does not introduce an untyped or
+floating-point execution language.
+
+| Established output change at a mutation endpoint | Required behavior |
+| --- | --- |
+| Low to high, active arguments available | Apply the declared active target. |
+| High to low | Apply the declared resting target. |
+| High remains high, effective arguments change | Apply the new target. |
+| Continuity and effective arguments unchanged | Do not invoke again. |
+| Low remains low while inputs/arguments change | Update required input state without invoking an active target. |
+| Same update retransmitted | Preserve its original identity; do not manufacture another transition. |
+
+The resting target is part of the output's authored behavior, not a universal zero/off
+default. A falling signal is therefore an output change, not the old false-path stop.
+An unchanged high carrying a changed required argument is also a meaningful delta;
+an additional "execute again" bit is not inherently required. Circuit connections may
+carry different types or widths along one graph as comparisons reduce values to Boolean
+signals or calculations produce scalar arguments.
+
+### Values and physical representation
+
+Compilation determines which values each component consumes and produces, their widths,
+storage requirements and connections. It computes values where their required inputs are
+available and carries only the outputs needed downstream. This replaces a per-traversal
+read/write stack with maintained, bounded signal storage. A physical signal or hardware
+register need not be copied into a mandatory software cache just to participate.
+
+Events and data may have separate paths: a comparator/edge event changes a connection,
+while a peripheral register or prepared DMA buffer supplies its value. A frame template
+can bind the destination and layout during installation; changing fields and transmit
+triggers then follow those bindings. Hardware ownership must prevent a producer from
+overwriting a buffer still being read or transmitted. Radio identifiers, integrity,
+accepted delivery and required formatting do not disappear because a frame is prepared.
 
 ### Interrupts and local task execution
 
-Hardware IRQs and kernel-detected changes feed existing RTOS notification/task
-machinery. The interrupt acknowledges/captures the event and wakes task-context
-work; getters that perform I/O, native mutations and radio waits must not require
-blocking inside an ISR. A software-detected delta can notify the task directly.
-
-For a local delta, the kernel follows the changed state's resident dependencies
-and starts the corresponding upstream activation work. An incoming forward visit
-selects its installed local predicate, reads the relevant state, computes needed
-values and follows the selected successor. A false result ends the path unless the
-program explicitly supplies an alternative. In an AND chain, arrival embodies the
-preceding successful tests; general branching follows the edge actually selected.
-
-Local work uses RTOS tasks with statically bounded storage and independent
-traversal values. Task creation/reuse is a kernel implementation concern, never
-appliance firmware responsibility or a global graph scheduler. Radio waiting must
-not hold the appliance lock. Existing IRQ-driven radio task wakeups are a foundation;
-installed-program dispatch uses this same task machinery.
-
-### The read and write head
-
-The evaluator performs local work along the authored path. An OR branches around its
-second predicate when the first is true and visits the second when the first is false; an
-AND reaches the second only after the first is true. The chosen edge carries the Boolean
-decision, without retaining that decision as another operand. The read/write head carries
-only values still needed downstream. Each visited owner contributes its local inputs and
-greedily completes calculations whose inputs have become available; the final input owner
-sends the most reduced result possible. The mutation owner can pass that result to its
-native function or finish a calculation requiring its own local state.
-
-The compiler determines the peak live carried values, their widths and byte capacity for
-the emitted traversal, assigns operand locations and reuses them after their last use.
-This is neither a universal one-operand limit nor one slot per predicate. For (a - b) \* c
-encountered in that order, one carried location can hold a, then a - b, then (a - b) \* c
-if those intermediates have no later use. Each traversal owns its own working values;
-overlapping traversals never overwrite one another. Every path reaching an operation must
-supply its operands, including short-circuit paths. The existing native-call payload limit
-does not define this head ABI. General concurrent joins require an explicit bounded design
-and are not implied by serial predicate branching.
+Prefer peripheral-to-peripheral events over CPU interrupts where the target can implement
+the required behavior. An IRQ that merely wakes a task to reread and compare every state
+is not evidence of a hardware circuit realization. Required CPU handlers are finite and
+event-driven, using the inherited RTOS notification/task mechanisms. Blocking hardware
+operations and radio waits must not run inside an ISR or hold an appliance-wide lock.
+There is no continuous program scan and no global scheduling of successful circuit tails.
 
 ### Historical inputs and current calculations
 
-Typed calculations over current exposed states and the head's temporary working values
-are ordinary program work. Historical inputs require a separate declared retention
-capability. Installing an automation must not silently add history getters to an
-appliance's surface or make its correctness depend on a volatile buffer that disappears
-after reboot. Automation-authored history maintenance is deferred.
+Current calculations over established signals are ordinary circuit work. Historical
+inputs require a separate declared retention capability. Installing a circuit must not
+silently add history getters to an appliance or depend on an ephemeral history that
+vanishes after reboot. Automation-authored history maintenance remains deferred.
 
 An optional recording vertex may retain qualified network deltas and expose historical
-information through its own surface. That does not require every appliance to record raw
-hardware samples or invent observations at a fixed sampling interval. Missing information
-cannot be substituted with zero or false. A public receive call log is deferred as well;
-it is not required for addressed dependent delivery and does not establish a historical
-query service.
+information through its own surface. It does not require every appliance to log raw
+samples indefinitely. Missing history is not zero/false. A public receive call log is
+also deferred; it is not a prerequisite for addressed dependent delivery.
 
-### Mutation and continuation
+### Mutation and independent changes
 
-A successful path reaches a binding to a local mutation handle. The node invokes that
-function with the computed arguments. There is no central queue holding successful tail
-pointers while unrelated chains finish. Local processor scheduling or link availability
-may delay a visit, but a one-condition program does not wait merely because another
-program has eight conditions.
+The endpoint's installed binding determines the physical task or finite native function
+and its active/resting targets. Packet acceptance, command completion and physical
+achievement remain different facts. A physical completion dependency uses an observed
+state or another explicitly declared result; receipt alone cannot supply it.
 
-A mutation can be followed by another directed action edge. The program must specify
-whether continuation depends on command acceptance, a returned result, or a subsequent
-observed state change. Receipt of a packet, successful function return, and physical
-achievement of the desired state are different facts. A physical completion dependency is
-represented by the relevant observation or declared operation semantics, not inferred from
-a transport acknowledgement.
+Independent connections and nodes operate concurrently. Accepted meaningful circuit
+updates retain their ordering/delivery obligations. A later update does not cancel a
+hardware function already running, and a long function does not block the whole network.
+Resulting appliance changes feed their own connected circuits. There is no global atomic
+execution lock or automatic whole-program supersession.
 
-As drivers observe resulting state changes, those changes activate their own dependents in
-the ordinary way. No node needs to know the complete automation to perform its local part.
-A path reaching its last mutation means that its invocation work has progressed; it is not
-proof that every physical consequence has already completed.
-
-### Independent deltas and concurrency
-
-A later change is another valid cause and starts its own dependent traversal, including
-when that program is already traversing. If it arrives before a predicate is read, the
-predicate reads the newly exposed local value; if it arrives after the predicate has
-passed, that decision is not unwound. There is no cancellation, supersession, program-wide
-atomic execution lock or global barrier waiting for earlier physical effects. Native
-operations and shared local state retain their ordinary synchronization. Resulting
-physical observations activate their dependents by the same rule.
-
-Each node serializes access where its local state or mutation interface requires it.
-Independent paths and independent nodes can execute concurrently. The correctness of a
-program must not depend on the accidental order in which unrelated paths happen to run;
-admission and runtime semantics must state any required ordering or interlock.
+Repeated reports that leave a circuit's effective output unchanged are not new actions.
+Coalescing distinct already-accepted target transitions is a separate semantic choice;
+the existing latest-target policy for manual slider streams does not silently authorize
+it for installed circuits. Queue bounds and the handling of a busy physical endpoint
+must be stated by the implementation.
 
 ## A common peer delivery protocol
 
@@ -421,37 +480,90 @@ addresses a particular binding, possibly through multiple peers. A vector is not
 of direct radio adjacency. Established relay bindings make its path explicit without
 requiring the compiler to precompute route permutations.
 
-Delivery responsibility follows actual installed dependencies and other explicitly
-addressed recipients. Each registered source change activates its own resident dependency
-links; it does not require every vertex to receive a copy of that change. Other vertices
-do not maintain a global dependency table or infer relevance from overheard traversal.
-The source must transmit a change notification along each affected program's upstream
-path. The current implementation calls this addressed notification an upstream activation.
-If it does not reach the next remote evaluation owner, that owner cannot continue toward
-the head. This is outward delta propagation; local registration alone is insufficient.
-The separate best-effort `StateChanged` broadcast carries an attribute/value notice for
-observation. Distinguishing these wire classes must not be mistaken for independence
-from change notification or from its delivery guarantee.
+Delivery responsibility follows actual installed dependencies and explicitly addressed
+recipients. An observation broadcast is not the sole delivery path for an automation's
+required inputs. Circuit updates address the next bound owner; that owner establishes
+its input and produces any resulting output changes. A relay forwards without evaluating
+the condition or learning every circuit in the network.
 
-The same delivery protocol applies to upstream change activation, forward predicate
-traversal, action traversal, installation control, and safety traffic. Evaluation is not
-an unreliable exception that may silently disappear after the head receives an activation.
-Priorities and retry budgets can differ by declared message class without changing what a
-receipt proves.
+Direct delivery with bounded retries is the first path where the peer is reachable;
+relay recovery may be needed when it is not. The precise retry budget and transition to
+alternative routes are transport policy, not implied by the circuit definition. A
+physical broadcast used for relay discovery does not turn the addressed circuit update
+into an instruction for every listener. This revision does not select a new routing policy.
 
-| **Logical message** | **Meaning** |
-|----|----|
-| DELIVER | Addressed work for a target binding and phase, with the traversal identity, revision, bounded payload, and any retained operand. |
-| RECEIVED | The named target accepted the specified delivery; its correlated receipt establishes acceptance of this handoff. |
-| COMPLETE | A declared unit of work has finished, including any child work covered by its accounting contract. This is stronger than receipt. |
-| FAULT | A declared execution, availability, resource, or safety condition failed, with the scope and response defined by the binding contract. |
-| HEALTH | Fresh evidence for an active safety dependency and protection instance, not merely evidence that a processor is alive. |
-| INSTALL and ACTIVATE | Stage and verify a program revision, then change admission eligibility under the installation protocol. |
+| Logical message | Meaning |
+| --- | --- |
+| STATE | Exposed appliance-value notice for observation. |
+| CIRCUIT | Addressed connection update: established continuity and any relevant typed values, with identity/order/revision information. |
+| RECEIVED | The named target accepted that update; a MAC ACK from an intermediate hop is insufficient. |
+| COMPLETE | A declared operation completed; this is stronger than delivery and distinct from physical feedback. |
+| FAULT / HEALTH | Declared failure or fresh evidence for an active protection instance. |
+| INSTALL / ENABLE | Apply validated compiled configuration and control the head's enabling signal. |
 
-These names define semantic distinctions, not a frozen packet format or six mandatory wire
-opcodes. Several may share an envelope or fit in one fixed-size frame. The wire ABI must
-specify identity, target, message class, revision, payload bounds, authentication,
-integrity checks, and fragmentation where necessary.
+These names distinguish meaning, not mandatory opcodes or finalized byte layouts. A
+continuity value needs one bit, but the packet still needs enough binding and delivery
+information to address the right connection and reject duplicates or stale incarnations.
+Binary framing, bounds, integrity and any fragmentation remain kernel responsibilities.
+
+### Composable channel policies
+
+One common transceiver serves logical channels. A logical channel binds a message
+definition/codec, the identity of its stream, bounded storage and a composition of
+receive policies. Channels share the physical transport; they are not separate
+radio drivers, tasks or RF frequencies. Kernel services establish these bindings.
+Appliance implementors do not select network policies or construct messages.
+
+The message definition supplies encoding/decoding and the metadata needed by its
+selected policies. The common mechanism admits, stores and delivers messages;
+service handlers act on accepted data without recreating sequence/duplicate rules.
+The basic policies are:
+
+| Policy | Meaning | Required evidence |
+| --- | --- | --- |
+| Unique | Accept an identified message or piece at most once within its stream. A duplicate cannot cause repeated delivery or execution. | An accepted sequence or occupied position in a bounded indexed receive window. |
+| Temporal | Register a logical update only if newer than the last registered update for the corresponding owned attribute or connection. Discard older and equal arrivals; do not wait for gaps or resequence. | The sequence associated with that current registered state. |
+| Complete | Collect every position in a declared finite transmission before delivering the assembled object. Pieces may arrive out of order; their individual age is not grounds for rejecting a missing position. | Declared extent and accepted-piece coverage, plus successful object verification. |
+
+All message channels use Unique. State notices, continuous control and evaluation/
+execution updates compose Unique + Temporal. Program-fragment and firmware-image
+transfers compose Unique + Complete. Existing integrity and firmware-authenticity
+verification remain in their respective owners; completeness alone does not authorize
+installing or booting an image. These are required semantics, not claims that the
+current handlers already implement a common channel.
+
+The fundamental metadata is the originating stream/binding, logical update identity
+and sequence, and, for a multipart object, piece position/extent and declared total.
+A source may use one transmit counter; each registered attribute still compares
+against the sequence of its own value. No wall clock or system-wide ordering is
+required. Counter reuse/wrap and stream re-establishment belong to the common
+channel implementation, not individual evaluators.
+
+Composition must preserve the distinction between an update and pieces of that
+update. If Temporal and Complete are combined, Temporal applies to the logical
+object version; Complete tracks coverage within it. Receiving piece 9 never makes
+missing piece 8 obsolete. Policies are fixed for an established channel and their
+combination is validated against the message definition before use.
+
+Policies share acceptance evidence: Unique + Temporal can use the same last-accepted
+sequence, and Unique + Complete can use the same occupied-position map. They do not
+each allocate an independent history or payload queue. Indexed storage is bounded;
+a large firmware transfer may use flash and a bounded receive window rather than
+requiring an image-sized RAM allocation. Protocol codecs and storage bindings may
+differ while the policy mechanism remains common.
+
+A transmission's identity and contents are immutable once issued. Retries use that
+same logical message or piece; new state receives a new identity/sequence. Integrity
+is verified before acceptance. Advance acceptance state only after the receiving
+storage accepts responsibility, so Busy or a failed write cannot make a retry look
+already received. A duplicate may repeat an acceptance response without repeating
+delivery to the consumer.
+
+Temporal rejects newly arriving stale data; it does not preempt already-running
+native work or retroactively cancel accepted changes. Distinct increasing updates
+that arrive in order remain distinct accepted changes. Manual-control replacement
+of pending intent is the separately declared behavior below, not a consequence of
+Temporal. Evaluation/branch logic is unaffected by these receive policies.
 
 ### Continuous native control
 
@@ -459,7 +571,7 @@ Continuous scalar control is a required core kernel communication primitive. A p
 such as the tablet can maintain an addressed control relationship with an existing
 native transformer and send successive typed arguments while receiving state feedback.
 Dragging a dimmer slider is the immediate use case. It needs no installed automation,
-nucleus, appliance-specific stream handler or change to the current traversal model.
+nucleus, appliance-specific stream handler or installed automation.
 
 The caller supplies the destination, native handle and argument. The kernel owns binary
 framing, correlation, ordering, bounded flow control, delivery recovery and dispatch to
@@ -500,53 +612,44 @@ The component documentation owns the bounded session, expiry and wire details.
 
 ### Dependent delivery and acceptance receipts
 
-The source owner knows its local dependent entries from the installed graph. Activation
-follows their upstream links toward the head; forward evaluation follows the selected
-successors. A transport relay forwards toward the named owner without interpreting the
-predicate or deciding whether the change matters. The destination validates and accepts
-its own bound work. Observing another traversal is not substituted for that receipt.
+The sender retains an addressed circuit update until its named receiving owner accepts
+it or the declared delivery policy reports a failure. The receiver accepts responsibility
+for establishing that input and delivering any resulting output changes to its own
+dependents. Relays need no global dependency census. Observing unrelated traffic is not
+evidence that the intended connection received its update.
 
-The current holder retains each handoff until the named evaluation owner accepts it.
-Transport-hop acknowledgment proves only frame reception at that hop. After accepting
-work, the next evaluation owner is responsible for its own onward handoffs. Neither the
-origin nor a relay needs a network-wide recipient list. Reaching the head is acceptance
-there, not proof that the tail has executed or every other dependent has received work.
+Retries retain identity and ordering. A lost acceptance receipt is answered from retained
+evidence without repeating processing. Changing the radio path does not turn the same
+update into a fresh transition. Unique + Temporal prevents an old high from overwriting
+a newer registered low. Older arrivals are discarded, without resequencing; this does
+not cancel an earlier accepted evaluation. The concrete bounded channel format remains
+implementation work. A finite retry budget does not prove eventual delivery after an
+unbounded outage.
 
-Requests and receipts have stable correlation across retries. A lost request is retried;
-a lost acceptance receipt is answered from retained acceptance evidence without repeating
-processing. Receipts do not require another chain of receipt acknowledgments. The current
-Release operation frees retained evidence after the sender has learned acceptance; a lost
-Release does not revoke acceptance or block the receiver's admitted work.
+Capacity is explicit. Busy leaves work with its sender, and accepted work cannot be
+evicted to admit another update. Local overflow is reported rather than represented as
+lossless acquisition. Incarnation and storage-reuse identity prevent delayed packets
+from binding to a different connection. These obligations reuse the kernel's delivery
+owners, but the present visit-reservation protocol is not yet a circuit-update protocol.
 
-Fixed capacity remains explicit. Busy leaves work with its sender for later retry. Accepted
-work is not evicted to make room for another visit. Distinct local changes remain distinct
-causes; the existing bounded local-cause overflow report is not a lossless-delivery claim.
-Reboot and reused-storage identities prevent stale tickets from becoming new invocations;
-uncertain acceptance is reported rather than guessed. These rules do not guarantee
-exactly-once physical effects across arbitrary crashes.
-
-Universal delta dissemination and a standardized public receive call log are deferred.
-They must not become prerequisites for this addressed delivery path. A future explicit
-consumer of observations would need its own receiving relationship and delivery policy;
-the existing best-effort broadcasts do not silently provide reliable subscriptions.
+General observation broadcasts remain best-effort. A consumer requiring dependable
+observations needs an explicit receiving relationship. Universal dissemination, public
+receive logs and a distributed historical ledger remain deferred.
 
 ### Completion and uncertain outcomes
 
-Receipt at the head establishes delivery to that head. It does not prove that all relay
-traffic is quiet, that the execution has reached its tail, or that the peripheral has
-reached the desired state. Finite distributed work can use local accounting of spawned
-work and returned completion signals to establish termination. Dijkstra–Scholten provides
-a relevant foundation under its stated communication assumptions \[1\]. Its result must
-not be claimed for a lossy, rebooting implementation without the additional required
-protocol.
+A maintained circuit has no overall traversal-complete event: it remains installed and
+responds to its inputs. Individual deliveries and finite native operations still have
+completion or failure outcomes. Their evidence must not be confused with physical
+convergence or network-wide quiescence. Termination accounting such as
+Dijkstra-Scholten concerns finite work under stated assumptions, not proof that a
+maintained circuit has permanently finished [1].
 
-A target can invoke a function and lose power before its acknowledgement is received.
-Without durable operation evidence or a suitable operation-specific property, another node
-cannot infer whether invocation happened \[6\]. The baseline does not introduce a mutation
-ledger or promise exactly-once physical effects across arbitrary crashes. The
-implementation must state its bounded duplicate guarantee and report unresolved outcomes
-where that guarantee no longer applies. A fresh observation is a fresh change, not
-evidence that an old request should be replayed.
+A target can apply an output and lose power before its receipt is returned. Without
+durable operation evidence or a suitable operation-specific property, another node cannot
+infer whether the action happened [6]. The baseline does not introduce a mutation ledger
+or promise exactly-once physical effects across arbitrary crashes. Recovery establishes
+current inputs and reconciles configured outputs; it does not blindly replay old commands.
 
 ## Adaptive relay bindings and bounded routing state
 
@@ -556,7 +659,7 @@ edges or messages in flight. Current protocol capacities belong in the component
 documentation.
 
 Initially, broadcast and opportunistic relay discover usable paths. Repeated useful
-traversal supplies evidence about which connections are worth retaining. Preferred paths
+delivery supplies evidence about which connections are worth retaining. Preferred paths
 become resident in relay bindings, so ordinary traffic increasingly follows vectors
 through established neighbors. Loss of a relay returns the affected path to discovery or
 repair. Broadcast becomes less prominent as useful connectivity stabilizes; it remains
@@ -576,7 +679,7 @@ and uncertainty must be retained when estimating one-way latency. Public log ins
 not required to measure marginal communication cost.
 
 A relay weight reflects the benefit of retaining a particular connection under scarce
-local capacity. Useful evidence includes delivery success, traversal latency,
+local capacity. Useful evidence includes delivery success, delivery latency,
 transmissions or energy spent, demand, the quality of alternatives, and replacement cost.
 The exact formula, quantization, decay, and comparison protocol remain open. Weight is a
 compact estimate derived from observed use, not a large learned representation or a claim
@@ -656,7 +759,7 @@ open because the command failed, the safety obligation remains active.
 
 ![Protection](assets/architecture/protection.png)
 
-Figure 3. Conditional protection follows the observed open state. An outstanding close
+Figure 2. Conditional protection follows the observed open state. An outstanding close
 command does not establish closure. A fault response can continue driving closure while
 protection remains required.
 
@@ -670,10 +773,10 @@ arbitrary communication delay from failure without additional bounds \[4\]. The 
 model must include detection and actuation latency; watchdog protection bounds the
 response to lost evidence rather than making remote failure instantaneous.
 
-Safety obligations can outlive the traversal that opened the state. Program retirement
+Safety obligations can outlive the circuit transition that opened the state. Program retirement
 must therefore retain or transfer the active protection binding until closure or an
 equivalent validated protection handoff. It must not free the watchdog merely because the
-last predicate traversal ended. How active protection is detached from a retiring program
+triggering update was processed or a circuit was disabled. How active protection is detached from a retiring program
 revision without retaining that entire revision is an explicit installation and lifetime
 obligation.
 
@@ -681,122 +784,86 @@ obligation.
 
 ### Vertex-owned fragment sharing
 
-The compiler composes the intended logic, partitions it by ownership of its inputs
-and hardware operations, and sends each vertex its local fragment and graph
-connections. It does not inspect a remote fragment catalog to arrange reuse or
-remain online to reconcile adjacency. An automation is a description of graph
-behavior, not a separate runtime entity owning copies of fragments on each vertex.
+The compiler composes logic, partitions it by ownership, and supplies each vertex's
+prepared components and connections. It does not inspect a global catalog of installed
+fragments to arrange deduplication or remain online to coordinate execution. The vertex
+matches equivalent local computation/configuration during installation.
 
-Each vertex performs local matching during installation. When the same computation
-already exists, it retains that computation once and adds the incoming fragment's
-paired upstream/downstream references. The pairs remain associated; two unrelated
-upstream and downstream lists must not create new cross-connections. Removing a
-path removes its relevant reference pair. Other pairs keep the shared computation
-installed; removal of the final pair permits reclaiming the computation once
-local users of its storage have been detached. Appliance states and native
-functions keep their existing ownership and are not removed with a graph path.
+A shared component retains paired upstream/downstream references. Different pairs retain
+their own established upstream continuity, typed inputs, output state and delivery
+identity wherever those differ. Receiving an update for one pair cannot activate another
+pair merely because they share a predicate or physical upstream peer. A local physical
+change can affect several pairs, each according to its own inputs and authored wiring.
 
-Sharing stored computation does not merge evaluations or their read/write heads.
-A forward evaluation addresses one paired connection and follows only that pair's
-authored continuation, subject to its local predicate/branch result. Sharing the
-computation or the upstream physical vertex does not establish the preceding
-conditions or carried values of another pair. It must not cause execution through
-that other pair. A new local state delta can initiate separate upstream activations
-for multiple affected relationships; each still undergoes its own forward path.
+Removing a pair releases only that relationship. The final user permits reclamation of
+the shared component when no active peripheral, DMA operation, accepted delivery or
+protection obligation still uses it. Native appliance states and functions remain owned
+by the appliance, not by a removable automation.
 
 ### Explicit removal
 
-Explicit removal takes effect when that vertex processes the addressed deletion
-command. Ready local evaluations are dispatched in admission order before a later
-command; a computation already executing in that handler is not interrupted by
-another message. Waiting for remote traffic or a hardware function does not block
-all other local events. There is no network-wide execution stack or drain authority.
+An addressed removal takes effect in that vertex's local event order. Local processing
+already underway is not retroactively interrupted by another message. Waiting for radio
+traffic or a native function does not block all local events. There is no network-wide
+execution stack or deletion authority.
 
-Removal detaches the selected connections and their pending source notifications.
-Subsequent continuations addressed to them stop there. A native hardware function
-already running finishes; its detached continuation cannot follow the removed
-edges. A call that has not started is canceled. A message already delivered beyond
-this vertex cannot be recalled; another vertex applies deletion when it receives
-its own command. This is distinct from replacement's deliberate drain policy below.
-Storage reuse must preserve generation identity so delayed traffic cannot bind to
-a new connection occupying the same address.
+Removal disconnects the selected pair and its event routes. Later traffic for that
+incarnation cannot act on reused storage. A native function already running finishes;
+unstarted work for the removed connection is canceled. Hardware/DMA resources cannot be
+reused while their previous owner can still touch them. Work already delivered to another
+vertex cannot be recalled by local deletion.
+
+Normal high-to-low signal propagation applies the declared resting target. The exact
+ordering of a requested rest transition, local disconnection and deletion at other owners
+still needs a circuit lifecycle rule; explicit deletion must not be represented as an
+already implemented network-wide rest or drain operation.
 
 ### Replacement lifecycle
 
-A program replacement follows firmware-install reasoning: the old revision remains active
-until the new one is installed and compatibility is established. The delegate stages the
-new fragments in available fixed storage, obtains installation evidence from their
-required owners, and only then permits new activations to enter the new revision. Receipt
-of bytes alone is not proof of a valid installation.
+Stage a candidate's prepared configuration without disturbing the incumbent. Validate
+bindings, resource needs and required protection before activation. New and old
+connection identities must not be mixed as nodes receive installation messages at
+different times. A failed staging attempt leaves the incumbent available.
 
-| **Phase** | **Required behavior** |
-|----|----|
-| Stage | Receive fragments without disturbing active bindings; validate identity, IR, references, capacity, and authorization. |
-| Establish readiness | Verify that every required semantic fragment and any required protection mechanism can participate in the new revision. |
-| Switch admission | At the program head, admit subsequent activations to the new revision once the installation condition is satisfied. |
-| Drain old work | Previously admitted old traversals continue using compatible old fragments and their associated delivery state. |
-| Release old bindings | Return each old fragment's storage to the fixed pool as soon as no admitted old work or retained safety obligation can use it. |
-
-A traversal must not evaluate half an old program and half a new one because nodes
-switched at different moments. Revision selection at admission and compatible references
-along the path provide the required model. This does not require every node to flip a
-global clock bit simultaneously. Consistent network-update research is relevant to staging
-and preserving one configuration per traversal, though its deployment model is not adopted
-wholesale \[5\].
-
-![Replacement](assets/architecture/replacement.png)
-
-Figure 4. Hard admission cutover with independent draining. The new revision accepts new
-work while admitted old work finishes. Old storage is released promptly when its actual
-obligations end.
-
-No historical copy is retained for sentiment or indefinite rollback. A failed staging
-attempt leaves the incumbent active. Once old work and required protection have cleared,
-its storage is reusable. Releasing a fixed slot is a lifetime operation; it does not
-require heap allocation or a general-purpose object reclamation framework.
+The previous model's policy of draining whole admitted traversals cannot simply be
+renamed for maintained signals. Cutover must account for established input levels,
+pending updates, active/resting output transitions, in-progress native operations and
+shared hardware resources. The exact cutover and output reconciliation protocol remains
+open. Consistent-update research [5] is relevant but does not choose that protocol.
 
 ### What still needs a protocol
 
-Head relocation, changes to the upstream dependency set, partitions during activation, and
-a crash between durable commit and admission cutover need explicit rules. A local
-head-pointer exchange is sufficient only when those surrounding preconditions have
-actually been established. Likewise, retirement requires evidence that no accepted old
-delivery can later reference a reused slot. A timeout alone is not proof of drain unless
-the protocol's delivery and identity bounds make it so.
+Resource relocation, versioned circuit installation/update encoding, input baseline
+exchange, enablement/cutover, owner replacement and restart reconciliation require concrete
+formats before implementation. An old compiled image or a saved high bit is not proof
+that its peer input is current. No new API should encode an arbitrary choice here merely
+to demonstrate packet movement. [The implementation plan](PROGRAM_DESIGN.md) identifies
+the decisions that must be resolved for the first circuit implementation.
 
 ### Enablement is part of the graph
 
-The graph should represent a program's enabled or disabled admission state at its head or
-incoming activation gate. The selected physical layout is still to be fixed, but it must
-avoid a separate global AutomationID-to-Enabled lookup on every traversal. A disabled
-program retains its relationships, definition, and place in admission consistency
-checking; disablement does not remove it from the mathematical system.
+The head retains the enabling signal. Local predicates may be true while the circuit is
+disabled; that truth cannot energize its outputs. Disabled definitions remain installed
+and participate in consistency/resource accounting. Enabling establishes the outputs
+from valid current inputs. Repeating the same accepted enable command is not another
+edge. Disabling produces a low signal whose ordinary propagation reaches the declared
+resting targets; it does not erase the graph or preempt a running hardware function.
 
-Disablement lasts until explicit resume. Resume changes the resident admission state and
-initiates ordinary evaluation of the currently applicable conditions. Manual mutation
-remains a direct authorized invocation; it does not imply a timed hold or an automatically
-inserted expected-starting-state guard. A later legitimate automation activation can
-change the peripheral again.
+Manual control remains an authorized direct operation or control stream, without an
+implicit hold timer or invented expected-starting-state guard. A later meaningful circuit
+output transition can change the appliance again. An unchanged high circuit does not
+repeatedly override a manual command through polling.
 
-Initial enablement likewise admits one fresh evaluation before ordinary delta-driven
-operation. Repeated delivery of the same enable request must not manufacture additional
-enablement evaluations.
-
-Reboot recovery temporarily uses fresh activations once the restored local state/time
-are available. Recovery at a dependency-bearing binding follows its ordinary upstream
-relationships; it cannot rely on the head also rebooting. The enabled head admits the
-resulting forward evaluation with current inputs, never by replaying an interrupted
-mutation. These independently originated recovery activations can produce repeated
-evaluations of the same program as its participants return. A single head does not
-deduplicate them, and ordinary delivery duplicate suppression does not merge them.
-Coordinated reconciliation after an outage remains deferred. This temporary policy
-does not establish once-per-program recovery across a network restart.
-
-The ordering of an explicit disable or delete against an already admitted traversal needs
-a precise lifecycle contract. Ordinary state-change supersession is excluded regardless of
-that decision. No lifecycle operation can undo a mutation already registered with a
-driver, and disabling a program must not erase an active safety obligation while its
-protected state is still open.
+After reboot, restore the compiled configuration and enabled setting and establish
+physical inputs. Circuit activation starts LOW; do not restore a saved adjacent
+activation/value snapshot. Only the head can originate initial activation, and
+only while its enabled predicate is true. Other vertices remain LOW until an
+upstream HIGH and their own evaluation permit propagation. Do not add a forced
+upstream-state announcement on connection establishment or replay an interrupted
+mutation. The prior independent upstream recovery evaluations are a property of
+the existing engine, not this head-originated initialization model.
+No lifecycle operation can undo a completed physical action or drop protection while
+the protected state remains open.
 
 ## Persistence reconstruction and recovery
 
@@ -828,8 +895,8 @@ This is ordinary region protection and does not imply high-frequency flash write
 
 ### Boot reconstructs relationships
 
-Boot establishes the local driver surface, reconstructs the graph through saved-reference
-traversal, binds old identities to new addresses, and resolves foreign peer bindings under
+Boot applies the prepared local surface/circuit setup, reconstructs saved relationships,
+binds durable identities to current resources, and resolves foreign peer bindings under
 the current incarnation rules. Execution must not dereference unbound locations. Persisted
 installation state determines which revision is eligible, while incomplete staging must
 not masquerade as a complete replacement.
@@ -837,7 +904,7 @@ not masquerade as a complete replacement.
 Drivers obtain the current actual peripheral state. They do not recover an old desired
 state by replaying unfinished mutation requests. Newly observed state then participates in
 ordinary change propagation. A configured schedule may author recovery behavior for a
-missed activation, but that is evaluation of a valid current condition, not blind replay
+missed transition, but that is reconciliation of valid current inputs, not blind replay
 of an unconfirmed old command.
 
 ### Recovery while protection may be required
@@ -856,8 +923,9 @@ an unrelated new decay anchor or claim that post-crash observations are known wh
 are not.
 
 Distributed installation recovery must reconcile durable fragment readiness with admission
-state and old-work drainage. Local durable writes alone do not prove a globally complete
-installation. The necessary peer reconciliation belongs to the installation protocol,
+state, pending update ownership and physical resource retirement. Local durable writes
+alone do not prove a globally complete installation. The necessary peer reconciliation
+belongs to the installation protocol,
 without requiring a replicated ledger of ordinary peripheral mutations.
 
 ## Synthesis admission and continual refinement
@@ -880,8 +948,8 @@ Checking only that two desired final states can coexist is insufficient when the
 intermediate actions can interfere. The admission model must cover the allowed
 interleavings, command effects, and declared safety dependencies relevant to the emitted
 program. Where safety requires a condition to hold during an open interval, the execution
-needs the corresponding interlock or watchdog semantics. A prior predicate read is not
-evidence that a remote value remains unchanged indefinitely.
+needs the corresponding interlock or watchdog semantics. A retained upstream high is not
+evidence of fresh remote state after its required delivery/health relationship is lost.
 
 ### A hypothesis can improve
 
@@ -944,14 +1012,15 @@ elapsed intervals, retries, and watchdog deadlines. Those local measurements do 
 establish one globally simultaneous state of the network.
 
 Every vertex kernel supplies the same local commissioned time and calculated solar
-capabilities. The program binds a time or solar predicate at the evaluation vertex where
-it belongs in the authored order; neither requires a special clock/solar vertex or a
+capabilities. The program binds a time or solar predicate at the owner where
+it belongs in the authored circuit; neither requires a special clock/solar vertex or a
 broadcast for every temporal boundary. Commissioning supplies a UTC reference and
 approximate location. Local elapsed counters and calculated boundaries drive deadline
-records; an expiry generates an internal delta at its predicate, which follows the normal
-upstream-to-head activation path. Forward traversal reads that predicate at its normal
-position. The kernel arms the next relevant deadline rather than repeatedly scanning every
-program or comparing the clock once per second.
+records; an expiry changes the local temporal signal and updates its connected circuit
+outputs. A closed time window propagates low toward its resting targets. The kernel arms
+the next relevant deadline rather than repeatedly scanning every program or comparing
+the clock once per second. Calendar/solar boundary computation remains bounded support
+work; it is not evidence that all such mathematics runs in a hardware comparator.
 
 Civil-time predicates such as 20:00–22:00 follow the installation's local civil
 time, including daylight-saving changes. Commissioning must therefore supply the
@@ -983,22 +1052,18 @@ requirement. Local sequence numbers and counters still need bounded wrap and reu
 
 ### Fixed capacity is part of correctness
 
-Use fixed receive and transmit rings, fixed in-flight delivery slots, fixed
-installed-binding storage, bounded temporary operands, and the configured relay pool.
-Capacity accounting is local and concrete. This does not require a general dynamic cache
-or distributed object allocator.
+Admission accounts for actual peripheral channels, comparator/timer instances, shared
+resources, signal/DMA storage, transmit/receive rings, accepted updates and relay capacity.
+Hardware resource exhaustion is as real as SRAM exhaustion. Equivalent computation may
+share resources only when doing so preserves independent connections and input/output
+semantics. Do not reserve arbitrary large scratch buffers for every potential fragment.
 
-The admission policy preserves accepted work. A receiver without free execution capacity
-returns Busy before accepting a visit; its sender retains that visit for retry. The
-bounded local-change buffer reports overflow when full rather than evicting earlier
-pending activations. This is distinct from the outward observation transport ring's
-existing hard eviction. Physical state changes can arrive faster than an overloaded
-link drains, so backpressure alone cannot make arbitrary arrival rates lossless.
-
-This architecture treats separately registered changes as distinct activations. An
-implementation that coalesces them under pressure changes that semantic contract and needs
-explicit authorization in the protocol. Fixed memory is compatible with bounded delivery
-guarantees; it is not a proof of lossless delivery under unbounded load.
+Preserve accepted meaningful updates. A receiver without capacity reports Busy before
+acceptance; its sender retains the update for retry. Bounded local storage reports
+overflow rather than silently evicting earlier required transitions. Distinct accepted
+circuit-output transitions are not duplicate packets. Coalescing them requires an
+explicit policy; the exception for manual continuous-control streams remains separate.
+Backpressure cannot make arbitrary physical change rates lossless under a stalled link.
 
 ### Processor and platform choices
 
@@ -1012,9 +1077,9 @@ described above; persisted graph references and appliance-image compatibility
 retain their separate requirements.
 
 Local multiprocessing, threads, interrupt work, and cooperative tasks should be chosen
-where they simplify correctness or materially improve throughput. Serial evaluation of one
-path does not require a single-core machine, one global execution thread, or a new
-operating-system process for each chain. The earlier central-host processor choice does
+where they simplify correctness or materially improve throughput. Configured peripheral
+paths need no software process for each circuit, and finite native operations need no
+new scheduler beyond the inherited RTOS. The earlier central-host processor choice does
 not dictate MCU selection for every peripheral node.
 
 Hard real-time claims require a deployment profile: maximum local execution costs,
@@ -1051,8 +1116,8 @@ coupled to one user interface.
 ## Architectural integrity
 
 Execution integrity requires that each accepted delivery addresses the intended binding
-incarnation, that an admitted traversal uses one compatible program revision, and that a
-false predicate cannot reach its success continuation. Transport integrity requires that
+incarnation, that circuit updates remain within one compatible connection revision, and that
+a false/unknown required condition cannot produce a valid high output. Transport integrity requires that
 duplicate handling preserve distinct changes, that accepted work has a defined completion
 or fault outcome, and that obsolete packets cannot act on a reused slot.
 
@@ -1108,7 +1173,7 @@ distinguish a failed peer from an arbitrarily delayed one.
 **\[5\] M Reitblatt and colleagues Abstractions for Network Update 2012**
 
 A reference for staged replacement that preserves a coherent configuration for an
-individual traversal. Its controller architecture is not a prescription for Lattice's peer
+individual path. Its controller architecture is not a prescription for Lattice's peer
 topology.
 
 [Primary source](https://www.cs.princeton.edu/~dpw/papers/network-update-sigcomm12.pdf)

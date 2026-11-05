@@ -24,7 +24,12 @@ pub mod testing;
 ))]
 pub(crate) mod receive;
 
-#[cfg(any(test, feature = "port-nrf52840", feature = "port-esp32c6"))]
+#[cfg(any(
+    test,
+    feature = "firmware-update",
+    feature = "port-nrf52840",
+    feature = "port-esp32c6"
+))]
 pub(crate) mod mac;
 
 /// Maximum MAC frame size, excluding the hardware checksum.
@@ -43,3 +48,5 @@ pub enum Error {
 
 /// Shared normalized communication cost and internal measurement support.
 pub mod cost;
+
+pub(crate) mod channel;
