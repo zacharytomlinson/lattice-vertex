@@ -1,12 +1,12 @@
 //! Persistent owner-local program definitions and native dependency wiring.
-//! Installation is distinct from admission of a distributed traversal.
+//! Installation is distinct from admission of a maintained connection.
 
 pub(crate) mod activation;
 mod evaluation;
+mod execution;
 mod image;
 use image::Definition;
 pub(crate) mod runtime;
-mod traversal;
 mod validation;
 
 use super::appliance::Native;
@@ -946,7 +946,7 @@ impl Configuration {
             return Reply::status(Status::Binding);
         }
         if matches!(request, E::Enable { enabled: true, .. })
-            && traversal::fits(part.definition).is_err()
+            && execution::fits(part.definition).is_err()
         {
             return Reply::status(Status::Bounds);
         }
@@ -1072,8 +1072,8 @@ impl Configuration {
                 }
                 if let Some((target, enabled, revision)) = control.target {
                     self.bytes[target as usize + 2] =
-                        (self.bytes[target as usize + 2] & 0xc0) | if enabled { 3 } else { 0 };
-                    self.initial_pending |= enabled;
+                        (self.bytes[target as usize + 2] & 0xc0) | if enabled { 3 } else { 2 };
+                    self.initial_pending = true;
                     self.bytes[target as usize + 20..target as usize + 24]
                         .copy_from_slice(&revision.to_le_bytes());
                 }
@@ -1102,51 +1102,23 @@ impl Configuration {
     }
     fn recovery(&self, after: u16) -> Option<(u16, lattice_peer_wire::program::execution::Entry)> {
         use lattice_peer_wire::program::execution::Entry;
-        for p in parts(&self.bytes[..self.used as usize]).filter_map(Result::ok) {
-            if p.definition.sources().next().is_none() && !p.definition.records().any(|r| matches!(r,Ok(r) if matches!(r.operation,lattice_peer_wire::program::Operation::Temporal {..}))) && p.offset > after && self.enabled(p.offset)
-            {
-                if let Some(record) = p.definition.head() {
-                    return Some((
+        parts(&self.bytes[..self.used as usize])
+            .filter_map(Result::ok)
+            .find_map(|p| {
+                if p.offset <= after || !self.enabled(p.offset) {
+                    return None;
+                }
+                p.definition.head().map(|record| {
+                    (
                         p.offset,
                         Entry {
                             definition: p.offset,
                             generation: p.generation,
                             record,
                         },
-                    ));
-                }
-            }
-            for s in p.definition.sources() {
-                let at = p.offset + PREFIX as u16 + s.offset;
-                if at > after {
-                    return Some((
-                        at,
-                        Entry {
-                            definition: p.offset,
-                            generation: p.generation,
-                            record: s.entry,
-                        },
-                    ));
-                }
-            }
-            for r in p.definition.records().filter_map(Result::ok) {
-                if let lattice_peer_wire::program::Operation::Temporal { entry, .. } = r.operation {
-                    let at =
-                        p.offset + PREFIX as u16 + p.definition.storage_record(r.offset).unwrap();
-                    if at > after {
-                        return Some((
-                            at,
-                            Entry {
-                                definition: p.offset,
-                                generation: p.generation,
-                                record: entry,
-                            },
-                        ));
-                    }
-                }
-            }
-        }
-        None
+                    )
+                })
+            })
     }
 }
 fn canonical_digest(definition: Definition<'_>) -> [u8; 32] {

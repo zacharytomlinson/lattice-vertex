@@ -1,9 +1,8 @@
 # Local time and solar predicates
 
-The deadline/clock facilities below are implemented. Their current program integration
-uses the software traversal engine. The planned
-[maintained-circuit backend](../../../docs/PROGRAM_DESIGN.md) will consume these
-deadlines as local input transitions instead; no such conversion is claimed here.
+The deadline/clock facilities below feed the software retained-input engine.
+A deadline change reevaluates its local connection using current upstream context;
+it does not initiate a walk to the head. Native code generation remains planned.
 
 Every participating kernel supplies these inputs; an author places a temporal
 record at the evaluation owner where it belongs in the program. There is no
@@ -16,8 +15,8 @@ The installed record and activation entry are described in
 program definitions, using the existing protected flash owner. The peer task
 registers installed temporal sources and waits until the nearest deadline through
 its ordinary RTOS receive timeout. On expiry it refreshes due predicates; a truth
-change enters the same bounded activation storage as native changes. Activation
-travels upstream before normal forward traversal. Neither a short-circuit nor
+change enters the same bounded activation storage as native changes and resumes
+its local Entry. Neither a short-circuit nor
 head disablement removes the underlying temporal source.
 
 There are at most 32 temporal records per vertex. The installer rejects excess
@@ -38,7 +37,7 @@ A spring jump evaluates the window at the new civil time; a skipped window is
 not an invented catch-up action. In autumn a window may become true twice if the
 clock passes through it twice. These are current-state predicates, not cron jobs.
 An anchor correction similarly recalculates current truth. First availability
-establishes a baseline; enable/recovery visits already waiting for time can then
+establishes a baseline; local evaluations already waiting for time can then
 proceed. It does not manufacture an additional baseline delta. Deadline handling
 is bounded by normal kernel/flash servicing latency; there is no historical
 replay of every window missed while the CPU was unavailable.
@@ -105,6 +104,9 @@ other long interrupt masking, and debugger halts remain physical timing limits.
 Neither port currently promises sub-millisecond reference accuracy or a backed RTC.
 
 ## Validation
+
+The physical runs below used the earlier traversal engine. The retained-input
+integration currently has host and target-build checks, not a new hardware run.
 
 Owner-local tables cover Gregorian leap cycles, northern/southern DST edges,
 gaps/folds, civil and polar/solar bounds, numeric codecs, anchor idempotence,

@@ -574,7 +574,7 @@ fn admission_commit() {
     let native = Device::new();
     let mut flash = Flash::new();
     let mut bytes = definition(true);
-    bytes[4..6].copy_from_slice(&(crate::configLATTICE_TRAVERSAL_BYTES as u16).to_le_bytes());
+    bytes[4..6].copy_from_slice(&(crate::configLATTICE_PROGRAM_BYTES as u16).to_le_bytes());
     let mut p = install(&bytes, &native, &mut flash);
     assert_eq!(
         p.admission(E::State {
@@ -724,6 +724,7 @@ struct Running {
     binding: Device,
     value: core::sync::atomic::AtomicBool,
     calls: core::sync::atomic::AtomicU32,
+    last: core::sync::atomic::AtomicBool,
 }
 impl Native for Running {
     fn ready(&self) -> bool {
@@ -743,7 +744,9 @@ impl Native for Running {
     }
     fn invoke(&self, _: &TaskContext, reference: u64, args: &[crate::ir::Value]) -> InvokeStatus {
         assert_eq!(reference, CALL);
-        assert_eq!(args, &[crate::ir::Value::boolean(true)]);
+        assert_eq!(args.len(), 1);
+        self.last
+            .store(args[0].as_bool().unwrap(), Ordering::Relaxed);
         self.calls.fetch_add(1, Ordering::Relaxed);
         InvokeStatus::Invoked
     }
@@ -762,6 +765,7 @@ fn running(value: bool) -> &'static Running {
         binding: Device::new(),
         value: core::sync::atomic::AtomicBool::new(value),
         calls: core::sync::atomic::AtomicU32::new(0),
+        last: core::sync::atomic::AtomicBool::new(false),
     }))
 }
 fn terminal(length: u16) -> Vec<u8> {
@@ -775,320 +779,744 @@ fn terminal(length: u16) -> Vec<u8> {
     b
 }
 #[test]
-fn handoff_admission() {
-    use super::traversal::Traversals;
-    use lattice_peer_wire::program::execution::{Cause, Entry, Request as E, Ticket, CHUNK_BYTES};
+fn signal_admission() {
+    use super::execution::Execution;
+    use lattice_peer_wire::program::execution::{Entry, Request as E, SIGNAL_BYTES};
     crate::port::test_port_reset();
     let context = unsafe { TaskContext::assume() };
     let native = running(true);
-    for length in [
-        0,
-        1,
-        CHUNK_BYTES,
-        CHUNK_BYTES + 1,
-        2 * CHUNK_BYTES,
-        crate::configLATTICE_TRAVERSAL_BYTES,
-    ] {
+    for length in [0, 1, SIGNAL_BYTES, SIGNAL_BYTES + 1, 2 * SIGNAL_BYTES, 512] {
         let mut flash = Flash::new();
         let mut p = install(&terminal(length as u16), native, &mut flash);
-        let mut t = Traversals::new();
-        t.epoch = 7;
+        let mut t = Execution::new();
         t.local = 2;
+        t.epoch = 7;
         let entry = Entry {
             definition: 4,
             generation: 1,
             record: 48,
         };
-        let reserve = E::Reserve {
-            epoch: 7,
-            sender_epoch: 3,
-            sequence: 1,
-            cause: Cause {
-                owner: 1,
-                epoch: 3,
-                sequence: 1,
-            },
-            entry,
-            upstream: false,
-            length: length as u16,
+        let source = Entry {
+            definition: 4,
+            generation: 1,
+            record: 60,
         };
         let mut out = [0; DATA_BYTES];
-        let r = t.receive(&p, 1, reserve, 0, &mut out);
-        assert_eq!(r.status, Status::Receiving);
-        let ticket = Ticket {
-            epoch: 7,
-            slot: r.offset,
-            generation: r.generation,
-        };
         let bytes = vec![42; length];
-        let commit = E::Commit {
-            ticket,
-            digest: Sha256::digest(&bytes).into(),
-        };
-        if length != 0 {
-            assert_eq!(
-                t.receive(&p, 1, commit, 1, &mut out).status,
-                Status::Invalid
-            );
-        }
-        for (i, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
-            let data = E::Data {
-                ticket,
-                offset: (i * CHUNK_BYTES) as u16,
-                bytes: chunk,
+        let chunks = length.div_ceil(SIGNAL_BYTES).max(1);
+        for i in (0..chunks).rev() {
+            let offset = i * SIGNAL_BYTES;
+            let end = (offset + SIGNAL_BYTES).min(length);
+            let request = E::Signal {
+                source,
+                target: entry,
+                epoch: 3,
+                sequence: 2,
+                active: true,
+                offset: offset as u16,
+                bytes: &bytes[offset..end],
             };
             for _ in 0..2 {
+                let reply = t.receive(&p, 1, request, 2, &mut out);
                 assert_eq!(
-                    t.receive(&p, 1, data, 2, &mut out).status,
-                    Status::Receiving
+                    reply.status,
+                    if i == 0 {
+                        Status::Accepted
+                    } else {
+                        Status::Receiving
+                    }
                 );
             }
+            assert_eq!(t.statistics.admitted, u32::from(i == 0));
         }
         t.poll(&mut p, native, &context, 3);
-        assert_eq!(t.statistics.admitted, 0);
-        for _ in 0..2 {
+        assert_eq!((t.statistics.admitted, t.statistics.completed), (1, 1));
+        for sequence in [1, 2] {
+            let end = SIGNAL_BYTES.min(length);
             assert_eq!(
-                t.receive(&p, 1, commit, 4, &mut out).status,
+                t.receive(
+                    &p,
+                    1,
+                    E::Signal {
+                        source,
+                        target: entry,
+                        epoch: 3,
+                        sequence,
+                        active: true,
+                        offset: 0,
+                        bytes: &bytes[..end],
+                    },
+                    4,
+                    &mut out
+                )
+                .status,
                 Status::Accepted
             );
+            assert_eq!(t.statistics.admitted, 1);
         }
-        assert_eq!(t.statistics.admitted, 1);
-        for _ in 0..crate::configLATTICE_TRAVERSALS {
-            t.poll(&mut p, native, &context, 5);
-        }
-        assert_eq!(t.statistics.completed, 1);
         assert_eq!(
-            t.receive(&p, 1, commit, 6, &mut out).status,
+            t.receive(
+                &p,
+                1,
+                E::Signal {
+                    source,
+                    target: entry,
+                    epoch: 3,
+                    sequence: 3,
+                    active: false,
+                    offset: 0,
+                    bytes: &[],
+                },
+                5,
+                &mut out
+            )
+            .status,
             Status::Accepted
         );
+        assert_eq!(t.statistics.admitted, 2);
         assert_eq!(
-            t.receive(&p, 1, E::Release { ticket }, 7, &mut out).status,
-            Status::Ok
+            t.receive(
+                &p,
+                1,
+                E::Signal {
+                    source,
+                    target: Entry {
+                        generation: 2,
+                        ..entry
+                    },
+                    epoch: 3,
+                    sequence: 4,
+                    active: false,
+                    offset: 0,
+                    bytes: &[],
+                },
+                6,
+                &mut out
+            )
+            .status,
+            Status::Binding
         );
-        assert_eq!(t.receive(&p, 1, commit, 8, &mut out).status, Status::Stale);
+        assert_eq!(t.statistics.faults, 0);
+        assert_eq!(t.wait_ms(7, true), None);
+    }
+}
+
+// Exercise delivery through the real update codec, with an optional single loss.
+fn settle(
+    a: &mut Configuration,
+    b: &mut Configuration,
+    ea: &mut super::execution::Execution,
+    eb: &mut super::execution::Execution,
+    na: &'static Running,
+    nb: &'static Running,
+    context: &TaskContext,
+    loss: &mut Option<bool>,
+) -> (u32, u32) {
+    use crate::kernel::appliance::execution as calls;
+    use lattice_peer_wire::program::execution::Request as E;
+    let mut counts = (0, 0);
+    let mut wire = [0; lattice_peer_wire::program::transfer::REQUEST_BYTES];
+    let mut out = [0; DATA_BYTES];
+    for now in (0u32..20_000).step_by(100) {
+        for e in [&mut *ea, &mut *eb] {
+            if let Some((i, _, _, sent)) = e.awaiting() {
+                if now.wrapping_sub(sent) >= 2000 {
+                    e.retry(i, now);
+                }
+            }
+        }
+        ea.poll(a, na, context, now);
+        eb.poll(b, nb, context, now);
+        for reverse in [false, true] {
+            let (from, to, p, sender, receiver, count) = if reverse {
+                (&mut *eb, &mut *ea, &*a, 2, 1, &mut counts.1)
+            } else {
+                (&mut *ea, &mut *eb, &*b, 1, 2, &mut counts.0)
+            };
+            if let Some((i, owner, n)) = from.outgoing(now, &mut wire) {
+                assert_eq!(owner, receiver);
+                assert_eq!(wire[0], 30);
+                *count += 1;
+                from.sent(i, 1, now);
+                let drop = loss.take();
+                if drop != Some(false) {
+                    let reply =
+                        to.receive(p, sender, E::decode(&wire[..n]).unwrap(), now, &mut out);
+                    if drop.is_none() {
+                        from.reply(i, reply, now);
+                    }
+                }
+            }
+        }
+        calls::run_ready(context);
+        if !ea.pending() && !eb.pending() {
+            return counts;
+        }
+    }
+    panic!("bounded delivery did not settle");
+}
+
+fn conditional_pair() -> (Vec<u8>, Vec<u8>) {
+    // A: owned Bool predicate, then B. B: its owned Bool predicate and a call.
+    let mut head = definition(true)[..86].to_vec();
+    head.extend_from_slice(&[25, 0, 5, 2, 0, 0, 0, 2]);
+    head.extend_from_slice(&2u64.to_le_bytes());
+    head.extend_from_slice(&4u16.to_le_bytes());
+    head.extend_from_slice(&1u32.to_le_bytes());
+    head.extend_from_slice(&60u16.to_le_bytes());
+    head.push(0);
+    let original = definition(true);
+    let mut tail = original[..60].to_vec();
+    tail[10..12].fill(255);
+    tail.extend_from_slice(&[24, 0, 0, 2]);
+    tail.extend_from_slice(&1u64.to_le_bytes());
+    tail.extend_from_slice(&4u16.to_le_bytes());
+    tail.extend_from_slice(&1u32.to_le_bytes());
+    tail.extend_from_slice(&60u16.to_le_bytes());
+    tail.extend_from_slice(&[0, 1, 84, 0]);
+    let mut read = original[68..86].to_vec();
+    read[16..18].copy_from_slice(&102u16.to_le_bytes());
+    tail.extend_from_slice(&read);
+    tail.extend_from_slice(&[11, 0, 5, 2, 0, 0, 0, 1, 113, 0, 0]);
+    tail.extend_from_slice(&original[97..]);
+    (head, tail)
+}
+
+#[test]
+fn retained_activation() {
+    use super::execution::Execution;
+    use crate::kernel::appliance::execution as calls;
+    use lattice_peer_wire::program::execution::{Entry, Request as E};
+    for initial_loss in [None, Some(false), Some(true)] {
+        crate::port::test_port_reset();
+        calls::reset();
+        crate::kernel::change::reset();
+        let context = unsafe { TaskContext::assume() };
+        let na = running(false);
+        let nb = running(false);
+        let (head, tail) = conditional_pair();
+        let mut fa = Flash::new();
+        let mut fb = Flash::new();
+        let mut a = install(&head, na, &mut fa);
+        let mut b = install(&tail, nb, &mut fb);
         assert_eq!(
-            t.receive(&p, 1, reserve, 9, &mut out).status,
-            Status::Receiving
+            a.admission(E::Enable {
+                definition: 4,
+                generation: 1,
+                revision: 0,
+                enabled: true,
+            })
+            .status,
+            Status::Persisting
         );
-        assert_eq!(t.receive(&p, 1, commit, 10, &mut out).status, Status::Stale);
-        t.epoch = 8;
+        persist(&mut a, &mut fa, na);
+        let entry = Entry {
+            definition: 4,
+            generation: 1,
+            record: 60,
+        };
+        let mut ea = Execution::new();
+        ea.local = 1;
+        ea.epoch = 10;
+        let mut eb = Execution::new();
+        eb.local = 2;
+        eb.epoch = 20;
         assert_eq!(
-            t.receive(&p, 1, reserve, 11, &mut out).status,
-            Status::Stale
+            settle(&mut a, &mut b, &mut ea, &mut eb, na, nb, &context, &mut None),
+            (0, 0)
+        );
+        assert_eq!(nb.calls.load(Ordering::Relaxed), 0);
+        nb.value.store(true, Ordering::Relaxed);
+        eb.activate(&b, entry).unwrap();
+        assert_eq!(
+            settle(&mut a, &mut b, &mut ea, &mut eb, na, nb, &context, &mut None),
+            (0, 0)
+        );
+        assert_eq!(nb.calls.load(Ordering::Relaxed), 0);
+        nb.value.store(false, Ordering::Relaxed);
+        na.value.store(true, Ordering::Relaxed);
+        ea.activate(&a, entry).unwrap();
+        let mut loss = initial_loss;
+        let (sent, returned) = settle(
+            &mut a, &mut b, &mut ea, &mut eb, na, nb, &context, &mut loss,
+        );
+        assert!(sent >= 1);
+        assert_eq!(returned, 0);
+        assert!(loss.is_none());
+        let head_runs = ea.statistics.admitted;
+        for (value, expected) in [(true, 1), (true, 1), (false, 1), (true, 2)] {
+            nb.value.store(value, Ordering::Relaxed);
+            eb.activate(&b, entry).unwrap();
+            assert_eq!(
+                settle(&mut a, &mut b, &mut ea, &mut eb, na, nb, &context, &mut None),
+                (0, 0)
+            );
+            assert_eq!(nb.calls.load(Ordering::Relaxed), expected);
+            assert_eq!(ea.statistics.admitted, head_runs);
+        }
+        na.value.store(false, Ordering::Relaxed);
+        ea.activate(&a, entry).unwrap();
+        assert_eq!(
+            settle(&mut a, &mut b, &mut ea, &mut eb, na, nb, &context, &mut None),
+            (1, 0)
+        );
+        eb.activate(&b, entry).unwrap();
+        assert_eq!(
+            settle(&mut a, &mut b, &mut ea, &mut eb, na, nb, &context, &mut None),
+            (0, 0)
+        );
+        assert_eq!(nb.calls.load(Ordering::Relaxed), 2);
+        na.value.store(true, Ordering::Relaxed);
+        ea.activate(&a, entry).unwrap();
+        assert_eq!(
+            settle(&mut a, &mut b, &mut ea, &mut eb, na, nb, &context, &mut None),
+            (1, 0)
+        );
+        assert_eq!(nb.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            a.admission(E::Enable {
+                definition: 4,
+                generation: 1,
+                revision: 1,
+                enabled: false,
+            })
+            .status,
+            Status::Persisting
+        );
+        persist(&mut a, &mut fa, na);
+        assert_eq!(
+            settle(&mut a, &mut b, &mut ea, &mut eb, na, nb, &context, &mut None),
+            (1, 0)
+        );
+        eb.activate(&b, entry).unwrap();
+        assert_eq!(
+            settle(&mut a, &mut b, &mut ea, &mut eb, na, nb, &context, &mut None),
+            (0, 0)
+        );
+        assert_eq!(nb.calls.load(Ordering::Relaxed), 3);
+        assert_eq!((ea.statistics.faults, eb.statistics.faults), (0, 0));
+        assert_eq!((ea.wait_ms(0, true), eb.wait_ms(0, true)), (None, None));
+        calls::reset();
+    }
+}
+
+fn settle_local(
+    e: &mut super::execution::Execution,
+    p: &mut Configuration,
+    native: &'static Running,
+    context: &TaskContext,
+) {
+    for now in 0..16 {
+        e.poll(p, native, context, now);
+        crate::kernel::appliance::execution::run_ready(context);
+        if !e.pending() {
+            return;
+        }
+    }
+    panic!("local component did not become idle");
+}
+
+#[test]
+fn local_connection_removal() {
+    use super::execution::Execution;
+    use crate::kernel::appliance::execution as calls;
+    use lattice_peer_wire::program::execution::{Entry, Request as E};
+    crate::port::test_port_reset();
+    calls::reset();
+    crate::kernel::change::reset();
+    let context = unsafe { TaskContext::assume() };
+    let native = running(true);
+    let (mut head, tail) = conditional_pair();
+    head[94..102].copy_from_slice(&1u64.to_le_bytes());
+    let mut flash = Flash::new();
+    let mut p = install(&tail, native, &mut flash);
+    let (definition, generation) = stage(&mut p, &head, 2, native);
+    persist(&mut p, &mut flash, native);
+    assert_eq!(
+        p.admission(E::Enable {
+            definition,
+            generation,
+            revision: 0,
+            enabled: true
+        })
+        .status,
+        Status::Persisting
+    );
+    persist(&mut p, &mut flash, native);
+    let mut e = Execution::new();
+    e.local = 1;
+    e.epoch = 9;
+    settle_local(&mut e, &mut p, native, &context);
+    assert_eq!(native.calls.load(Ordering::Relaxed), 1);
+    e.remove(definition, generation);
+    assert_eq!(p.remove(definition, generation, native), Status::Persisting);
+    persist(&mut p, &mut flash, native);
+    settle_local(&mut e, &mut p, native, &context);
+    e.activate(
+        &p,
+        Entry {
+            definition: 4,
+            generation: 1,
+            record: 60,
+        },
+    )
+    .unwrap();
+    settle_local(&mut e, &mut p, native, &context);
+    assert_eq!(native.calls.load(Ordering::Relaxed), 1);
+    assert_eq!((e.statistics.faults, e.wait_ms(0, true)), (0, None));
+    calls::reset();
+}
+
+#[test]
+fn activation_and_arguments() {
+    use super::execution::Execution;
+    use crate::kernel::appliance::execution as calls;
+    use lattice_peer_wire::program::execution::{Entry, Request as E};
+    crate::port::test_port_reset();
+    calls::reset();
+    crate::kernel::change::reset();
+    let context = unsafe { TaskContext::assume() };
+    let native = running(true);
+    let mut bytes = terminal(1);
+    bytes.truncate(48);
+    bytes.extend_from_slice(&[12, 0, 0, 0, 1, 1, 0, 0, 0, 1, 60, 0]);
+    bytes.extend_from_slice(&[18, 0, 6]);
+    bytes.extend_from_slice(&CALL.to_le_bytes());
+    bytes.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0]);
+    let mut flash = Flash::new();
+    let mut p = install(&bytes, native, &mut flash);
+    let mut e = Execution::new();
+    e.local = 2;
+    e.epoch = 7;
+    let source = Entry {
+        definition: 8,
+        generation: 1,
+        record: 60,
+    };
+    let target = Entry {
+        definition: 4,
+        generation: 1,
+        record: 48,
+    };
+    let mut out = [0; DATA_BYTES];
+    for (sequence, active, value, count, last) in [
+        (1, true, 1, 1, true),
+        (1, true, 1, 1, true),
+        (2, true, 0, 2, false),
+        (1, true, 1, 2, false),
+        (3, true, 0, 2, false),
+        (4, false, 0, 2, false),
+        (5, true, 0, 3, false),
+        (6, true, 1, 4, true),
+        (7, false, 0, 4, true),
+    ] {
+        let data = [value];
+        assert_eq!(
+            e.receive(
+                &p,
+                1,
+                E::Signal {
+                    source,
+                    target,
+                    epoch: 3,
+                    sequence,
+                    active,
+                    offset: 0,
+                    bytes: if active { &data } else { &[] },
+                },
+                0,
+                &mut out
+            )
+            .status,
+            Status::Accepted
+        );
+        settle_local(&mut e, &mut p, native, &context);
+        assert_eq!(
+            (
+                native.calls.load(Ordering::Relaxed),
+                native.last.load(Ordering::Relaxed)
+            ),
+            (count, last)
         );
     }
-    // Busy never steals an existing context.
+    assert_eq!(e.statistics.faults, 0);
+    calls::reset();
+}
+
+#[test]
+fn connection_activation_isolation() {
+    use super::execution::Execution;
+    use crate::kernel::appliance::execution as calls;
+    use lattice_peer_wire::program::execution::{Entry, Request as E};
+    crate::port::test_port_reset();
+    calls::reset();
+    crate::kernel::change::reset();
+    let context = unsafe { TaskContext::assume() };
+    let native = running(true);
+    let (_, tail) = conditional_pair();
     let mut flash = Flash::new();
-    let mut p = install(&definition(true), native, &mut flash);
-    let mut t = Traversals::new();
-    t.epoch = 1;
-    t.local = 1;
+    let mut p = install(&tail, native, &mut flash);
+    let (offset, generation) = stage(&mut p, &tail, 2, native);
+    persist(&mut p, &mut flash, native);
+    let a = Entry {
+        definition: 4,
+        generation: 1,
+        record: 60,
+    };
+    let b = Entry {
+        definition: offset,
+        generation,
+        record: 60,
+    };
+    let source = Entry {
+        definition: 4,
+        generation: 1,
+        record: 60,
+    };
+    let mut e = Execution::new();
+    e.local = 2;
+    e.epoch = 7;
+    let mut out = [0; DATA_BYTES];
+    for (target, sequence, active, count) in [(a, 1, true, 1), (b, 1, true, 2), (a, 2, false, 2)] {
+        assert_eq!(
+            e.receive(
+                &p,
+                1,
+                E::Signal {
+                    source,
+                    target,
+                    epoch: 3,
+                    sequence,
+                    active,
+                    offset: 0,
+                    bytes: &[],
+                },
+                0,
+                &mut out
+            )
+            .status,
+            Status::Accepted
+        );
+        settle_local(&mut e, &mut p, native, &context);
+        assert_eq!(native.calls.load(Ordering::Relaxed), count);
+    }
+    for value in [false, true] {
+        native.value.store(value, Ordering::Relaxed);
+        e.activate(&p, a).unwrap();
+        e.activate(&p, b).unwrap();
+        settle_local(&mut e, &mut p, native, &context);
+    }
+    assert_eq!(native.calls.load(Ordering::Relaxed), 3);
+    assert_eq!(e.statistics.faults, 0);
+    calls::reset();
+}
+
+#[test]
+fn branch_publications() {
+    use super::execution::Execution;
+    use crate::kernel::appliance::execution as calls;
+    use lattice_peer_wire::program::execution::{Entry, Request as E};
+    crate::port::test_port_reset();
+    calls::reset();
+    crate::kernel::change::reset();
+    let context = unsafe { TaskContext::assume() };
+    let native = running(false);
+    let mut bytes = definition(true)[..86].to_vec();
+    bytes.extend_from_slice(&[41, 0, 5, 2, 0, 0, 0]);
+    for owner in [3u64, 2] {
+        bytes.push(2);
+        bytes.extend_from_slice(&owner.to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&60u16.to_le_bytes());
+    }
+    let mut flash = Flash::new();
+    let mut p = install(&bytes, native, &mut flash);
+    assert_eq!(
+        p.admission(E::Enable {
+            definition: 4,
+            generation: 1,
+            revision: 0,
+            enabled: true
+        })
+        .status,
+        Status::Persisting
+    );
+    persist(&mut p, &mut flash, native);
     let entry = Entry {
         definition: 4,
         generation: 1,
         record: 60,
     };
-    for _ in 0..crate::configLATTICE_TRAVERSALS {
-        assert_eq!(t.activate(&p, entry), Ok(()));
+    let mut e = Execution::new();
+    e.local = 1;
+    e.epoch = 7;
+    let mut wire = [0; lattice_peer_wire::program::transfer::REQUEST_BYTES];
+    for (step, value, expected) in [
+        (0, false, vec![(2, true)]),
+        (1, true, vec![(2, false), (3, true)]),
+        (2, false, vec![(2, true), (3, false)]),
+    ] {
+        native.value.store(value, Ordering::Relaxed);
+        if step != 0 {
+            e.activate(&p, entry).unwrap();
+        }
+        let mut emitted = Vec::new();
+        for now in 0..16 {
+            e.poll(&mut p, native, &context, now);
+            if let Some((slot, owner, n)) = e.outgoing(now, &mut wire) {
+                let E::Signal { active, .. } = E::decode(&wire[..n]).unwrap() else {
+                    panic!()
+                };
+                emitted.push((owner, active));
+                e.reply(slot, Reply::status(Status::Accepted), now);
+            }
+            if !e.pending() {
+                break;
+            }
+        }
+        emitted.sort_unstable();
+        assert_eq!(emitted, expected);
+        assert_eq!(e.statistics.faults, 0);
     }
-    assert_eq!(t.activate(&p, entry), Err(Status::Busy));
-    assert_eq!(
-        t.statistics.admitted,
-        crate::configLATTICE_TRAVERSALS as u32
-    );
-    for _ in 0..crate::configLATTICE_TRAVERSALS {
-        t.poll(&mut p, native, &context, 0);
-    }
-    assert_eq!(t.statistics.faults, 0);
 }
 
 #[test]
-fn dependent_delivery() {
-    use super::traversal::Traversals;
-    use crate::kernel::appliance::execution;
-    use lattice_peer_wire::program::execution::Request as E;
-    // Each handoff phase can lose either its request or its reply. The same
-    // accepted causes must still produce one invocation each on the true path.
-    for upstream in [false, true] {
-        for (truth, loss) in [
-            (false, None),
-            (true, None),
-            (true, Some((9, false))),  // session request
-            (true, Some((9, true))),   // session reply
-            (true, Some((10, false))), // reserve request
-            (true, Some((10, true))),  // reservation reply
-            (true, Some((11, false))), // data request
-            (true, Some((11, true))),  // data reply
-            (true, Some((12, false))), // commit request
-            (true, Some((12, true))),  // acceptance reply
-            (true, Some((13, false))), // release request
-            (true, Some((13, true))),  // release reply
-        ] {
-            if upstream && matches!(loss, Some((11, _))) {
-                continue;
-            } // upstream carries no values
-            crate::port::test_port_reset();
-            execution::reset();
-            crate::kernel::change::reset();
-            let context = unsafe { TaskContext::assume() };
-            let native_a = running(truth);
-            let native_b = running(truth);
-            let mut head = definition(true)[..86].to_vec();
-            head[4..6].copy_from_slice(&1u16.to_le_bytes());
-            head[6..8].fill(0);
-            head[79] = 1;
-            head.extend_from_slice(&[25, 0, 5, 1, 0, 0, 0, 2]);
-            head.extend_from_slice(&2u64.to_le_bytes());
-            head.extend_from_slice(&4u16.to_le_bytes());
-            head.extend_from_slice(&1u32.to_le_bytes());
-            head.extend_from_slice(&48u16.to_le_bytes());
-            head.push(0);
-            head[56..58].copy_from_slice(&111u16.to_le_bytes());
-            head.extend_from_slice(&[8, 0, 0, 1, 60, 0, 0, 0]);
-            let mut tail = terminal(1);
-            tail.truncate(48);
-            tail.extend_from_slice(&[12, 0, 0, 0, 1, 1, 0, 0, 0, 1, 60, 0]);
-            tail.extend_from_slice(&[18, 0, 6]);
-            tail.extend_from_slice(&CALL.to_le_bytes());
-            tail.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0]);
-            if upstream {
-                head = definition(true);
-                tail = definition(true)[..60].to_vec();
-                tail[4..8].fill(0);
-                tail[10..12].fill(0xff);
-                // A remote source entry points to A's head. It carries no operands.
-                tail.extend_from_slice(&[22, 0, 0, 2]);
-                tail.extend_from_slice(&1u64.to_le_bytes());
-                tail.extend_from_slice(&4u16.to_le_bytes());
-                tail.extend_from_slice(&1u32.to_le_bytes());
-                tail.extend_from_slice(&60u16.to_le_bytes());
-                tail.extend_from_slice(&[0, 0]);
-            }
-            let mut flash_a = Flash::new();
-            let mut flash_b = Flash::new();
-            let mut a = install(&head, native_a, &mut flash_a);
-            let mut b = install(&tail, native_b, &mut flash_b);
-            let mut ta = Traversals::new();
-            ta.local = 1;
-            ta.epoch = 10;
-            let mut tb = Traversals::new();
-            tb.local = 2;
-            tb.epoch = 20;
-            let mut wire = [0; lattice_peer_wire::program::transfer::REQUEST_BYTES];
-            let mut data = [0; DATA_BYTES];
-            let mut dropped = false;
-            let source = if upstream { native_b } else { native_a };
-            crate::kernel::change::bind(source);
-            for now in (10..=10_000).step_by(10) {
-                // Complete disabled recovery through the real handoff before enablement.
-                if now == 1000 {
-                    assert_eq!(
-                        a.admission(E::Enable {
-                            definition: 4,
-                            generation: 1,
-                            revision: 0,
-                            enabled: true
-                        })
-                        .status,
-                        Status::Persisting
-                    );
-                    while a.pending_write() {
-                        a.poll(&mut flash_a, native_a).unwrap();
-                    }
-                }
-                for t in [&mut ta, &mut tb] {
-                    if let Some((index, _, _, sent)) = t.awaiting() {
-                        if now - sent >= 2_000 {
-                            t.retry(index, now);
-                        }
-                    }
-                }
-                if now == 1330 {
-                    let (p, t) = if upstream {
-                        (&b, &mut tb)
-                    } else {
-                        (&a, &mut ta)
-                    };
-                    let admitted = t.statistics.admitted;
-                    let batch = crate::kernel::change::batch();
-                    for sequence in 0..10 {
-                        crate::kernel::change::record(
-                            core::ptr::from_ref(source).cast(),
-                            STATE,
-                            Some(crate::ir::Value::boolean((sequence % 2 == 1) == truth)),
-                        );
-                    }
-                    runtime::admit_changes(p, t);
-                    assert_eq!(t.statistics.admitted, admitted);
-                    assert_eq!(crate::kernel::change::evicted(), 2);
-                    drop(batch);
-                }
-                if upstream {
-                    runtime::admit_changes(&b, &mut tb);
-                } else {
-                    runtime::admit_changes(&a, &mut ta);
-                }
-                ta.poll(&mut a, native_a, &context, now);
-                tb.poll(&mut b, native_b, &context, now);
-                // Apply the same loss partition to B->A activation or A->B execution.
-                let mut exchange = |from: &mut Traversals,
-                                    to: &mut Traversals,
-                                    p: &Configuration,
-                                    sender,
-                                    receiver,
-                                    selected| {
-                    if let Some((index, owner, n)) = from.outgoing(now, &mut wire) {
-                        assert_eq!(owner, receiver);
-                        from.sent(index, now as u16, now);
-                        let omit = now >= 1000
-                            && selected
-                            && !dropped
-                            && loss.is_some_and(|(opcode, _)| opcode == wire[0]);
-                        dropped |= omit;
-                        if !omit || loss.unwrap().1 {
-                            let r = to.receive(
-                                p,
-                                sender,
-                                E::decode(&wire[..n]).unwrap(),
-                                now,
-                                &mut data,
-                            );
-                            if !omit {
-                                from.reply(index, r, now);
-                            }
-                        }
-                    }
-                };
-                exchange(&mut ta, &mut tb, &b, 1, 2, !upstream);
-                exchange(&mut tb, &mut ta, &a, 2, 1, upstream);
-                execution::run_ready(&context);
-            }
-            let expected = 11 * truth as u32;
-            assert_eq!(
-                (
-                    native_a.calls.load(Ordering::Relaxed),
-                    native_b.calls.load(Ordering::Relaxed)
-                ),
-                if upstream {
-                    (expected, 0)
-                } else {
-                    (0, expected)
+fn incoming_edge_independence() {
+    use super::execution::Execution;
+    use crate::kernel::appliance::execution as calls;
+    use lattice_peer_wire::program::execution::{Entry, Request as E};
+    crate::port::test_port_reset();
+    calls::reset();
+    crate::kernel::change::reset();
+    let context = unsafe { TaskContext::assume() };
+    let native = running(true);
+    let (_, bytes) = conditional_pair();
+    let mut flash = Flash::new();
+    let mut p = install(&bytes, native, &mut flash);
+    let mut e = Execution::new();
+    e.local = 3;
+    e.epoch = 7;
+    let target = Entry {
+        definition: 4,
+        generation: 1,
+        record: 60,
+    };
+    let mut out = [0; DATA_BYTES];
+    for (owner, sequence, active) in [(1, 1, true), (2, 1, true), (2, 2, false)] {
+        assert_eq!(
+            e.receive(
+                &p,
+                owner,
+                E::Signal {
+                    source: target,
+                    target,
+                    epoch: 1,
+                    sequence,
+                    active,
+                    offset: 0,
+                    bytes: &[],
                 },
-                "upstream={upstream} loss={loss:?}"
-            );
-            assert_eq!((ta.statistics.faults, tb.statistics.faults), (0, 0));
-            assert!(a.initial().is_none());
-            assert_eq!(super::activation::overflow(), 0);
-            assert_eq!(dropped, loss.is_some(), "loss partition {loss:?}");
-            assert!(!super::activation::pending());
-            assert!(
-                !(if upstream { &tb } else { &ta }).pending(),
-                "sender retained completed work: {loss:?}"
-            );
-            crate::kernel::change::reset();
-            execution::reset();
-        }
+                0,
+                &mut out
+            )
+            .status,
+            Status::Accepted
+        );
+        settle_local(&mut e, &mut p, native, &context);
+        assert_eq!(native.calls.load(Ordering::Relaxed), 1);
     }
+    for value in [false, true] {
+        native.value.store(value, Ordering::Relaxed);
+        e.activate(&p, target).unwrap();
+        settle_local(&mut e, &mut p, native, &context);
+    }
+    assert_eq!(native.calls.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        e.receive(
+            &p,
+            1,
+            E::Signal {
+                source: target,
+                target,
+                epoch: 1,
+                sequence: 2,
+                active: false,
+                offset: 0,
+                bytes: &[],
+            },
+            0,
+            &mut out
+        )
+        .status,
+        Status::Accepted
+    );
+    e.activate(&p, target).unwrap();
+    settle_local(&mut e, &mut p, native, &context);
+    assert_eq!(native.calls.load(Ordering::Relaxed), 2);
+    calls::reset();
+}
+
+#[test]
+fn running_call_and_withdrawal() {
+    use super::execution::Execution;
+    use crate::kernel::appliance::execution as calls;
+    use lattice_peer_wire::program::execution::{Entry, Request as E};
+    crate::port::test_port_reset();
+    calls::reset();
+    crate::kernel::change::reset();
+    let context = unsafe { TaskContext::assume() };
+    let native = running(true);
+    let (_, mut bytes) = conditional_pair();
+    bytes.truncate(113);
+    bytes.extend_from_slice(&[33, 0, 6]);
+    bytes.extend_from_slice(&CALL.to_le_bytes());
+    bytes.extend_from_slice(&[1, 0, 0, 1, 2]);
+    bytes.extend_from_slice(&3u64.to_le_bytes());
+    bytes.extend_from_slice(&4u16.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&48u16.to_le_bytes());
+    bytes.push(0);
+    let mut flash = Flash::new();
+    let mut p = install(&bytes, native, &mut flash);
+    let mut e = Execution::new();
+    e.local = 2;
+    e.epoch = 7;
+    let target = Entry {
+        definition: 4,
+        generation: 1,
+        record: 60,
+    };
+    let mut out = [0; DATA_BYTES];
+    for (sequence, active) in [(1, true), (2, false)] {
+        assert_eq!(
+            e.receive(
+                &p,
+                1,
+                E::Signal {
+                    source: target,
+                    target,
+                    epoch: 1,
+                    sequence,
+                    active,
+                    offset: 0,
+                    bytes: &[],
+                },
+                0,
+                &mut out
+            )
+            .status,
+            Status::Accepted
+        );
+        e.poll(&mut p, native, &context, 0);
+    }
+    assert_eq!(native.calls.load(Ordering::Relaxed), 0);
+    settle_local(&mut e, &mut p, native, &context);
+    assert_eq!(native.calls.load(Ordering::Relaxed), 1);
+    let mut wire = [0; lattice_peer_wire::program::transfer::REQUEST_BYTES];
+    assert!(e.outgoing(0, &mut wire).is_none());
+    assert_eq!(e.statistics.faults, 0);
+    calls::reset();
 }
 
 /// Different continuation widths change record offsets, but not computation.

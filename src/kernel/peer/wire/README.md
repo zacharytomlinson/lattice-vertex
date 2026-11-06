@@ -11,8 +11,11 @@ Native invocation messages use the existing scalar argument bounds and statuses
 callback-fragment prototype; they are now rejected and reserved against semantic
 reuse in this wire version. `program` now owns LPD v1 records and installation
 commands/replies used by LVT opcodes 21/22 and host kinds 7/0x87. See the
-[program component](../../program/README.md) for installation, receiver-reserved
-handoffs and execution limits. Their runtime remains in the kernel.
+[program component](../../program/README.md) for installation, addressed signal
+updates and execution limits. Their runtime remains in the kernel. Inner execution tag 30 carries the source/target
+Entry, sender incarnation/sequence, activation and up to 24 carried bytes. Old visit
+tags 10–13 are rejected; predicates and LPD v1 are unchanged. Control session tickets
+belong to `control`, independently of program signal identity.
 
 `clock` supplies numeric commissioning profiles, recurring Gregorian/civil rules,
 temporal predicate encodings and reference messages. It carries no live clock,

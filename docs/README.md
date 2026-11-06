@@ -16,12 +16,12 @@ Architectural requirements do not imply implementation. The direction distinguis
 working facilities from missing ones. Current user decisions supersede older notes;
 reconcile a disagreement into its owner rather than retaining two authorities.
 The architecture specifies maintained circuit signals and prepared implementations.
-The immediate migration establishes maintained connections in software, then lowers
-local computation through LLVM to native code. Hardware selection is separate.
-The current program component still documents the implemented LPD/LPG record
-interpreter and traversal protocol. Its existing test evidence does not establish
-maintained connections or a hardware backend. As the plan is implemented, move mechanics
-beside their code and retire the proposal; do not maintain a parallel specification.
+Maintained connections now have a software implementation, host properties, both
+target builds and selected two-board checks. LLVM lowering follows; physical circuit
+realization remains separate. The program component owns LPD/LPG records, retained
+input execution and its wire protocol. Prior traversal hardware checks do not prove
+this backend. Keep implemented mechanics beside their code rather than maintaining
+a parallel specification in the plan.
 
 Useful component entry points:
 

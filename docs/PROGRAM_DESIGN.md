@@ -1,16 +1,19 @@
 # Circuit implementation plan
 
 The [architecture](ARCHITECTURE.md#maintained-circuits-and-delta-propagation) owns
-the accepted semantics. Immediate work establishes maintained software connections
-on **nRF52840 and ESP32-C6**, followed by LLVM lowering to native code on both.
+the accepted semantics. Maintained software connections are implemented for
+**nRF52840 and ESP32-C6**, with selected two-board validation complete. LLVM lowering
+on both targets is next.
 Hardware selection and autonomous signal/RF paths remain a separate investigation.
 The [implementation map](KERNEL_DIRECTION.md#implementation-map) distinguishes
 current owners from planned relationships. The [program component](../src/kernel/program/README.md)
 owns the currently implemented LPD/LPG formats and checks.
 
-No maintained-circuit execution backend is implemented yet. Existing successful
-runs exercised the record interpreter and upstream/forward visits. They establish
-reusable installation, transport and RTOS facilities, not the new execution model.
+The software backend has host/property checks, release builds and a two-board
+retained-input check in both chip directions. It established local resume, argument
+updates, HIGH/LOW, stale/duplicate rejection and reconstruction using software-backed
+appliance states. See the component notes for evidence and limits. Local record
+interpretation remains until native lowering; physical circuit offload is unproven.
 
 ## Shared channel foundation
 
@@ -32,9 +35,9 @@ Temporal. Program installation and firmware/header reception use Unique + Comple
 Fragments use their existing 512-byte staging buffer and a 64-byte coverage map;
 firmware uses a 192-byte receive window before contiguous flash writes. Signature
 verification, protected staging and whole-image verification remain in the updater.
-The old evaluation/execution visit protocol is still present and will be replaced
-when retained activation inputs become the channel consumer. Do not mistake the
-bounded relay-notice cache for persistent state of every remote attribute.
+Retained connection inputs now use Unique + Temporal directly. Signal updates
+replace the old visit protocol. The bounded relay-notice cache remains separate
+from these per-connection inputs.
 
 Existing codecs own encoding/decoding; channel definitions expose sequence/extent
 metadata from decoded messages. Stream identity stays in the owner's existing
@@ -75,10 +78,11 @@ Sources are qualified appliance states, including binary, enumerated and bounded
 scalar values. Firmware gains no networking, evaluator or publication responsibility.
 No periodic scan of all predicates or new scheduler is introduced.
 
-The existing activation queue stores dependency cursors, not originating values.
-Migrating it must make accepted-input ownership and ordering explicit; retaining a
-cause alone does not preserve its value. Budget retained inputs/outputs and pending
-delivery from installed requirements, independently of the 512-byte installation buffer.
+The activation queue stores dependency cursors and reads current owned state at
+evaluation time. It is not a sample history. Incoming carried values, output payloads
+and working data share the existing 4 KiB arena; declaration-based admission leaves
+space for concurrent updates. Exact capacities, indexed reception and compaction
+belong in the [component](../src/kernel/program/README.md#storage-and-capacity).
 
 No old test automation is live, so compatibility with deployed automations is not
 a migration constraint. Do not redesign the program format merely on that basis;
@@ -122,9 +126,10 @@ Compiler ownership/packaging and artifact details remain to settle. They do not
 require a nucleus at execution time. Future hardware lowering must use the same
 mathematical definitions; it must not infer intent by disassembling native code.
 
-## First complete behavior
+## Following behavior and validation scope
 
-Use the same circuit on both targets, independent of appliance-specific libraries:
+Validate the retained-input implementation on both targets with installed predicates,
+branch paths and native calls. A potential later authored-rest example is:
 
     A: head enable and occupancy
     B: qualified illumination and local time-window signal
@@ -133,6 +138,10 @@ Use the same circuit on both targets, independent of appliance-specific librarie
     A.out = enabled AND occupied
     B.out = A.out AND (illumination < threshold) AND time_window
     C.target = B.active_target while B.out is high, otherwise 0
+
+The existing LPD has no implicit LOW-action instruction: withdrawal closes the path
+without synthesizing `SetLevel(0)`. The example's resting behavior needs an explicit
+authored path/artifact; it is not claimed by this migration.
 
 A, B and C are logical ownership roles. A two-board check can co-locate B and C;
 swap target roles to exercise both ports without claiming a three-owner radio run.
@@ -201,9 +210,9 @@ not proof of a CPU-free Lattice node.
 
 | Step | Concrete result | Owners and completion evidence |
 | --- | --- | --- |
-| 1. Consolidate channel policies | Define codec/storage bindings and implement shared Unique, Temporal and Complete admission in actual consumers. State updates reject duplicates/older arrivals; complete transfers collect every piece. | Existing radio/peer/program/update owners. No unused generic harness or duplicated payload storage. |
-| 2. Retain activation/value context | Bind and budget the retained inputs needed to start evaluation at the affected local fragment. Preserve the existing operators, branches and mutations. | Existing program/image/validation and source/time owners. No backward activation requirement or new logic model. |
-| 3. Validate propagation on both ports | Exercise local and upstream changes, both activation directions, argument changes, duplicate/late arrivals, reconstruction and pair isolation. | Compact component properties plus maintained hardware fixtures. Report latency and CPU work without claiming hardware realization. |
+| 1. Consolidate channel policies (implemented) | Define codec/storage bindings and implement shared Unique, Temporal and Complete admission in actual consumers. State updates reject duplicates/older arrivals; complete transfers collect every piece. | Existing radio/peer/program/update owners. No unused generic harness or duplicated payload storage. |
+| 2. Retain activation/value context (implemented) | Bind and budget the retained inputs needed to start evaluation at the affected local fragment. Preserve the existing operators, branches and mutations. | Existing program/image/validation and source/time owners. No backward activation requirement or new logic model. |
+| 3. Validate propagation on both ports (selected bench check passed) | Exercise local and upstream changes, both activation directions, argument changes, duplicate/late arrivals, reconstruction and pair isolation. | Compact component properties plus maintained hardware fixtures. Report latency and CPU work without claiming hardware realization. |
 | 4. Replace local interpretation | Lower IR through LLVM to native code for both targets, using the agreed typed input/output and native-call ABI. | Compiler and existing loader/port owners. Same evaluation meaning, correct target execution and no per-delta opcode dispatch. |
 
 Steps can share implementation work, but a packet-only demonstration does not
@@ -218,13 +227,8 @@ common channel policy meanings are settled. These mechanics remain implementatio
 
 - **Native artifact (following stage):** compiler packaging, entry ABI, relocation,
   code placement and typed/native bindings for LLVM-generated Thumb/RV32 code.
-- **Channel representation:** codec metadata, finite receive-window bounds, counter
-  wrap/re-establishment and storage commitment. Temporal does not resequence.
-- **Retained activation:** initialize activation LOW and retain current context only
-  in RAM. Initial HIGH originates only at a true, enabled head; downstream vertices
-  require upstream HIGH before propagating their local result. No forced neighbor
-  announcement. Reuse addressed acceptance/retry ownership and preserve existing
-  evaluation and finite-call behavior.
+- **Active heartbeat (deferred):** end-to-end continuity/failure detection while
+  active. The retained-input implementation deliberately adds no expiry or carrier.
 - **Hardware realization (separate investigation):** a complete receive/gate/transmit
   path and its resources. Adding a processor at each missing connection is not the
   selected solution, and a local comparator does not establish autonomous forwarding.

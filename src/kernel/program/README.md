@@ -1,24 +1,24 @@
 # Resident programs
 
-This documents the **current software record/visit engine**, including its deployed
-LPD/LPG formats and validation evidence. The accepted target is now
-[compile-time circuit assembly and maintained signals](../../../docs/ARCHITECTURE.md#maintained-circuits-and-delta-propagation).
-The [two-chip implementation plan](../../../docs/PROGRAM_DESIGN.md) replaces that
-execution model; it is not implemented here yet. Preserve explicit version/migration
-handling rather than silently assigning these records different behavior.
+The kernel retains each addressed connection's activation and required values in
+RAM. A local appliance/time change resumes that connection directly; an accepted
+upstream update supplies its current input. No activation walks back to the head.
+Local predicates, branches, arithmetic and native calls still use the existing
+LPD v1 records. LLVM-generated native computation is the next backend, not an
+implemented capability. See the [implementation plan](../../../docs/PROGRAM_DESIGN.md).
 
-This component receives previously unknown local program definitions, validates
-them, commits them to protected storage, and attaches their source relationships
-to the appliance's owned states. Startup rebuilds those links from committed
-definitions against the current native bindings. Firmware supplies no automation
-callback, installation loop, storage policy, or message handler.
+This component validates incoming definitions, commits them to protected storage,
+and attaches their sources to owned appliance states and time deadlines. Startup
+reconstructs those bindings. Firmware supplies no automation callback, installation
+loop, storage policy or message handler.
 
-**Installed means committed, validated and wired, but inactive.** A separate durable
-head-admission command enables execution. The kernel follows upstream activation
-links, evaluates the installed local records, transfers complete visits and invokes
-native functions in existing RTOS tasks. Firmware supplies no evaluator callback.
-Local time/solar records use kernel deadlines and the same upstream activation
-path. Externally installed retained-state maintenance remains unsupported.
+**Installed means committed, validated and wired, but inactive.** Durable head
+admission enables the circuit. Incoming activation starts LOW. Only enabled heads
+originate initial evaluation; other entries need an incoming HIGH. Prior activation
+and carried values are never restored after reboot. Authored mutations keep their
+meaning: LOW closes a connection; it does not invent a resting mutation. Native
+calls execute in the existing finite RTOS tasks. Automation-authored history is
+still unsupported.
 
 ## Ownership and publication
 
@@ -34,7 +34,7 @@ formation, using the task stack rather than the board entry stack. Trial firmwar
 cannot confirm startup until its definitions reconstruct. Configuration remains
 read-only during an unconfirmed trial. After confirmation permits writes, one
 configuration checkpoint commits a new receiver incarnation before execution is
-admitted. Its epoch cannot alias tickets issued before restart. This is not a
+admitted. Its epoch distinguishes signal sequences issued before restart. This is not a
 mutation journal.
 Confirmed firmware can still expose a reconstruction error for recovery without
 inventing a physical mutation. Nothing invokes a native getter or transformer
@@ -123,8 +123,8 @@ The [time component](../time/README.md) owns its clock/deadline semantics.
 
 The invoke record describes continuation on the returned native result. It does
 not infer physical completion or encode an acceptance-only continuation. A
-physical completion dependency belongs to an observed state. The existing native task returns its result before that visit follows either edge;
-other visits, acquisition and radio service can continue meanwhile.
+physical completion dependency belongs to an observed state. The existing native task returns its result before that evaluation follows either edge;
+other evaluations, acquisition and radio service can continue meanwhile.
 
 Lists start with their `u8` count. Operands are a tag followed by their data:
 constant (0: existing typed scalar encoding), carried location (1: scalar type
@@ -136,8 +136,8 @@ none. Scalar and primitive tags match the existing
 Links are stop (tag 0), local (tag 1 plus `u16` record offset), or foreign (tag 2
 plus owner `u64`, definition offset `u16`, generation `u32`, record offset `u16`).
 The foreign definition offset identifies its stored prefix; its record offset
-is relative to the LPD definition after that prefix. A source's entry must lead
-upstream unless it is the head. An action-only entry with no sources needs no
+is relative to the LPD definition after that prefix. LPD v1 still validates a source entry's authored upstream reference unless it is
+the head; the runtime no longer follows that reference for activation. An action-only entry with no sources needs no
 upstream link: functions are not observation dependencies.
 
 Local successors point forward in record order and cannot enter another entry.
@@ -149,7 +149,7 @@ represents `&&`/`||`; neither needs an accumulator or a dedicated opcode.
 
 Validation permits at most 128 local records, using bounded temporary analysis
 storage. Carried/scratch capacities describe the compiled layout; this loader
-does not allocate traversal contexts. Enablement and incoming visits check execution
+does not allocate execution contexts. Enablement and incoming updates check execution
 capacity separately. Firmware callbacks cannot substitute for missing record kinds.
 
 ## Persistent image
@@ -241,7 +241,7 @@ end of list. They enumerate the actual reconstructed native dependency chain.
 Receiving, persisting and installed are distinct statuses. Other results report
 busy, unsupported, invalid, bounds, binding, compatibility, storage or conflict.
 Execution adds Enabled (12), Disabled (13), Accepted (14), Stale (15), and Unavailable
-(16), and Removed (17); an Accepted visit receipt does not claim that its native operation has finished.
+(16), and Removed (17); an Accepted signal receipt does not claim that its native operation has finished.
 Installation Data ranges may arrive out of order through the common Unique + Complete
 channel. A 64-byte coverage map tracks the existing 512-byte staging buffer; progress
 reports its contiguous accepted prefix and Commit still requires the full definition
@@ -255,7 +255,8 @@ transport integrity, not a new authentication or FSPS proof mechanism.
 
 Remove addresses one local connection set, including one stored inline with its
 computation. The handler detaches its state sources, temporal alarms, pending
-activations and visit receipts. Pending source cursors advance to surviving
+activations and retained incoming contexts. Any previously selected downstream
+output is withdrawn through an addressed LOW update. Pending source cursors advance to surviving
 siblings before the old storage can be reused. Ready native calls are canceled;
 already-running native calls finish with their continuation detached. Their
 arguments already belong to the native task, so they retain no program-image borrow.
@@ -276,160 +277,144 @@ no global automation registry, deletion crawler, or replacement/drain protocol.
 
 ## Admission and execution
 
-The same LVT program route and host envelope carry execution control. Read tokens
-are allocated jointly by the host endpoint and resident executor. Routing remains
-owner-directed through the existing peer paths; neither tablet nor compiler owns
-runtime forwarding.
+The same LVT program route and host envelope carry admission and addressed signal
+updates. Relays route to the named owner through existing peer paths. Neither the
+tablet nor a compiler participates in ongoing evaluation.
 
 | Command | Fields after command byte |
 | --- | --- |
-| 7 admission state | Definition offset `u16`, definition generation `u32` |
-| 8 set admission | Same reference, expected admission revision `u32`, enabled `u8` |
+| 7 admission state | Definition offset `u16`, generation `u32` |
+| 8 set admission | Same reference, expected revision `u32`, enabled `u8` |
 | 9 receiver session | None |
-| 10 reserve visit | Receiver epoch `u64`, sender epoch `u64`, sender sequence `u32`, entry reference (definition `u16`, generation `u32`, record `u16`), upstream `u8`, carried length `u16`, cause (owner `u64`, epoch `u64`, sequence `u32`) |
-| 11 visit data | Receiver ticket (epoch `u64`, slot `u16`, generation `u32`), offset `u16`, byte count `u8`, 1–38 bytes |
-| 12 commit visit | Receiver ticket, SHA256 of the carried bytes |
-| 13 release receipt | Receiver ticket |
 | 14 execution statistics | None |
+| 30 signal | Source Entry, target Entry, sender epoch `u64`, sequence `u32`, active `u8`, offset `u16`, 0–24 carried bytes |
 
-Admission replies identify the definition and include its current revision as four
-bytes. Enabling/disabling is a compare-and-set against that revision. Persistence
-completes before admission changes; repeating the accepted request cannot start a
-second enablement evaluation. Initial enablement schedules one fresh activation.
-Disablement stops admission at the head and does not cancel previously admitted
-forward visits. Distributed fragment/interface readiness remains the authoring
-peer's responsibility; a local enable receipt does not prove remote readiness.
+An Entry is definition offset `u16`, generation `u32`, record offset `u16`.
+The source owner comes from the addressed envelope. Old execution tags 10–13
+(reserve/data/commit/release visit) are rejected. LPD v1 and persistent LPG v4 have
+not changed; there is no second logic language or legacy execution runtime.
 
-Session replies contain the durable epoch (`u64`), working-byte capacity (`u16`),
-visit count (`u16`) and native argument capacity (`u16`). Current kernel build
-bounds are four independent visits, one 4096-byte working arena, 32 pending local
-causes and 32 typed native arguments per call. Each visit reserves only its
-declared carried-plus-scratch extent in that arena; no heap is used. The manual
-call codec's 61-byte limit does not constrain program arguments or carried data.
-A local Entry starts with empty scratch and its declared carried inputs. Only
-current, established native observations are read; unavailable values are neither
-false nor zero. A visit waiting for an unavailable input retains its progress.
+Admission remains revision-checked and durable. Enablement schedules the head
+once from current inputs; disablement withdraws its selected output. Repeating an
+accepted command does not generate a new edge. Recovery evaluates enabled heads
+once after local observations become available. Downstream entries remain LOW
+until upstream supplies activation. A local enable receipt does not establish
+remote readiness.
 
-Native observation/history publication records each cause separately from the
-outward eight-entry delta ring. After the batch commits, each pending source cursor
-advances only when its dependent activation is admitted. Full local cause storage
-increments the explicit overflow counter without evicting older work. An upstream
-visit follows Entry links without testing predicates; the enabled head starts the
-forward path. True/false successors encode short-circuit control. Local arithmetic
-uses the shared IR's declared-width semantics. Independent visits own independent
-values, including while waiting for a native function's return.
+### Retained inputs and local evaluation
 
-Delivery obligations follow these installed dependents, not every vertex in the
-network. Relays route to the named owner without interpreting the program. An
-observed traversal is not a substitute for the owner's correlated acceptance.
-An upstream activation is the addressed notification of a source delta. Its first
-remote delivery is necessary for the receiving vertex to continue traversal;
-local registration is not a substitute for getting that notification across the radio.
-The `dependent_delivery` table drops requests and replies during remote upstream
-activation and forward handoff. It checks invocation count, retained progress and
-independence from `StateChanged` broadcast eviction, including a source change on
-the other owner that must reach the head before evaluation. These host checks do
-not establish crash recovery or arbitrary multi-hop radio delivery.
+`execution.rs` owns input bindings, local evaluation work, selected outputs and
+native-call argument records. `evaluation.rs` retains the existing declared-width
+arithmetic and typed value access. `runtime.rs` connects this engine to the peer,
+source notifications, clock deadlines, storage and native task completions.
 
-A foreign handoff first reserves a receiver context and working extent. Ordered
-chunks are acknowledged without evaluation; identical duplicates are harmless and
-conflicting bytes are rejected. Commit checks completeness, digest and typed Entry
-inputs before admitting the visit. The acceptance receipt is retained separately
-from the running visit. Repeating Commit returns the same acceptance without
-re-evaluation. Sender ownership ends on acceptance; Release only frees the receipt.
-Losing Release does not cancel the receiver's work.
+Incoming bindings are scoped by source owner/source Entry/target Entry. Each uses
+Unique + Temporal acceptance within its sender incarnation. Equal or older updates
+are acknowledged without evaluation. Accepted input sequences persist with that
+binding in RAM, independently of the expiring observation-forwarding cache.
+Only a complete, typed update changes the input. Missing scalars are unavailable,
+not fabricated zeroes. A local reevaluation uses the current retained input and
+fresh owned state; it does not ask the head to run again.
 
-Receiver tickets include boot incarnation and slot generation. An expired/reused
-or pre-reboot ticket cannot invoke again. A sender may restart an expired partial
-transfer before Commit, but an uncertain Commit is never restarted under a new
-ticket. Stale evidence at that point becomes an explicit uncertain outcome. Partial
-reservations expire after 30 seconds without accepted data; acceptance receipts
-expire after 60 seconds or Release. Neither expiry discards an admitted visit.
-An ordinary request waits two seconds for a response and uses capped exponential
-retry delays of 100–1600 ms. Busy retains the sender's work. Persistent unavailability
-can occupy fixed visit capacity; it does not allocate more memory or silently drop
-that visit. One outgoing exchange is in flight per radio service; local/native
-visits still overlap.
+Separate installed connection sets remain independent even when they share code.
+Where authored paths converge on the same entry, each incoming edge keeps its own
+activation. Withdrawing one edge cannot erase another active edge; the most
+recently accepted remaining HIGH supplies the context for local reevaluation.
+This does not broadcast an incoming evaluation through unrelated connection pairs.
 
-### Network-service readiness
+Changed selected outputs propagate, including LOW. A branch change publishes its
+new selected HIGH and withdraws the former output. Sequence admission rejects a
+late update on the same connection. Native calls run on an activation edge or a
+changed argument tuple; unchanged active arguments reuse the pending/completed
+call result. Already-running calls finish. An older completion cannot overwrite a
+newer registered local output, and LOW does not itself invoke an inferred action.
+Existing authored success/failure and true/false links remain authoritative.
 
-Retained work and runnable work are distinct. Receiving reservations and accepted
-receipts request wakeups at their 30/60-second expiry. A sending visit requests its
-actual retry or two-second reply deadline; a native call waits for completion.
-A visit blocked on unavailable state/capacity keeps its cursor and operands until
-a producer notification, service message or relevant time boundary resumes it.
-Ready local evaluations run in admission order, each with a bounded local turn.
-Reservation alone does not enter that order; complete accepted work does. A later
-command is handled after earlier ready local evaluation has been dispatched.
+Qualified source notifications remain separate from the outward delta ring. The
+bounded queue retains dependency cursors until admission and reports overflow
+rather than evicting accepted work. It reads current owned values when evaluation
+runs; it is not a historical ledger of samples at notification time. Available
+state/time publication and resource release wake blocked evaluation.
 
-The transport latches software-work notifications separately from radio-driver
-wakes. This matters when a source baseline, cache publication or resource release
-has no packet/delta queued: the receive wait must still return to the service.
-Native context release, observation/cache/batch completion, flash-access availability
-and startup confirmation supply those wakeups. Configuration writes continue when
-writable and unblocked, without a fixed scanning cadence. Time reacquisition and
-local temporal boundaries contribute their real deadlines to the same wait.
+### Storage and capacity
 
-The generic 10 ms pending-work wakeup is removed. Immediate work still gives the
-radio a receive opportunity of at least one tick; normal discovery and RTOS ticks
-remain. Capacity pressure does not cancel finite execution or coalesce registered
-causes. Explicit removal has the distinct semantics above. No extra task or general
-work scheduler is introduced.
+Session replies are 20 bytes: epoch `u64`, followed by six `u16` bounds: byte arena,
+evaluation slots, native arguments, local components, input bindings and action
+records. Defaults are **4096 bytes, 5 work slots, 32 arguments, 8 components,
+16 inputs and 16 action records**. Local source admission keeps two work slots
+available for incoming/local continuation progress. Metadata is additional fixed
+storage; 4096 is the shared value arena, not total executor RAM. The current
+release builds allocate 6,736 bytes for the complete executor on either MCU,
+excluding resident definitions, the source queue and native-task storage.
 
-The C6/Nordic hardware check retained an accepted receipt after its visit completed:
-radio notification waits were 9/18 over about two seconds, with zero appliance getter
-calls during those windows. Long native calls and the saved two-owner program also
-completed with no execution faults, uncertain handoffs or local overflow. These are
-one-hop, software-backed appliance checks. Captures and injected-IRQ/measurement
-code remain in the external lab, outside kernel source and build dependencies.
+Retained inputs, output payloads, native argument records and temporary carried/
+scratch data share that one arena. Extents use declared lengths, not 512 bytes per
+connection. Immutable carried data may be shared; computations writing carried
+values receive private working storage. Admission budgets retained capacities plus
+all work slots at the largest admitted workspace size. Bounds rejects a binding
+that cannot fit; transient work exhaustion returns Busy. Offset-based compaction
+preserves aliases and makes released space reusable without a heap. The 512-byte
+installation buffer and 8 KiB resident definition arena remain separate owners.
 
-Statistics replies contain five `u32` counters (admitted local visits, completed
-local visits, faults, uncertain handoffs, local-cause overflow), followed by the
-last fault status (`u8`), definition (`u16`) and record (`u16`). Local completion
-includes stopped paths and accepted onward handoffs; it is not whole-program or
-physical completion. These diagnostics remain available through the ordinary peer
-service. Reboot recovery walks restored source bindings upstream and can cause
-repeated evaluations across returning participants; coordinated reconciliation is
-explicitly deferred.
+### Signal delivery and readiness
+
+A signal carries the input payload directly. There is no receiver reservation,
+separate digest/commit exchange or release receipt. LOW has no payload. HIGH's
+length is declared by the target definition; one message carries up to 24 bytes.
+Larger updates use fixed 24-byte pieces with an exact final piece and indexed
+coverage. Out-of-order pieces and duplicates are accepted without applying partial
+values. Incomplete reception expires after 30 seconds; a newer complete update
+makes older incomplete updates irrelevant. CRC/framing remain with the transport.
+
+The sender retains each immutable update until the owner accepts it. Requests use
+the existing two-second reply deadline and 100–1600 ms capped backoff. Busy leaves
+ownership with the sender. A lost reply produces an idempotent retry, not another
+native call. One outgoing radio exchange runs at a time; other local evaluations
+and native tasks may overlap. Same-owner continuations use this acceptance path
+without RF or a session handshake.
+
+Retained activation alone does not schedule wakeups. Runnable local work, partial
+receive expiry, pending sends and retry deadlines contribute actual deadlines;
+blocked work waits on source/native/capacity notifications. Radio ISR notification
+bits remain separate from network-service wakes. No polling task or periodic
+continuity traffic was added. An end-to-end active heartbeat is deferred: an
+isolated upstream failure can leave retained HIGH downstream in this interim model.
+
+Statistics retain five `u32` fields: admitted local work, completed local work,
+faults, reserved uncertain count (zero), and source overflow; then last fault
+status `u8`, definition `u16` and record `u16`. Completion is local, not proof of
+whole-circuit or physical completion.
 
 ## Maintained checks
 
-Host checks enforce declaration bounds, typing, initialization, publication after
-commit, duplicate/conflict behavior, reservation expiry and reconstruction against
-fresh native storage. Execution checks cover declared-width arithmetic, location
-bounds, commit-before-admission, independent activations despite transport eviction,
-conditional cross-owner execution, partial handoffs, duplicate commits and capacity.
-Sharing checks enforce exact bound-path reconstruction, local ownership under
-removal permutations, source-cursor repair, fresh generations on reuse, FIFO ready
-dispatch and publication/recovery at interrupted flash boundaries, including an
-installation in a hole without changing image length. Shared transport checks
-cover the command and message boundaries.
-The C6/Nordic sharing check installed two paths through one Nordic predicate
-computation, each with its own C6 upstream and downstream references. Each produced
-only its addressed target value. Removing the original connection retained the
-shared body and the second path, including after resetting both boards. Removing
-the final connections restored both original image extents; reusing a Nordic
-address rejected the old generation while the new generation executed. Both owners
-also rejected an oversized Begin under the 512-byte incoming-fragment limit.
+Host properties cover declaration bounds, typed initialization, commit publication,
+reconstruction, shared-computation ownership, removal, generation reuse and flash
+interruption. Execution checks cover initial LOW, head-only startup, local resume
+without upstream traffic, independent connection pairs, branch withdrawal, carried
+argument changes, stale/duplicate updates, indexed reception, lost requests/replies,
+native-call completion after LOW, local removal and arena alias preservation.
 
-A temporary lab-only Nordic setter exposed an intermediate running value, delayed
-three seconds, and then established its final value. Radio deletion was accepted
-while it was running; the function finished without its downstream mutation. A
-prior attempt timed out on a remote state read before issuing deletion, and another
-native-command reply timed out after reboot despite the requested and dependent
-states completing. Direct readback and USB observation resolved the check outcomes;
-the later [radio investigation](../radio/TESTING.md#receive-turns-in-the-resident-peer)
-reproduced CCA timing/configuration failures and loss of an ACKed reply in receive
-storage. It corrected those paths and validated maintained images with back-to-back
-calls/reads. This is real-MCU execution with software-backed appliance values,
-not physical-actuator or latency proof.
+The retained-input engine has host/property validation and release library builds
+for both MCU targets. A C6/nRF52840 bench run installed the same two-owner condition
+in both chip directions: source level >= 100, downstream power true, then SetLevel
+with source level minus 50. Downstream-only changes invoked locally without another
+head admission (14 to 14 with C6 head; 32 to 32 with Nordic head). Changed arguments
+while HIGH propagated; unchanged arguments, duplicate and older updates did not
+reapply a manually changed target. LOW prevented subsequent local activation.
 
-The maintained images were restored, test fragments removed and original admission
-restored. Saved program bytes changed only for LPG v3-to-v4 migration and the C6
-head's expected disable/re-enable revision. Clock profiles and original references
-were preserved. Captures and the temporary setter/authoring runner remain in the
-external lab under `experiments/fragment-reclamation-20261027`, with no kernel build
-dependency on them.
+Both directions completed with zero execution faults and local overflow. Removing
+the temporary connections restored the original image extents. Resetting both boards
+reconstructed the saved enabled head, started downstream LOW and preserved local
+resume after the first HIGH. Surfaces, definitions and clock profiles were preserved;
+only the original C6 head's revision advanced for the test's disable/re-enable.
+The maintained updated images remain on both boards with test appliance levels zero.
+
+These are one-hop MCU checks using software-backed appliance states, not physical
+sensor/actuator, arbitrary RF-delivery or hard latency proof. Native/time primitives
+also retain their earlier checks; this run did not repeat temporal-boundary or
+isolated-power-loss testing. The lab driver, image hashes and captures are outside
+source under `lattice-vertex-lab/experiments/retained-activation-20261105`; no kernel
+code or build depends on them.
 
 Both ports' existing radio fixture has a `program-test` feature that starts with
 storage and an ordinary test appliance without a signing policy. It contains no
@@ -440,14 +425,3 @@ existing layout-3 provisioning procedure with those artifacts before a physical
 test. This mode needs no release public key. Signed-update builds use
 the same service. `prepare --ota --appliance` provides the existing dimmer fixture
 and binary USB host endpoint together; it still contains no preinstalled program.
-
-The 2026-10-22 C6/nRF52840 hardware check installed 133-byte and 135-byte definitions
-after boot, including radio installation of the remote half. It evaluated
-`C6.level >= 100 && Nordic.power`, computed `C6.level - 50` at the C6, and invoked
-Nordic SetLevel with that carried byte. False predicates suppressed mutation;
-changing only Nordic power activated backward through the C6 and returned to the
-Nordic. Enable/disable/resume, registered delta events, and reconstruction after
-resetting both MCUs passed, with no reported execution faults, uncertain handoffs
-or activation overflow in the capture. These are software-backed native surfaces;
-the result does not establish physical dimmer behavior or loss-free RF. Artifacts,
-captures and the one-off authoring/check script remain in the external lab.

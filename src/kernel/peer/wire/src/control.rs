@@ -1,6 +1,11 @@
 //! Continuous absolute-target control. Pending targets may be superseded;
 //! running native calls and registered physical deltas are never canceled.
-pub use crate::program::execution::Ticket;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ticket {
+    pub epoch: u64,
+    pub slot: u16,
+    pub generation: u32,
+}
 use crate::program::transfer::{Reply, Status, REQUEST_BYTES};
 use crate::{scalar, InvokeStatus, StateReadResult, Type, Value};
 

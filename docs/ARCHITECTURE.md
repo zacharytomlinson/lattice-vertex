@@ -30,8 +30,10 @@ specification. Development discipline belongs in [AGENTS.md](../AGENTS.md).
 
 This is the accepted target model, not a claim of implementation. Maintained circuit
 signals and compile-time hardware assembly supersede the earlier upstream-to-head,
-forward-visit execution model. The current kernel still contains that record interpreter
-and traversal engine; its formats and evidence remain in component notes until migration.
+forward-visit execution model. The kernel now retains connection inputs in software;
+local record interpretation remains until native lowering. Hardware realization is
+not established by that software implementation. Formats and evidence live in
+component notes.
 [The kernel direction](KERNEL_DIRECTION.md) distinguishes that baseline from planned work.
 
 | Requirement | Architectural consequence |
@@ -622,15 +624,15 @@ Retries retain identity and ordering. A lost acceptance receipt is answered from
 evidence without repeating processing. Changing the radio path does not turn the same
 update into a fresh transition. Unique + Temporal prevents an old high from overwriting
 a newer registered low. Older arrivals are discarded, without resequencing; this does
-not cancel an earlier accepted evaluation. The concrete bounded channel format remains
-implementation work. A finite retry budget does not prove eventual delivery after an
+not cancel an earlier accepted evaluation. The component notes specify the bounded
+signal-update format and its acceptance storage. A finite retry budget does not prove eventual delivery after an
 unbounded outage.
 
 Capacity is explicit. Busy leaves work with its sender, and accepted work cannot be
 evicted to admit another update. Local overflow is reported rather than represented as
 lossless acquisition. Incarnation and storage-reuse identity prevent delayed packets
 from binding to a different connection. These obligations reuse the kernel's delivery
-owners, but the present visit-reservation protocol is not yet a circuit-update protocol.
+owners. The software backend uses addressed signal updates in place of visit reservations.
 
 General observation broadcasts remain best-effort. A consumer requiring dependable
 observations needs an explicit receiving relationship. Universal dissemination, public
@@ -860,8 +862,7 @@ activation/value snapshot. Only the head can originate initial activation, and
 only while its enabled predicate is true. Other vertices remain LOW until an
 upstream HIGH and their own evaluation permit propagation. Do not add a forced
 upstream-state announcement on connection establishment or replay an interrupted
-mutation. The prior independent upstream recovery evaluations are a property of
-the existing engine, not this head-originated initialization model.
+mutation. This replaces the prior independent upstream recovery evaluations.
 No lifecycle operation can undo a completed physical action or drop protection while
 the protected state remains open.
 

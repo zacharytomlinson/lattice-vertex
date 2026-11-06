@@ -1,6 +1,6 @@
 //! Resident peer installation service. Flash stays with kernel::storage.
 
-use super::traversal::Traversals;
+use super::execution::Execution;
 use super::Configuration;
 use crate::kernel::appliance::Native;
 use lattice_peer_wire::program::execution::Request as ExecutionRequest;
@@ -10,7 +10,7 @@ static mut CONFIGURATION: Configuration = Configuration::new();
 static mut NATIVE: Option<&'static dyn Native> = None;
 static mut RESTORED: bool = false;
 static mut SURFACE: [u8; 32] = [0; 32];
-static mut TRAVERSALS: Traversals = Traversals::new();
+static mut EXECUTION: Execution = Execution::new();
 static mut CHECKPOINT: bool = false;
 static mut FLASH_BLOCKED: bool = false;
 static mut MORE_LOCAL_WORK: bool = false;
@@ -28,7 +28,7 @@ static mut SYNC: Synchronization = Synchronization {
 };
 #[derive(Clone, Copy)]
 pub(crate) enum Work {
-    Visit(usize),
+    Evaluation(usize),
     Time,
 }
 
@@ -54,14 +54,14 @@ pub(crate) fn receive(caller: u64, request: Request<'_>, output: &mut [u8; REPLY
                 let now = milliseconds();
                 // Earlier admitted local evaluations run before this command.
                 // Native calls and remote handoffs yield independently.
-                let traversals = &mut *core::ptr::addr_of_mut!(TRAVERSALS);
+                let execution = &mut *core::ptr::addr_of_mut!(EXECUTION);
                 let context = crate::sync::TaskContext::assume();
-                traversals.dispatch(programs, native, &context);
+                execution.dispatch(programs, native, &context);
 
                 if let Request::Clock(operation) = request {
                     use lattice_peer_wire::clock::Request as C;
                     if matches!(operation, C::Read | C::Anchor { .. }) {
-                        let epoch = (&*core::ptr::addr_of!(TRAVERSALS)).epoch;
+                        let epoch = (&*core::ptr::addr_of!(EXECUTION)).epoch;
                         if epoch == 0 {
                             return Reply::status(Status::Busy).encode(output);
                         }
@@ -103,8 +103,8 @@ pub(crate) fn receive(caller: u64, request: Request<'_>, output: &mut [u8; REPLY
                     }
                 }
                 if let Request::Execution(operation) = request {
-                    let traversals = &mut *core::ptr::addr_of_mut!(TRAVERSALS);
-                    if traversals.epoch == 0 {
+                    let execution = &mut *core::ptr::addr_of_mut!(EXECUTION);
+                    if execution.epoch == 0 {
                         return Reply::status(if programs.state == Status::Ok {
                             Status::Busy
                         } else {
@@ -117,7 +117,7 @@ pub(crate) fn receive(caller: u64, request: Request<'_>, output: &mut [u8; REPLY
                         ExecutionRequest::State { .. } | ExecutionRequest::Enable { .. }
                     ) {
                         let mut data = [0; lattice_peer_wire::program::transfer::DATA_BYTES];
-                        return traversals
+                        return execution
                             .receive(programs, caller, operation, now, &mut data)
                             .encode(output);
                     }
@@ -138,7 +138,7 @@ pub(crate) fn receive(caller: u64, request: Request<'_>, output: &mut [u8; REPLY
                         status,
                         Status::Persisting | Status::Removed | Status::Storage
                     ) {
-                        (&mut *core::ptr::addr_of_mut!(TRAVERSALS)).remove(definition, generation);
+                        (&mut *core::ptr::addr_of_mut!(EXECUTION)).remove(definition, generation);
                         (&mut *core::ptr::addr_of_mut!(TIME))
                             .retain(|source| programs.temporal_entry(source).is_some());
                     }
@@ -157,7 +157,7 @@ pub(crate) fn pending() -> bool {
     unsafe {
         (!RESTORED && (&*core::ptr::addr_of!(NATIVE)).is_some())
             || (&*core::ptr::addr_of!(CONFIGURATION)).pending_write()
-            || (&*core::ptr::addr_of!(TRAVERSALS)).pending()
+            || (&*core::ptr::addr_of!(EXECUTION)).pending()
             || super::activation::pending()
     }
 }
@@ -214,7 +214,7 @@ pub(crate) fn poll() {
             Err(_) => programs.state = Status::Storage,
         });
         if CHECKPOINT && programs.checkpoint_pending.is_none() && programs.state == Status::Ok {
-            (&mut *core::ptr::addr_of_mut!(TRAVERSALS)).epoch = programs.epoch();
+            (&mut *core::ptr::addr_of_mut!(EXECUTION)).epoch = programs.epoch();
             CHECKPOINT = false;
         }
     }
@@ -225,8 +225,8 @@ pub(crate) fn poll_work(local: u64, context: &crate::sync::TaskContext, now: u32
         let Some(native) = *core::ptr::addr_of!(NATIVE) else {
             return;
         };
-        let traversals = &mut *core::ptr::addr_of_mut!(TRAVERSALS);
-        traversals.local = local;
+        let execution = &mut *core::ptr::addr_of_mut!(EXECUTION);
+        execution.local = local;
         {
             let programs = &mut *core::ptr::addr_of_mut!(CONFIGURATION);
             let time = &mut *core::ptr::addr_of_mut!(TIME);
@@ -236,7 +236,7 @@ pub(crate) fn poll_work(local: u64, context: &crate::sync::TaskContext, now: u32
             if PROFILE_REVISION != revision {
                 time.configure(profile.map(|p| p.1), mono);
                 PROFILE_REVISION = revision;
-                traversals.wake();
+                execution.wake();
             }
             if programs.temporal_dirty {
                 time.retain(|source| programs.temporal_entry(source).is_some());
@@ -247,13 +247,13 @@ pub(crate) fn poll_work(local: u64, context: &crate::sync::TaskContext, now: u32
                 programs.temporal_dirty = false;
             }
             if time.wait_ms(mono) == Some(0) {
-                traversals.wake();
+                execution.wake();
             }
             time.poll(mono);
         }
-        MORE_LOCAL_WORK = admit_changes(&*core::ptr::addr_of!(CONFIGURATION), traversals)
+        MORE_LOCAL_WORK = admit_changes(&*core::ptr::addr_of!(CONFIGURATION), execution)
             && super::activation::pending();
-        MORE_LOCAL_WORK |= traversals.poll(
+        MORE_LOCAL_WORK |= execution.poll(
             &mut *core::ptr::addr_of_mut!(CONFIGURATION),
             native,
             context,
@@ -281,16 +281,16 @@ pub(crate) fn outgoing(
             sync.after = 0;
             sync.due = mono + 5000;
         }
-        (&mut *core::ptr::addr_of_mut!(TRAVERSALS))
+        (&mut *core::ptr::addr_of_mut!(EXECUTION))
             .outgoing(now, out)
-            .map(|(i, o, n)| (Work::Visit(i), o, n))
+            .map(|(i, o, n)| (Work::Evaluation(i), o, n))
     }
 }
 pub(crate) fn sent(work: Work, owner: u64, token: u16, now: u32) {
     unsafe {
         match work {
-            Work::Visit(index) => {
-                (&mut *core::ptr::addr_of_mut!(TRAVERSALS)).sent(index, token, now)
+            Work::Evaluation(index) => {
+                (&mut *core::ptr::addr_of_mut!(EXECUTION)).sent(index, token, now)
             }
             Work::Time => {
                 (&mut *core::ptr::addr_of_mut!(SYNC)).waiting =
@@ -305,16 +305,16 @@ pub(crate) fn awaiting() -> Option<(Work, u16, u64, u32)> {
             .waiting
             .map(|(t, o, n, _)| (Work::Time, t, o, n))
             .or_else(|| {
-                (&*core::ptr::addr_of!(TRAVERSALS))
+                (&*core::ptr::addr_of!(EXECUTION))
                     .awaiting()
-                    .map(|(i, t, o, n)| (Work::Visit(i), t, o, n))
+                    .map(|(i, t, o, n)| (Work::Evaluation(i), t, o, n))
             })
     }
 }
 pub(crate) fn retry(work: Work, now: u32) {
     unsafe {
         match work {
-            Work::Visit(index) => (&mut *core::ptr::addr_of_mut!(TRAVERSALS)).retry(index, now),
+            Work::Evaluation(index) => (&mut *core::ptr::addr_of_mut!(EXECUTION)).retry(index, now),
             Work::Time => {
                 let sync = &mut *core::ptr::addr_of_mut!(SYNC);
                 if let Some((_, owner, _, _)) = sync.waiting {
@@ -330,8 +330,8 @@ pub(crate) fn reply(work: Work, bytes: &[u8], now: u32) {
     if let Some(reply) = Reply::decode(bytes) {
         unsafe {
             match work {
-                Work::Visit(index) => {
-                    (&mut *core::ptr::addr_of_mut!(TRAVERSALS)).reply(index, reply, now)
+                Work::Evaluation(index) => {
+                    (&mut *core::ptr::addr_of_mut!(EXECUTION)).reply(index, reply, now)
                 }
                 Work::Time => {
                     let mono = crate::kernel::time::monotonic_ms();
@@ -361,13 +361,13 @@ pub(crate) fn temporal_value(source: u16) -> Option<bool> {
 pub(crate) fn resume() {
     unsafe {
         FLASH_BLOCKED = false;
-        (&mut *core::ptr::addr_of_mut!(TRAVERSALS)).wake();
+        (&mut *core::ptr::addr_of_mut!(EXECUTION)).wake();
     }
 }
 pub(crate) fn wait_ms(now: u32) -> Option<u64> {
     unsafe {
         let programs = &*core::ptr::addr_of!(CONFIGURATION);
-        let traversals = &*core::ptr::addr_of!(TRAVERSALS);
+        let execution = &*core::ptr::addr_of!(EXECUTION);
         let time = &*core::ptr::addr_of!(TIME);
         let sync = &*core::ptr::addr_of!(SYNC);
         let mono = crate::kernel::time::monotonic_ms();
@@ -379,12 +379,12 @@ pub(crate) fn wait_ms(now: u32) -> Option<u64> {
         if let Some(ms) = programs.wait_ms(now, !FLASH_BLOCKED) {
             include(ms.into());
         }
-        if let Some(ms) = traversals.wait_ms(now, sync.waiting.is_none()) {
+        if let Some(ms) = execution.wait_ms(now, sync.waiting.is_none()) {
             include(ms.into());
         }
         if let Some((_, _, sent, _)) = sync.waiting {
             include(2000u32.saturating_sub(now.wrapping_sub(sent)).into());
-        } else if traversals.awaiting().is_none()
+        } else if execution.awaiting().is_none()
             && time.profile.is_some()
             && time.utc(mono).is_none()
         {
@@ -400,8 +400,8 @@ fn milliseconds() -> u32 {
 }
 
 /// Consume only this kernel instance's committed local-source notifications.
-pub(super) fn admit_changes(programs: &Configuration, traversals: &mut Traversals) -> bool {
-    if traversals.epoch == 0 || traversals.local == 0 || !crate::kernel::change::committed() {
+pub(super) fn admit_changes(programs: &Configuration, execution: &mut Execution) -> bool {
+    if execution.epoch == 0 || execution.local == 0 || !crate::kernel::change::committed() {
         return false;
     }
     if let Some(change) = super::activation::first() {
@@ -409,9 +409,9 @@ pub(super) fn admit_changes(programs: &Configuration, traversals: &mut Traversal
             if let Some(entry) =
                 programs.temporal_entry(change.cursor & !crate::kernel::time::SOURCE)
             {
-                match traversals.activate(programs, entry) {
+                match execution.activate(programs, entry) {
                     Err(Status::Busy) => return false,
-                    Err(e) => traversals.fault(entry, e),
+                    Err(e) => execution.fault(entry, e),
                     Ok(()) => {}
                 }
             }
@@ -424,11 +424,11 @@ pub(super) fn admit_changes(programs: &Configuration, traversals: &mut Traversal
                 generation,
                 record: source.entry,
             };
-            match traversals.activate(programs, entry) {
+            match execution.activate(programs, entry) {
                 Ok(()) => super::activation::advance(next),
                 Err(Status::Busy) => return false,
                 Err(e) => {
-                    traversals.fault(entry, e);
+                    execution.fault(entry, e);
                     super::activation::advance(next);
                 }
             }
@@ -441,5 +441,5 @@ pub(super) fn admit_changes(programs: &Configuration, traversals: &mut Traversal
 }
 
 pub(crate) fn epoch() -> u64 {
-    unsafe { (&*core::ptr::addr_of!(TRAVERSALS)).epoch }
+    unsafe { (&*core::ptr::addr_of!(EXECUTION)).epoch }
 }

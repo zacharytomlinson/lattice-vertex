@@ -151,6 +151,9 @@ impl Request<'_> {
 }
 impl<'a> Request<'a> {
     pub fn decode(b: &'a [u8]) -> Option<Self> {
+        if b.first() == Some(&30) {
+            return super::execution::Request::decode(b).map(Self::Execution);
+        }
         if b.first() == Some(&29) {
             return (b.len() == 7).then(|| Self::Remove {
                 definition: u16::from_le_bytes(b[1..3].try_into().unwrap()),
@@ -249,12 +252,7 @@ mod tests {
     use super::*;
     #[test]
     fn record_bounds() {
-        use super::super::execution::{Cause, Entry, Request as E, Ticket, CHUNK_BYTES};
-        let ticket = Ticket {
-            epoch: 1,
-            slot: 2,
-            generation: 3,
-        };
+        use super::super::execution::{Entry, Request as E, SIGNAL_BYTES};
         for (request, length) in [
             (
                 Request::Execution(E::State {
@@ -274,41 +272,19 @@ mod tests {
             ),
             (Request::Execution(E::Session), 1),
             (
-                Request::Execution(E::Reserve {
-                    epoch: 1,
-                    sender_epoch: 2,
-                    sequence: 3,
-                    cause: Cause {
-                        owner: 4,
-                        epoch: 5,
-                        sequence: 6,
-                    },
-                    entry: Entry {
-                        definition: 4,
-                        generation: 1,
-                        record: 60,
-                    },
-                    upstream: true,
-                    length: 0,
-                }),
-                52,
+                Request::Execution(E::Signal {
+                    source: Entry { definition:4,generation:1,record:60 },
+                    target: Entry { definition:8,generation:2,record:48 },
+                    epoch:3,sequence:4,active:true,offset:0,bytes:&[9;SIGNAL_BYTES],
+                }), REQUEST_BYTES,
             ),
             (
-                Request::Execution(E::Data {
-                    ticket,
-                    offset: 0,
-                    bytes: &[9; CHUNK_BYTES],
-                }),
-                REQUEST_BYTES,
+                Request::Execution(E::Signal {
+                    source: Entry { definition:4,generation:1,record:60 },
+                    target: Entry { definition:8,generation:2,record:48 },
+                    epoch:3,sequence:5,active:false,offset:0,bytes:&[],
+                }), 32,
             ),
-            (
-                Request::Execution(E::Commit {
-                    ticket,
-                    digest: [7; 32],
-                }),
-                47,
-            ),
-            (Request::Execution(E::Release { ticket }), 15),
             (Request::Execution(E::Statistics), 1),
             (Request::Info, 1),
             (
@@ -363,7 +339,11 @@ mod tests {
             assert_eq!(n, length);
             assert_eq!(Request::decode(&bytes[..n]), Some(request));
             for end in 0..n {
-                assert!(Request::decode(&bytes[..end]).is_none());
+                // Signal payload length is the enclosing frame length. A shorter
+                // active piece is structurally valid; its binding checks its size.
+                if !matches!(request, Request::Execution(E::Signal { active:true, .. })) || end < 32 {
+                    assert!(Request::decode(&bytes[..end]).is_none());
+                }
             }
             if n < REQUEST_BYTES {
                 assert!(Request::decode(&bytes[..n + 1]).is_none());

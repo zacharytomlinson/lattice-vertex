@@ -519,8 +519,11 @@ pub const configLATTICE_ACQUISITION_STACK_WORDS: usize = 1024;
 /// Compatibility interval for getter-only State implementations. Event-backed
 /// states do not use this timeout; unchanged acquisitions emit no deltas.
 pub const configLATTICE_ACQUISITION_MS: u32 = 10;
-/// Fixed execution resources, advertised by the resident program service.
-pub const configLATTICE_TRAVERSALS: usize = 4;
-pub const configLATTICE_TRAVERSAL_BYTES: usize = 4096;
+/// Evaluation slots, plus one reserved for incoming/local continuation progress.
+pub const configLATTICE_EVALUATIONS: usize = 4;
+/// Resident local components; input/action bindings have two slots per component.
+pub const configLATTICE_CONNECTIONS: usize = 8;
+/// Shared byte arena for retained inputs/outputs, native arguments and local work.
+pub const configLATTICE_PROGRAM_BYTES: usize = 4096;
 pub const configLATTICE_ACTIVATIONS: usize = 32;
 pub const configLATTICE_PROGRAM_ARGUMENTS: usize = 32;
