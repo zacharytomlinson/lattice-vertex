@@ -18,6 +18,9 @@ pub(crate) enum EncodeError {
 }
 
 trait Encode: Sync {
+    fn name(&self) -> Option<&str> {
+        None
+    }
     fn encode(&self, writer: &mut Writer<'_>, include_ir: bool) -> Result<(), EncodeError>;
 }
 
@@ -25,7 +28,8 @@ trait Encode: Sync {
 /// on demand into the existing frame buffer, without a second resident IR copy.
 pub(crate) struct Description {
     source: &'static dyn Encode,
-    length: u16,
+    // Canonical LSF v3 definition length; presentation metadata is separate.
+    definition_length: u16,
     ir_status: lattice_peer_wire::IrStatus,
     include_ir: bool,
 }
@@ -67,9 +71,12 @@ impl Description {
             }
             Err(error) => return Err(error),
         };
+        if writer.position + source.name().map_or(0, str::len) + 2 > u16::MAX as usize {
+            return Err(EncodeError::TooLarge);
+        }
         Ok(Self {
             source,
-            length: writer.position as u16,
+            definition_length: writer.position as u16,
             ir_status: status,
             include_ir,
         })
@@ -80,7 +87,7 @@ impl Description {
     }
 
     pub(crate) fn len(&self) -> u16 {
-        self.length
+        (self.definition_length as usize + self.source.name().map_or(0, str::len) + 2) as u16
     }
 
     pub(crate) fn identity(&self) -> [u8; 32] {
@@ -88,8 +95,8 @@ impl Description {
         let mut hash = Sha256::new();
         let mut part = [0; 64];
         let mut offset = 0;
-        while offset < self.length {
-            let n = self.encode_part(offset, &mut part);
+        while offset < self.definition_length {
+            let n = self.part(offset, &mut part, false);
             hash.update(&part[..n]);
             offset += n as u16;
         }
@@ -97,7 +104,16 @@ impl Description {
     }
 
     pub(crate) fn encode_part(&self, offset: u16, output: &mut [u8]) -> usize {
-        if offset >= self.length || output.is_empty() {
+        self.part(offset, output, true)
+    }
+
+    fn part(&self, offset: u16, output: &mut [u8], metadata: bool) -> usize {
+        let length = if metadata {
+            self.len()
+        } else {
+            self.definition_length
+        };
+        if offset >= length || output.is_empty() {
             return 0;
         }
         let mut writer = Writer {
@@ -107,8 +123,24 @@ impl Description {
             copied: 0,
             counting: false,
         };
-        match self.source.encode(&mut writer, self.include_ir) {
-            Ok(()) | Err(EncodeError::Full) => writer.copied,
+        let encoded = (|| {
+            self.source.encode(&mut writer, self.include_ir)?;
+            if metadata {
+                let name = self.source.name().unwrap_or("").as_bytes();
+                writer.bytes(name)?;
+                writer.count(name.len())?;
+            }
+            Ok(())
+        })();
+        match encoded {
+            Ok(()) | Err(EncodeError::Full) => {
+                // LSF v4 appends name bytes and their u16 length. Native/IR
+                // records retain their offsets; compatibility hashes remain v3.
+                if metadata && offset <= 3 && 3 - (offset as usize) < writer.copied {
+                    writer.output[3 - offset as usize] = 4;
+                }
+                writer.copied
+            }
             // The immutable surface was checked in full before scheduler startup.
             Err(error) => panic!("validated surface changed: {:?}", error),
         }
@@ -323,6 +355,9 @@ impl<A: 'static, E> Encode for Surface<'_, A, E> {
 
 #[cfg(feature = "use-mutexes")]
 impl<A: Send + Sync + 'static, E: 'static> Encode for crate::kernel::Appliance<A, E> {
+    fn name(&self) -> Option<&str> {
+        self.name()
+    }
     fn encode(&self, writer: &mut Writer<'_>, include_ir: bool) -> Result<(), EncodeError> {
         encode_surface(
             self.surface(),
@@ -487,7 +522,7 @@ mod tests {
 
     #[test]
     fn range_encoding() {
-        let mut expected = Vec::from(&b"LSF\x03"[..]);
+        let mut expected = Vec::from(&b"LSF\x04"[..]);
         expected.extend_from_slice(&[64, 2, 1, 0, 1, 0, 1, 0, 1, 0]);
         reference(&mut expected, ON.reference());
         expected.push(0); // Boolean state
@@ -508,6 +543,7 @@ mod tests {
         expected.extend_from_slice(&[0, 0, 0, 0, 10]);
         inline(&mut expected);
         expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 1, 0, 0]);
+        expected.extend_from_slice(&[0, 0]); // absent name
         let description = Description::new(&SURFACE).unwrap();
         assert_eq!(description.len() as usize, expected.len());
         for width in [1, 7, super::super::frame::SURFACE_BYTES, 256] {
@@ -520,6 +556,14 @@ mod tests {
             }
             assert_eq!(result, expected, "piece size {width}");
         }
+        use sha2::{Digest, Sha256};
+        // Display metadata changes neither the old v3 definition nor its digest.
+        expected.truncate(expected.len() - 2);
+        expected[3] = 3;
+        assert_eq!(
+            description.identity(),
+            <[u8; 32]>::from(Sha256::digest(expected))
+        );
     }
 
     #[test]
@@ -563,7 +607,7 @@ mod tests {
             assert_eq!(bytes[5], *status as u8);
             assert_eq!(bytes[33], u8::from(*model)); // header, state, reference, empty native signature
             if !model {
-                assert_eq!(length, 34);
+                assert_eq!(length, 36);
             }
         }
     }
@@ -647,9 +691,24 @@ mod tests {
                 description.ir_status(),
                 lattice_peer_wire::IrStatus::Incomplete
             );
-            let mut native = [0; 14];
-            assert_eq!(description.encode_part(0, &mut native), 14);
-            assert_eq!(native, *b"LSF\x03\x40\x01\0\0\0\0\0\0\0\0");
+            let mut native = [0; 16];
+            assert_eq!(description.encode_part(0, &mut native), 16);
+            assert_eq!(native, *b"LSF\x04\x40\x01\0\0\0\0\0\0\0\0\0\0");
+        }
+        #[cfg(feature = "use-mutexes")]
+        for (length, accepted) in [(65519, true), (65520, false)] {
+            use self::std::boxed::Box;
+            let name = Box::leak("n".repeat(length).into_boxed_str());
+            let appliance = Box::leak(Box::new(
+                crate::kernel::Appliance::new(&crate::surface::EMPTY).with_name(name),
+            ));
+            let result = Description::prepare(appliance, lattice_peer_wire::IrStatus::Absent);
+            assert_eq!(result.is_ok(), accepted);
+            if accepted {
+                assert_eq!(result.unwrap().len(), u16::MAX);
+            } else {
+                assert!(matches!(result, Err(EncodeError::TooLarge)));
+            }
         }
     }
 

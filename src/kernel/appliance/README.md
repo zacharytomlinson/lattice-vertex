@@ -7,6 +7,31 @@ its declared states and operations automatically. Static storage, references and
 ordinary methods suffice; no state-registration handle or per-state trait is public.
 The [lamp example](../../../examples/surface.rs) is a complete native-only declaration.
 
+## Appliance declaration
+
+A configured name belongs to the ordinary kernel appliance declaration:
+
+```rust,ignore
+static APPLIANCE: Appliance<Relay, Error> = lattice_vertex::appliance! {
+    name: env!("VERTEX_APPLIANCE_NAME"),
+    surface: &SURFACE,
+};
+```
+
+Firmware can supply a literal, a constant, or a build-provided `env!` value.
+The macro expands to `Appliance::new(&SURFACE).with_name(name)`; static initialization
+evaluates that constructor at compile time. The kernel retains the borrowed name
+alongside the surface, and `APPLIANCE.name()` returns it. No generated binary blob,
+custom linker section or runtime registration is required. Existing unnamed
+`Appliance::new` declarations remain valid and return `None` from `name()`.
+
+The name is descriptive. It does not change state/operation binding references
+or the compatibility fingerprint. The kernel exposes it through the ordinary
+LSF v4 surface read; firmware needs no extra publication call. Names consume only
+their UTF-8 bytes plus a two-byte length in that read and must fit the total
+65,535-byte description bound. They add no discovery broadcast traffic. See the
+[surface format](../peer/EXPOSURE.md#surface-format).
+
 ## State is data
 
 ```rust

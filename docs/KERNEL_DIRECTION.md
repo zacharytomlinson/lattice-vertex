@@ -17,7 +17,7 @@ integration before LLVM native lowering. Hardware-offload research remains separ
 | Area | Current implementation | Boundary / next use |
 | --- | --- | --- |
 | RTOS and CPU ports | FreeRTOS-derived tasks, interrupts, timers and synchronization on C6/Nordic | Reuse while useful; replaceable substrate beneath the Lattice firmware contract |
-| Appliance surface | Concrete State values, automatic field/event registration, ordinary native methods and optional IR metadata | Exercise the first interface in real appliance firmware; metadata is not interpreted as device control |
+| Appliance surface | Compile-time names exposed on demand, concrete State values, automatic field/event registration, ordinary native methods and optional IR metadata | Exercise the first interface in real appliance firmware; names do not change durable bindings or compatibility fingerprints |
 | State changes | Typed captured-value FIFO, automatic cell transitions and hardware capture handlers; blocking state task | No getter polling or call-boundary sampling; actual appliance/IRQ integration still needs validation |
 | Program installation | Protected persistence, validation, local computation sharing, paired connections, removal and reconstruction | Reuse ownership; LPD v1/LPG v4 retained; no new logic grammar |
 | Program execution | Retained per-connection inputs/output, direct local reevaluation, sequenced HIGH/LOW updates and native-call argument tracking | Both chip directions checked; replace local record dispatch with LLVM-generated native code |
@@ -56,7 +56,7 @@ ownership, not a commitment to retain the old representation.
 ```mermaid
 flowchart TB
     firmware["Appliance firmware: state, operations and device controllers"]
-    appliance["surface / Appliance: declared fields, methods and optional IR"]
+    appliance["surface / Appliance: name, declared fields, methods and optional IR"]
     state_events["kernel/state + appliance/changes: state data, private registration and FIFO"]
     changes["kernel/change: registered observations"]
     program["program: current LPD/LPG loader, sharing and paired connections"]
@@ -140,8 +140,8 @@ and device access for continuing controllers. Default polling, readiness-only ev
 masks, observation mirrors and before/after native-call sampling are removed.
 Host checks and both maintained MCU firmware builds pass; this is not yet a physical
 IRQ/actuator validation or proof that the four appliance integrations are complete.
-The [consumer entry point](../README.md#start-an-appliance) uses the local checkout
-until these changes are published. Surface/argument boundary checks live beside
+The [consumer entry point](../README.md#start-an-appliance) covers local development
+and pinned Git consumption. Surface/argument boundary checks live beside
 their implementation; retired getter/callback integration tests are removed.
 
 Use the [integration exercise](PROGRAM_DESIGN.md#appliance-integration-exercise)
@@ -165,9 +165,9 @@ own the exact limits and wire layout. LPD v1/LPG v4 and protected appliance/time
 configuration remain unchanged; execution tags 10–13 are retired in favor of
 addressed signal tag 30. No deployed-automation compatibility runtime exists.
 
-LVT v8 and LSF v3 carry IR availability and optional models; host envelopes remain
-v4. All participating firmware must use the new RF version. Surface fingerprints
-change, so test programs/releases must be authored against the new descriptions.
+LVT v8 carries IR availability; LSF v4 carries optional models and an appliance-name
+trailer. Host envelopes remain v4. Surface readers need v4 support; compatibility
+fingerprints remain the canonical v3 definitions, independent of the name.
 
 Incoming activation is LOW and volatile. Only enabled heads originate initial
 activation; local changes elsewhere resume against current upstream inputs.

@@ -44,10 +44,31 @@ def keygen(args):
     print(f"Private key saved to {args.key}; public key saved to {public_path}")
 
 
+def surface_definition(data):
+    """Compatibility bytes: LSF v4 names are presentation, not native bindings."""
+    if len(data) > 0xFFFF or data[4:5] != b"\x40":
+        raise ValueError("invalid surface header")
+    if data[:4] in (b"LSF\x02", b"LSF\x03"):
+        minimum = 13 if data[3] == 2 else 14
+        if len(data) < minimum or (data[3] == 3 and data[5] > 2):
+            raise ValueError("invalid surface header")
+        return data
+    if data[:4] != b"LSF\x04" or len(data) < 16 or data[5] > 2:
+        raise ValueError("invalid surface header")
+    end = len(data) - 2
+    start = end - int.from_bytes(data[end:], "little")
+    if start < 14:
+        raise ValueError("invalid surface name length")
+    name = data[start:end].decode("utf-8")
+    if "\0" in name:
+        raise ValueError("NUL in appliance name")
+    return b"LSF\x03" + data[4:start]
+
+
 def pack(args):
     image = args.image.read_bytes()
-    surface = args.surface.read_bytes()
-    candidate_surface = args.candidate_surface.read_bytes()
+    surface = surface_definition(args.surface.read_bytes())
+    candidate_surface = surface_definition(args.candidate_surface.read_bytes())
     if surface != candidate_surface:
         raise ValueError(
             "candidate changes exported surface/handles; rebind is not supported yet"

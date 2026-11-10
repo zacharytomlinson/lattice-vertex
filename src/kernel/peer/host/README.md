@@ -47,8 +47,8 @@ still enforce their appliance's hardware limits.
 codec is shared by radio frames, surface literals, and USB. `host` is an optional
 module containing the local records/stream decoder; ordinary appliance builds do
 not include it. Neither module contains a radio driver, RTOS, allocator, or IR
-interpreter. The radio uses **LVT v8**, and surfaces use **LSF v3** with explicit
-IR availability and optional operation models. Host envelopes remain v4; a consumer
+interpreter. The radio uses **LVT v8**, and surfaces use **LSF v4** with explicit
+IR availability, optional operation models and an appliance-name trailer. Host envelopes remain v4; a consumer
 can read the first surface range to check availability before downloading the model.
 
 Host request/result kinds **7/0x87** carry owner-directed program installation and

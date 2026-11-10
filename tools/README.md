@@ -24,8 +24,8 @@ Older Nordic fixtures need layout-3 loader/application provisioning together;
 an ordinary package cannot migrate that layout.
 
 The empty-appliance checks use family `01010101010101010101010101010101`, layout 3,
-release A=1 and B=2. Their surface is thirteen bytes: `LSF`, byte 2, byte 64, then
-eight zero bytes. Keep that dump beside generated artifacts. Replace `PORT` below
+release A=1 and B=2. Their unnamed surface is sixteen bytes: `LSF`, byte 4, byte 64,
+then eleven zero bytes. Keep that dump beside generated artifacts. Replace `PORT` below
 with `src/port/nrf52840` or `src/port/esp32c6`; platform is respectively 1 or 2.
 
 ```sh
@@ -61,9 +61,15 @@ to the radio protocol. Measured packages can activate autonomously instead.
 Release packaging requires `--costs JSON` rather than `--unmeasured`. JSON contains
 `erase_page_us`, `write_per_byte`, `verify_per_byte`, `activation_us`,
 `swap_per_byte`, and `longest_pause_us`, with the units defined in the updater.
-Current/candidate surface dumps must be byte-identical. The signing pipeline must
+Current/candidate canonical definitions must be byte-identical. LSF v4 display
+names are excluded: remove the UTF-8 name and trailing `u16` length, and normalize
+the version byte to 3 before comparison/hashing. The packager performs this
+normalization; renames alone are compatible. The signing pipeline must
 supply authentic dumps and the matching candidate release; the packager cannot
 prove those properties from arbitrary machine code.
+
+The name bounds and compatibility normalization checks run with
+`python3 -m unittest discover -s tools -p 'test_update_package.py'`.
 
 For one subsequent candidate without reprovisioning, set `LATTICE_UPDATE_RELEASE=N`
 when building its `ota` binary and use the same signed release. Do not apply the

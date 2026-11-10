@@ -67,6 +67,54 @@ fn initialize() -> (TaskContext, &'static Appliance<Device, ()>) {
     super::super::change::bind(owner);
     (context, owner)
 }
+
+#[test]
+fn declaration_metadata() {
+    use crate::kernel::peer::exposure::Description;
+
+    static FIRST: Appliance<Device, ()> = crate::appliance! {
+        name: concat!("First", " appliance"),
+        surface: &SURFACE,
+    };
+    static SECOND: Appliance<Device, ()> = crate::appliance! {
+        name: "Dining room — appliance with a descriptive name that spans more than one radio frame",
+        surface: &SURFACE,
+    };
+
+    crate::port::test_port_reset();
+    let context = unsafe { TaskContext::assume() };
+    let expected = Description::new(&SURFACE).unwrap().identity();
+    for (owner, name) in [
+        (&FIRST, "First appliance"),
+        (
+            &SECOND,
+            "Dining room — appliance with a descriptive name that spans more than one radio frame",
+        ),
+    ] {
+        owner.initialize(&context, Device::new([Some(false), None]));
+        assert_eq!(owner.name(), Some(name));
+        let description = Description::with_installed(owner).unwrap();
+        assert_eq!(description.identity(), expected);
+        let mut bytes = [0; 256];
+        let length = description.len() as usize;
+        for width in [1, 7, lattice_peer_wire::SURFACE_BYTES] {
+            for (index, chunk) in bytes[..length].chunks_mut(width).enumerate() {
+                assert_eq!(
+                    description.encode_part((index * width) as u16, chunk),
+                    chunk.len()
+                );
+            }
+            let (_, received_name) = lattice_peer_wire::surface_parts(&bytes[..length]).unwrap();
+            assert_eq!(received_name, Some(name));
+        }
+        assert_eq!(owner.device().value.get(), Some(false));
+    }
+    assert_eq!(Appliance::new(&SURFACE).name(), None);
+    for invalid in ["", "invalid\0name"] {
+        assert!(std::panic::catch_unwind(|| Appliance::new(&SURFACE).with_name(invalid)).is_err());
+    }
+}
+
 #[test]
 fn state_value_and_registration_bounds() {
     for (initial, result) in [

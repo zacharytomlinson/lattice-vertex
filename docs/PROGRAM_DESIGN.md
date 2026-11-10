@@ -163,8 +163,9 @@ through the optional behavioral StateTransformer trait. Neither requires IR.
 IR operations and appliance mathematics are explicit attachments. Absence is
 unknown behavior for synthesis, never a default empty effect or permissive condition.
 The cheap discovery marker lets nucleus skip absent/incomplete models before a
-full transfer; declared complete still needs its assessment. LVT v8/LSF v3 encode
-this separation, with the exact format owned by the peer component.
+full transfer; declared complete still needs its assessment. LVT v8/LSF v4 encode
+this separation and the descriptive appliance name, with the exact format owned
+by the peer component. The name is excluded from compatibility identity.
 
 ## Compilation, setup and operation
 

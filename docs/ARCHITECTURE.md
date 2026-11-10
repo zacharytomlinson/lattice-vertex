@@ -241,6 +241,11 @@ Compatible firmware relocation must preserve those references. Reusing a name fo
 a different physical meaning is an incompatible change, even if its type matches.
 Duplicate references must be rejected rather than ambiguously dispatched.
 
+An appliance may separately supply a compile-time descriptive name. The kernel
+exposes that metadata on demand without adding it to ordinary state deltas or
+discovery broadcasts. Display-name changes do not change native bindings or the
+surface compatibility fingerprint used by installed programs and firmware updates.
+
 On reconstruction, the loader resolves saved native bindings and fixes local
 relationships after checking types and compatibility. A multi-node reference adds
 the owning node's identity to this reconstruction domain. Mathematical definitions

@@ -33,6 +33,35 @@ impl IrStatus {
     }
 }
 
+/// Separate optional presentation metadata from an LSF definition without
+/// interpreting IR. The returned definition retains its original version byte.
+/// For a v4 compatibility hash, replace that byte with 3 and hash only this prefix.
+/// Full record validation remains the surface consumer's responsibility.
+pub fn surface_parts(bytes: &[u8]) -> Option<(&[u8], Option<&str>)> {
+    if bytes.len() > u16::MAX as usize || bytes.get(4) != Some(&64) {
+        return None;
+    }
+    match bytes.get(..4)? {
+        b"LSF\x02" if bytes.len() >= 13 => Some((bytes, None)),
+        b"LSF\x03" if bytes.len() >= 14 => {
+            IrStatus::decode(bytes[5])?;
+            Some((bytes, None))
+        }
+        b"LSF\x04" if bytes.len() >= 16 => {
+            IrStatus::decode(bytes[5])?;
+            let end = bytes.len() - 2;
+            let length = u16::from_le_bytes(bytes[end..].try_into().ok()?) as usize;
+            let start = end.checked_sub(length).filter(|&n| n >= 14)?;
+            let name = core::str::from_utf8(&bytes[start..end]).ok()?;
+            if name.as_bytes().contains(&0) {
+                return None;
+            }
+            Some((&bytes[..start], (!name.is_empty()).then_some(name)))
+        }
+        _ => None,
+    }
+}
+
 /// Result of dispatch, never a claim that physical state has converged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]

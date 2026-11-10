@@ -72,7 +72,7 @@ The package is a 192-byte numeric header followed by the image:
 | --- | --- |
 | 0–7 | `LVUP`, format u16, platform u16 |
 | 8–27 | Layout u32, appliance family 16 bytes |
-| 28–59 | SHA-256 of the current/candidate exported surface |
+| 28–59 | SHA-256 of the current/candidate canonical surface definition (excludes display name) |
 | 60–71 | Release u64, image length u32 |
 | 72–103 | Image SHA-256 |
 | 104–127 | Six u32 costs: erase/page, write/byte, verify/byte, activation, swap/byte, longest pause |
@@ -347,3 +347,6 @@ binary remains untouched or runs correctly after a kernel-only update.
 LSF v3 introduces optional IR and changes the encoded surface fingerprint. Build
 release packages and installed definitions against the current description; an
 older fingerprint is not silently treated as the new interface.
+LSF v4 appends display-name metadata while preserving the canonical v3 definition.
+The kernel and packager hash that definition with the v3 header and without the
+name trailer; a rename alone does not require rebinding or invalidate an update.

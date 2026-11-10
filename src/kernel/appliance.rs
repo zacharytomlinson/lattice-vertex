@@ -46,6 +46,7 @@ pub enum InstallError {
 /// The kernel binds typed change inputs and invokes native functions in its tasks.
 /// Firmware owns device behavior; integration requires no report loop.
 pub struct Appliance<A: 'static, E: 'static> {
+    name: Option<&'static str>,
     surface: &'static Surface<'static, A, E>,
     control: UnsafeCell<StaticQueue_t>,
     native: UnsafeCell<MaybeUninit<A>>,
@@ -70,6 +71,7 @@ impl<A: Send + Sync, E> Appliance<A, E> {
             "native state capacity"
         );
         Self {
+            name: None,
             surface,
             control: UnsafeCell::new(StaticQueue_t::new()),
             native: UnsafeCell::new(MaybeUninit::uninit()),
@@ -79,6 +81,29 @@ impl<A: Send + Sync, E> Appliance<A, E> {
             events: changes::Events::new(),
             installed: AtomicPtr::new(ptr::null_mut()),
         }
+    }
+
+    /// Attach an appliance name in the ordinary static declaration.
+    /// The name is separate from durable state/operation bindings and the
+    /// encoded surface identity. No registration or special linker section is used.
+    ///
+    /// # Panics
+    /// Rejects an empty name or an embedded NUL, including during const evaluation.
+    pub const fn with_name(mut self, name: &'static str) -> Self {
+        assert!(!name.is_empty(), "empty appliance name");
+        let bytes = name.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            assert!(bytes[index] != 0, "NUL in appliance name");
+            index += 1;
+        }
+        self.name = Some(name);
+        self
+    }
+
+    /// The optional name supplied by the firmware declaration.
+    pub const fn name(&self) -> Option<&'static str> {
+        self.name
     }
 
     /// Install the actual device once, before starting the scheduler.
@@ -463,3 +488,34 @@ impl<A: Send + Sync, E> Native for Appliance<A, E> {
 
 #[cfg(all(test, feature = "port-test"))]
 mod tests;
+
+/// Construct a named appliance in a static declaration.
+///
+/// The name may be a literal, a constant, or an expression such as `env!(...)`.
+/// Expansion uses the ordinary const constructor, without runtime registration.
+///
+/// ```
+/// use lattice_vertex::{appliance, kernel::Appliance, surface};
+/// use core::convert::Infallible;
+///
+/// static DEVICE: Appliance<(), Infallible> = appliance! {
+///     name: concat!("Kitchen", " light"),
+///     surface: &surface::EMPTY,
+/// };
+/// assert_eq!(DEVICE.name(), Some("Kitchen light"));
+/// ```
+///
+/// ```compile_fail
+/// use lattice_vertex::{appliance, kernel::Appliance, surface};
+/// use core::convert::Infallible;
+/// static INVALID: Appliance<(), Infallible> = appliance! {
+///     name: "",
+///     surface: &surface::EMPTY,
+/// };
+/// ```
+#[macro_export]
+macro_rules! appliance {
+    (name: $name:expr, surface: $surface:expr $(,)?) => {
+        $crate::kernel::Appliance::new($surface).with_name($name)
+    };
+}

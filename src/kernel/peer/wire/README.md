@@ -1,7 +1,7 @@
 # Shared numeric wire definitions
 
 `lattice-peer-wire` owns the declared-width scalar/argument codec used by peer
-frames, surface literals, and attached-host messages. The current consumers use LVT v8, host v4, and LSF v3. Values and integer domains
+frames, surface literals, and attached-host messages. The current consumers use LVT v8, host v4, and LSF v4. Values and integer domains
 come from `lattice-ir`; protocol status values live here so the host need not invent
 a second interpretation of native dispatch or state-read failures. The registered
 `StateChange` record is also shared by RF deltas and host events.
@@ -55,7 +55,7 @@ an attempt token, phase, and bounded relative duration; LVT v8 opcode 18 encodes
 it after the network tag. It has no routed or attached-host request equivalent.
 
 IR availability is shared as `IrStatus`: absent, incomplete, or declared complete.
-Owner announcements carry it in the existing hop/control byte; LSF v3 also includes
+Owner announcements carry it in the existing hop/control byte; LSF v3/v4 also include
 it in its header. Native operation signatures are always present; a separate flag
 says whether authored IR follows. The marker never gates ordinary participation.
 
