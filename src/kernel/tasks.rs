@@ -14,10 +14,10 @@
 //! Ported from tasks.c in the FreeRTOS kernel.
 //!
 //! ## Key Functions
-//! - [`xTaskCreate`] / [`xTaskCreateStatic`] - Create a new task
+//! - `xTaskCreate` (allocator required) / [`xTaskCreateStatic`] - Create a new task
 //! - [`vTaskStartScheduler`] - Start the scheduler
 //! - [`vTaskDelay`] - Delay the current task
-//! - [`vTaskSuspend`] / [`vTaskResume`] - Suspend/resume tasks
+//! - `vTaskSuspend` / `vTaskResume` - Suspend/resume tasks (`task-suspend` feature)
 //!
 //! ## Scheduler Globals
 //! - `pxCurrentTCB` - Pointer to the currently running task
@@ -5212,6 +5212,29 @@ mod tests {
     unsafe fn initialise_synthetic_mutex_tcb(tcb: *mut TCB_t, priority: UBaseType_t) {
         initialise_synthetic_tcb(tcb, priority);
         (*tcb).uxBasePriority = priority;
+    }
+
+    #[cfg(all(feature = "port-test", feature = "use-mutexes"))]
+    #[test]
+    fn state_transition_excludes_task_switching() {
+        unsafe {
+            crate::port::test_port_reset();
+            reset_synthetic_scheduler_state();
+            xSchedulerRunning = pdTRUE;
+            let state = crate::kernel::State::new(false);
+            crate::kernel::state::atomic(|| {
+                assert_eq!(xTaskGetSchedulerState(), taskSCHEDULER_SUSPENDED);
+                vTaskSwitchContext(); // Models a synchronous yield requested by queue wakeup.
+                assert_eq!(xYieldPendings[0], pdTRUE);
+                state.set(true).unwrap(); // Nested transition preserves outer suspension.
+                assert_eq!(xTaskGetSchedulerState(), taskSCHEDULER_SUSPENDED);
+            });
+            assert_eq!(xTaskGetSchedulerState(), taskSCHEDULER_RUNNING);
+            assert_eq!(state.get(), Some(true));
+            assert_eq!(uxSchedulerSuspended, 0);
+            reset_synthetic_scheduler_state();
+            crate::port::test_port_reset();
+        }
     }
 
     #[test]

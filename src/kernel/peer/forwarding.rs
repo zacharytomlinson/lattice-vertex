@@ -1273,6 +1273,7 @@ impl Forwarder {
         &mut self,
         sequence: u16,
         surface_bytes: u16,
+        ir_status: lattice_peer_wire::IrStatus,
         now: u32,
     ) -> Message<'static> {
         self.expire(now);
@@ -1286,6 +1287,7 @@ impl Forwarder {
                 owner: SurfaceOwner {
                     address: self.local,
                     surface_bytes,
+                    ir_status,
                 },
                 sequence,
                 hops: 1,
@@ -1316,6 +1318,7 @@ impl Forwarder {
         &mut self,
         incoming: Message<'_>,
         surface_bytes: u16,
+        ir_status: lattice_peer_wire::IrStatus,
         now: u32,
         mut send: impl FnMut(Message<'static>),
     ) -> Option<SurfaceOwner> {
@@ -1378,6 +1381,7 @@ impl Forwarder {
                         owner: SurfaceOwner {
                             address: self.local,
                             surface_bytes,
+                            ir_status,
                         },
                         hops: 1,
                     },
@@ -2510,7 +2514,8 @@ mod tests {
                         network,
                         owner: SurfaceOwner {
                             address: owner,
-                            surface_bytes: 13,
+                            surface_bytes: 14,
+                            ir_status: lattice_peer_wire::IrStatus::DeclaredComplete,
                         },
                         sequence: 7,
                         hops,
@@ -2533,7 +2538,13 @@ mod tests {
                             };
                             let accepted = match content {
                                 Content::Arrive { .. } => node
-                                    .receive_discovery(input, 13, 0, |m| sent.push(m))
+                                    .receive_discovery(
+                                        input,
+                                        14,
+                                        lattice_peer_wire::IrStatus::Absent,
+                                        0,
+                                        |m| sent.push(m),
+                                    )
                                     .is_some(),
                                 _ => node.receive_change(input, 0, |m| sent.push(m)).is_some(),
                             };
@@ -2546,6 +2557,12 @@ mod tests {
                                 matches!(out.content, Content::Arrive { hops: h, .. } | Content::StateChanged { hops: h, .. } if h == hops + 1)
                             );
                             assert_eq!(out.destination, None);
+                            if let Content::Arrive { owner, .. } = out.content {
+                                assert_eq!(
+                                    owner.ir_status,
+                                    lattice_peer_wire::IrStatus::DeclaredComplete
+                                );
+                            }
                         }
                     }
                 }
@@ -2588,8 +2605,16 @@ mod tests {
                         },
                         1,
                     );
-                    node.receive_discovery(find, 13, 0, |m| sent.push(m));
-                    node.receive_discovery(find, 13, 1, |_| panic!("duplicate query forwarded"));
+                    node.receive_discovery(find, 14, lattice_peer_wire::IrStatus::Absent, 0, |m| {
+                        sent.push(m)
+                    });
+                    node.receive_discovery(
+                        find,
+                        14,
+                        lattice_peer_wire::IrStatus::Absent,
+                        1,
+                        |_| panic!("duplicate query forwarded"),
+                    );
                     let valid = network == NET && seeker != 2;
                     assert_eq!(
                         sent.len(),
@@ -2606,7 +2631,8 @@ mod tests {
                             Content::OwnerFound {
                                 owner: SurfaceOwner {
                                     address: 2,
-                                    surface_bytes: 13
+                                    surface_bytes: 14,
+                                    ir_status: lattice_peer_wire::IrStatus::Absent,
                                 },
                                 ..
                             }
@@ -2637,7 +2663,8 @@ mod tests {
                         request,
                         owner: SurfaceOwner {
                             address: owner,
-                            surface_bytes: 13,
+                            surface_bytes: 14,
+                            ir_status: lattice_peer_wire::IrStatus::Absent,
                         },
                         hops,
                     },
@@ -2645,12 +2672,26 @@ mod tests {
                 );
                 let mut sent = Vec::new();
                 assert_eq!(
-                    node.receive_discovery(found, 13, 1, |m| sent.push(m))
-                        .is_some(),
+                    node.receive_discovery(
+                        found,
+                        14,
+                        lattice_peer_wire::IrStatus::Absent,
+                        1,
+                        |m| sent.push(m)
+                    )
+                    .is_some(),
                     valid
                 );
                 assert_eq!(sent.len(), usize::from(valid && seeker != 2));
-                assert!(node.receive_discovery(found, 13, 2, |_| panic!()).is_none());
+                assert!(node
+                    .receive_discovery(
+                        found,
+                        14,
+                        lattice_peer_wire::IrStatus::Absent,
+                        2,
+                        |_| panic!()
+                    )
+                    .is_none());
             }
             assert_eq!(
                 node.routes.iter().filter(|r| r.owner != 0).count(),

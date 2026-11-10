@@ -91,7 +91,7 @@ normalized cost; hop count and address only break ties.
 
 ## Wire format
 
-These use **LVT v7**. Link replies now include the advertised neighbor cost and
+These use **LVT v8**. Link replies include the advertised neighbor cost and
 the remaining return-sender-to-owner path cost. Older wire versions are rejected.
 The common payload prefix remains magic/version (4 bytes), opcode (1), network
 founder (8), and channel (1). Integers are little-endian.

@@ -18,7 +18,7 @@ pub(super) use lattice_peer_wire::scalar::{decode_value, encode_value, type_tag}
 pub(crate) use lattice_peer_wire::{InvokeStatus, StateReadResult};
 
 const PAN: PanId = PanId(PAN_ID);
-const MAGIC: &[u8; 4] = b"LVT\x07";
+const MAGIC: &[u8; 4] = b"LVT\x08";
 pub(super) const MAX_HOPS: u8 = 8;
 const MAX_PAYLOAD: usize = MAX_FRAME_SIZE - 21;
 // Worst-case addressed MAC header plus the complete routed reply envelope.
@@ -44,6 +44,7 @@ pub(super) use lattice_peer_wire::StateChange;
 pub(super) struct SurfaceOwner {
     pub address: u64,
     pub surface_bytes: u16,
+    pub ir_status: lattice_peer_wire::IrStatus,
 }
 
 /// One immutable range request. The reader chooses a fresh token for each
@@ -339,7 +340,7 @@ impl<'a> Message<'a> {
                 payload[14..22].copy_from_slice(&owner.address.to_le_bytes());
                 payload[22..24].copy_from_slice(&sequence.to_le_bytes());
                 payload[24..26].copy_from_slice(&owner.surface_bytes.to_le_bytes());
-                payload[26] = hops;
+                payload[26] = hops | ((owner.ir_status as u8) << 4);
                 27
             }
             Content::FindOwners {
@@ -370,7 +371,7 @@ impl<'a> Message<'a> {
                 payload[22..24].copy_from_slice(&request.to_le_bytes());
                 payload[24..32].copy_from_slice(&owner.address.to_le_bytes());
                 payload[32..34].copy_from_slice(&owner.surface_bytes.to_le_bytes());
-                payload[34] = hops;
+                payload[34] = hops | ((owner.ir_status as u8) << 4);
                 35
             }
             Content::ReadSurface {
@@ -792,20 +793,24 @@ impl<'a> Message<'a> {
                             SurfaceOwner {
                                 address,
                                 surface_bytes: u16::from_le_bytes(p[24..26].try_into().unwrap()),
+                                ir_status: lattice_peer_wire::IrStatus::decode(p[26] >> 4)
+                                    .ok_or(InvalidFrame)?,
                             },
-                            p[26],
+                            p[26] & 15,
                         )
                     } else {
                         (
                             SurfaceOwner {
                                 address: u64::from_le_bytes(p[24..32].try_into().unwrap()),
                                 surface_bytes: u16::from_le_bytes(p[32..34].try_into().unwrap()),
+                                ir_status: lattice_peer_wire::IrStatus::decode(p[34] >> 4)
+                                    .ok_or(InvalidFrame)?,
                             },
-                            p[34],
+                            p[34] & 15,
                         )
                     };
                     if !valid_address(owner.address)
-                        || owner.surface_bytes < 13
+                        || owner.surface_bytes < 14
                         || !(1..=MAX_HOPS).contains(&hops)
                         || (hops == 1 && source != owner.address)
                     {
@@ -860,7 +865,7 @@ impl<'a> Message<'a> {
                 } else {
                     let total = u16::from_le_bytes(p[34..36].try_into().unwrap());
                     let hops = p[36];
-                    if total < 13
+                    if total < 14
                         || read.offset > total
                         || !(1..=MAX_HOPS).contains(&hops)
                         || (hops == 1 && source != read.owner)
@@ -1487,7 +1492,7 @@ mod tests {
                     b'L',
                     b'V',
                     b'T',
-                    7,
+                    8,
                     13,
                     99,
                     0,
@@ -1538,7 +1543,7 @@ mod tests {
         assert_eq!(
             &wire[21..n],
             &[
-                b'L', b'V', b'T', 7, 14, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
+                b'L', b'V', b'T', 8, 14, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
                 23, 22, 21, 20, 19, 18, 17, 0x34, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 9, 7, 6, 5, 4, 3,
                 2, 1, 8,
             ]
@@ -1693,7 +1698,7 @@ mod tests {
         assert_eq!(
             &wire[21..n],
             &[
-                b'L', b'V', b'T', 7, 11, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
+                b'L', b'V', b'T', 8, 11, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
                 23, 22, 21, 20, 19, 18, 17, 0x34, 0x12, 42, 0, 0, 0, 0, 0, 0, 0, 8,
             ]
         );
@@ -1952,7 +1957,7 @@ mod tests {
         assert_eq!(
             &wire[21..n],
             &[
-                b'L', b'V', b'T', 7, 8, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
+                b'L', b'V', b'T', 8, 8, 99, 0, 0, 0, 0, 0, 0, 0, 15, 8, 7, 6, 5, 4, 3, 2, 1, 24,
                 23, 22, 21, 20, 19, 18, 17, 1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8, 8, 1, 0, 1,
             ]
         );
@@ -2076,6 +2081,7 @@ mod tests {
         let owner = SurfaceOwner {
             address: A,
             surface_bytes: 195,
+            ir_status: lattice_peer_wire::IrStatus::Absent,
         };
         let cases: &[(Content, Option<u64>, &[u8])] = &[
             (
@@ -2087,7 +2093,7 @@ mod tests {
                 },
                 None,
                 &[
-                    b'L', b'V', b'T', 7, 3, 99, 0, 0, 0, 0, 0, 0, 0, 23, 8, 7, 6, 5, 4, 3, 2, 1,
+                    b'L', b'V', b'T', 8, 3, 99, 0, 0, 0, 0, 0, 0, 0, 23, 8, 7, 6, 5, 4, 3, 2, 1,
                     0x34, 0x12, 195, 0, 1,
                 ],
             ),
@@ -2100,7 +2106,7 @@ mod tests {
                 },
                 None,
                 &[
-                    b'L', b'V', b'T', 7, 6, 99, 0, 0, 0, 0, 0, 0, 0, 23, 8, 7, 6, 5, 4, 3, 2, 1,
+                    b'L', b'V', b'T', 8, 6, 99, 0, 0, 0, 0, 0, 0, 0, 23, 8, 7, 6, 5, 4, 3, 2, 1,
                     0x34, 0x12, 8,
                 ],
             ),
@@ -2114,7 +2120,7 @@ mod tests {
                 },
                 Some(B),
                 &[
-                    b'L', b'V', b'T', 7, 7, 99, 0, 0, 0, 0, 0, 0, 0, 23, 0x18, 0x17, 0x16, 0x15,
+                    b'L', b'V', b'T', 8, 7, 99, 0, 0, 0, 0, 0, 0, 0, 23, 0x18, 0x17, 0x16, 0x15,
                     0x14, 0x13, 0x12, 0x11, 0x34, 0x12, 8, 7, 6, 5, 4, 3, 2, 1, 195, 0, 1,
                 ],
             ),
@@ -2139,6 +2145,51 @@ mod tests {
                 assert_eq!(&wire[n - 4..n], &[255; 4]);
             }
             assert_eq!(Message::decode(&wire[..n], B, 23).unwrap(), message);
+            for status in [
+                lattice_peer_wire::IrStatus::Absent,
+                lattice_peer_wire::IrStatus::Incomplete,
+                lattice_peer_wire::IrStatus::DeclaredComplete,
+            ] {
+                let content = match content {
+                    Content::Arrive {
+                        network,
+                        owner,
+                        sequence,
+                        hops,
+                    } => Content::Arrive {
+                        network,
+                        owner: SurfaceOwner {
+                            ir_status: status,
+                            ..owner
+                        },
+                        sequence,
+                        hops,
+                    },
+                    Content::OwnerFound {
+                        network,
+                        seeker,
+                        request,
+                        owner,
+                        hops,
+                    } => Content::OwnerFound {
+                        network,
+                        seeker,
+                        request,
+                        owner: SurfaceOwner {
+                            ir_status: status,
+                            ..owner
+                        },
+                        hops,
+                    },
+                    _ => continue,
+                };
+                let declared = Message { content, ..message };
+                let mut bytes = [0; MAX_FRAME_SIZE];
+                assert_eq!(declared.encode(42, &mut bytes), n); // no extra discovery bytes
+                assert_eq!(Message::decode(&bytes[..n], B, 23).unwrap(), declared);
+                bytes[header + if destination.is_some() { 34 } else { 26 }] |= 0x30;
+                assert!(Message::decode(&bytes[..n], B, 23).is_err());
+            }
             assert!(Message::decode(&wire[..n], B, 22).is_err());
             for end in 0..n {
                 assert!(Message::decode(&wire[..end], B, 23).is_err());
@@ -2296,7 +2347,7 @@ mod tests {
             assert_eq!(
                 &out[p..n],
                 &[
-                    b'L', b'V', b'T', 7, 4, 99, 0, 0, 0, 0, 0, 0, 0, 23, 0x18, 0x17, 0x16, 0x15,
+                    b'L', b'V', b'T', 8, 4, 99, 0, 0, 0, 0, 0, 0, 0, 23, 0x18, 0x17, 0x16, 0x15,
                     0x14, 0x13, 0x12, 0x11, 8, 7, 6, 5, 4, 3, 2, 1, 0x34, 0x12, 0x78, 0x56, 8
                 ]
             );
@@ -2326,7 +2377,7 @@ mod tests {
                 },
                 &[
                     0x41, 0xd8, 42, 0x56, 0x4c, 0xff, 0xff, 8, 7, 6, 5, 4, 3, 2, 1, b'L', b'V',
-                    b'T', 7, 0,
+                    b'T', 8, 0,
                 ],
             ),
             (
@@ -2338,7 +2389,7 @@ mod tests {
                 },
                 &[
                     0x61, 0xdc, 42, 0x56, 0x4c, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 8,
-                    7, 6, 5, 4, 3, 2, 1, b'L', b'V', b'T', 7, 1, 0x28, 0x27, 0x26, 0x25, 0x24,
+                    7, 6, 5, 4, 3, 2, 1, b'L', b'V', b'T', 8, 1, 0x28, 0x27, 0x26, 0x25, 0x24,
                     0x23, 0x22, 0x21, 23,
                 ],
             ),
@@ -2351,7 +2402,7 @@ mod tests {
                 },
                 &[
                     0x41, 0xd8, 42, 0x56, 0x4c, 0xff, 0xff, 8, 7, 6, 5, 4, 3, 2, 1, b'L', b'V',
-                    b'T', 7, 2, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 23,
+                    b'T', 8, 2, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 23,
                 ],
             ),
         ];

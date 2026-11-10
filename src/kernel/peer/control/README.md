@@ -88,7 +88,7 @@ a running hardware call. The existing task wakeup deadlines serve these interval
 
 Setup uses inner command **24** in the existing Program service envelope. It replaces
 unbound Open tag 19, which is rejected. Finish/Close retain inner tags 21/22. The
-compact RF records use outer LVT v7 opcodes 25–28; each is prefixed by the existing
+compact RF records use outer LVT v8 opcodes 25–28; each is prefixed by the existing
 four-byte magic/version. Their handle is the nonce established by Open.
 
 | RF opcode | Fields after opcode | Lattice payload bytes including magic/opcode |

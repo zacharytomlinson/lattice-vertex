@@ -10,38 +10,33 @@ use crate::{
         peer::{exposure::Description, frame::StateReadResult},
         Appliance,
     },
-    surface::{Definition, State, Surface},
+    surface::{Definition, Surface},
     sync::TaskContext,
 };
 
-struct Device(core::sync::atomic::AtomicU16);
+struct Device(crate::kernel::State<u8>);
 impl Device {
     fn new(v: Option<u8>) -> Self {
-        Self(core::sync::atomic::AtomicU16::new(v.map_or(256, u16::from)))
+        Self(crate::kernel::State::restore(v))
     }
     fn set(&self, v: Option<u8>) {
-        self.0.store(v.map_or(256, u16::from), Ordering::Relaxed);
+        self.0.replace(v).unwrap();
     }
     fn get(&self) -> Option<u8> {
-        u8::try_from(self.0.load(Ordering::Relaxed)).ok()
+        self.0.get()
     }
 }
-struct Level;
-impl State for Level {
-    type Appliance = Device;
-    type Value = u8;
-    fn read(a: &Device) -> Option<u8> {
-        a.get()
-    }
-}
-static SOURCE: StateHandle<Device> = StateHandle::new::<Level>("source");
-static ALIAS: StateHandle<Device> = StateHandle::new::<Level>("alias");
+static SOURCE: StateHandle<Device> = StateHandle::new("source", |a| &a.0);
+static ALIAS: StateHandle<Device> = StateHandle::new("alias", |a| &a.0);
 static INPUTS: [&ir::Attribute<Read<Device>>; 1] = [SOURCE.definition()];
 static SURFACE: Surface<Device, ()> = Surface {
     states: &[&SOURCE],
     transformers: &[],
-    axioms: &[],
-    invariants: &[],
+    model: Some(&crate::surface::IrModel {
+        complete: true,
+        axioms: &[],
+        invariants: &[],
+    }),
 };
 // The predicate is opaque to maintenance: checking correspondence with native
 // code belongs to the compiler. This suite tests storage and dispatch boundaries.
@@ -83,7 +78,7 @@ impl Fixture {
     }
     fn initialize(&self) {
         self.owner.initialize(&self.context, Device::new(None));
-        self.owner.acquire(&self.context);
+        self.owner.process_changes(&self.context);
     }
     fn install(&self) -> Result<(), InstallError> {
         self.owner
@@ -91,7 +86,7 @@ impl Fixture {
     }
     fn set(&self, v: Option<u8>) {
         self.owner.with(&self.context, |a| a.set(v));
-        self.owner.acquire(&self.context);
+        self.owner.process_changes(&self.context);
     }
     fn read(&self, attr: &ir::Attribute<Read<Device>>) -> Option<Value> {
         let StateReadResult::Value { value, .. } = self.owner.read(&self.context, reference(attr))
@@ -285,7 +280,7 @@ fn instance_ownership() {
         .unwrap();
     let other = leak(Appliance::new(&SURFACE));
     other.initialize(&f.context, Device::new(None));
-    other.acquire(&f.context);
+    other.process_changes(&f.context);
     assert_eq!(
         other.install_state(&f.context, f.state, difference, &RULE),
         Err(InstallError::AlreadyInstalled)
@@ -294,7 +289,7 @@ fn instance_ownership() {
     for owned in [false, true] {
         let owner = if owned { f.owner } else { other };
         owner.with(&f.context, |a| a.set(Some(31)));
-        owner.acquire(&f.context);
+        owner.process_changes(&f.context);
         for record in [f.state, second] {
             assert_eq!(
                 f.read(record.sample(0)),
@@ -324,7 +319,7 @@ fn publication_identity() {
     let mut bytes = std::vec![0; description.len() as usize];
     description.encode_part(0, &mut bytes);
     assert!(description.len() > base.len());
-    for (entry, attr) in bytes[13..13 + 4 * 9]
+    for (entry, attr) in bytes[14..14 + 4 * 9]
         .chunks_exact(9)
         .zip(crate::ir::Surface::states(f.owner))
     {

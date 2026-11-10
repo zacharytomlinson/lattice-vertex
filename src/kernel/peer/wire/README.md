@@ -1,7 +1,7 @@
 # Shared numeric wire definitions
 
 `lattice-peer-wire` owns the declared-width scalar/argument codec used by peer
-frames, surface literals, and attached-host messages. The current consumers use LVT v7, host v4, and LSF v2. Values and integer domains
+frames, surface literals, and attached-host messages. The current consumers use LVT v8, host v4, and LSF v3. Values and integer domains
 come from `lattice-ir`; protocol status values live here so the host need not invent
 a second interpretation of native dispatch or state-read failures. The registered
 `StateChange` record is also shared by RF deltas and host events.
@@ -47,12 +47,17 @@ for the signed package and byte layout.
 Update phase 7 (`Verifying`) retains partial hash progress. A successful Finish
 may report this phase; send another Finish until Ready. Busy leaves progress
 unchanged and permits a later immutable-request retry. These additions keep the
-28-byte progress width and LVT v7 / host v4 envelopes. Updater consumers must use
+28-byte progress width and LVT v8 / host v4 envelopes. Updater consumers must use
 the updated phase decoder; ordinary read/call/change records are unaffected.
 
 `update::Absence` is the fixed nine-byte one-hop planned-outage notice. It carries
-an attempt token, phase, and bounded relative duration; LVT v7 opcode 18 encodes
+an attempt token, phase, and bounded relative duration; LVT v8 opcode 18 encodes
 it after the network tag. It has no routed or attached-host request equivalent.
+
+IR availability is shared as `IrStatus`: absent, incomplete, or declared complete.
+Owner announcements carry it in the existing hop/control byte; LSF v3 also includes
+it in its header. Native operation signatures are always present; a separate flag
+says whether authored IR follows. The marker never gates ordinary participation.
 
 ## Communication cost
 

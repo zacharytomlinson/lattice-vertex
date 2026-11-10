@@ -29,14 +29,22 @@
  * structure, control flow, and comments as much as possible.
  */
 
-//! # FreeRTOS-in-Rust - FreeRTOS Kernel in Rust
+//! # Lattice vertex
 //!
-//! This crate provides a pure-Rust implementation of the FreeRTOS kernel,
-//! translated line-by-line from the original C source code.
+//! Appliance firmware declares [`kernel::State`] fields or [`kernel::StateEvent`]
+//! sources and native methods through [`surface`]. `kernel::Appliance` registers
+//! those sources automatically. On supported radio ports, `kernel::start` owns
+//! networking and execution while the firmware's tasks and event handlers own
+//! appliance behavior. Mathematical IR models are optional.
+//!
+//! The scheduler and synchronization mechanisms derive from the pure-Rust
+//! FreeRTOS translation. The firmware interface and native-only example are in
+//! the repository's `src/kernel/appliance/README.md` and `examples/surface.rs`.
 //!
 //! ## Features
 //!
 //! - `port-dummy` - Dummy port for compilation (default, panics at runtime)
+//! - `port-esp32c6` / `port-nrf52840` - Supported MCU and radio integration
 //! - `arch-32bit` - 32-bit architecture types (default)
 //! - `arch-64bit` - 64-bit architecture types
 //! - `tick-32bit` - 32-bit tick counter (default)

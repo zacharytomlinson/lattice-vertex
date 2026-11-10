@@ -130,24 +130,18 @@ fn jitter(local: u64, now: u32) -> u32 {
 // a native call. Commit closes admission atomically before changing boot state.
 use core::sync::atomic::{AtomicU32, Ordering};
 const COMMITTING: u32 = 1 << 31;
-const OBSERVATION: u32 = 1 << 16;
-const WORK_MASK: u32 = OBSERVATION - 1;
 static HOLDS: AtomicU32 = AtomicU32::new(0);
 static ACTIVITY: AtomicU32 = AtomicU32::new(0);
 
 #[must_use = "keep the guard until the physical operation finishes"]
 pub struct ActivationHold {
-    count: u32,
+    _private: (),
 }
 impl Drop for ActivationHold {
     fn drop(&mut self) {
-        if self.count == 1 {
-            activity();
-        }
-        HOLDS.fetch_sub(self.count, Ordering::AcqRel);
-        if self.count == 1 {
-            wake();
-        }
+        activity();
+        HOLDS.fetch_sub(1, Ordering::AcqRel);
+        wake();
     }
 }
 /// Keep this guard for the duration of physical work that must not be interrupted
@@ -159,27 +153,13 @@ pub fn hold_activation(
     try_hold()
 }
 pub(crate) fn try_hold() -> Result<ActivationHold, lattice_peer_wire::update::Status> {
-    acquire_hold(true)
-}
-pub(super) fn observation_hold() -> Result<ActivationHold, lattice_peer_wire::update::Status> {
-    acquire_hold(false)
-}
-fn acquire_hold(
-    activity_on_drop: bool,
-) -> Result<ActivationHold, lattice_peer_wire::update::Status> {
-    let count = if activity_on_drop { 1 } else { OBSERVATION };
     HOLDS
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            if n >= COMMITTING || (activity_on_drop && n & WORK_MASK == WORK_MASK) {
-                return None;
-            }
-            n.checked_add(count).filter(|next| *next < COMMITTING)
+            (n < COMMITTING - 1).then_some(n + 1)
         })
         .map_err(|_| lattice_peer_wire::update::Status::Busy)?;
-    if activity_on_drop {
-        activity();
-    }
-    Ok(ActivationHold { count })
+    activity();
+    Ok(ActivationHold { _private: () })
 }
 pub(crate) fn activity() {
     ACTIVITY.fetch_add(1, Ordering::AcqRel);
@@ -187,9 +167,9 @@ pub(crate) fn activity() {
 pub(crate) fn epoch() -> u32 {
     ACTIVITY.load(Ordering::Acquire)
 }
-/// Sampling blocks the atomic commit but does not restart the user-work quiet interval.
+/// Physical work or an activation commit currently holds the node.
 pub(crate) fn work_held() -> bool {
-    HOLDS.load(Ordering::Acquire) & (WORK_MASK | COMMITTING) != 0
+    HOLDS.load(Ordering::Acquire) != 0
 }
 fn wake() {
     #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]

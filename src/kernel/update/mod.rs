@@ -17,7 +17,6 @@ pub(crate) mod staging;
     all(feature = "port-esp32c6", feature = "esp32c6-update")
 ))]
 pub use runtime::{confirm, select_trial, snapshot, PlatformStorage};
-pub(crate) use staging::hold_observation;
 pub use staging::{hold_updates, UpdateHold};
 
 use lattice_peer_wire::update::{PackageId, Request};

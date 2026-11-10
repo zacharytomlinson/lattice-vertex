@@ -9,9 +9,9 @@ name = "lattice-vertex"
 version = "0.3.0"
 edition = "2021"
 authors = ["FreeRTOS-in-Rust Contributors"]
-description = "Pure-Rust no_std FreeRTOS kernel translation with safe Rust APIs"
+description = "Event-driven appliance kernel with Lattice networking and FreeRTOS-derived primitives"
 license = "MIT"
-readme = false
+readme = "README.md"
 publish = false
 exclude = ["/experiments/", "/lab/"]
 repository = "https://github.com/zacharytomlinson/lattice-vertex"
@@ -159,3 +159,7 @@ esp-sync = { version = "=0.2.1", optional = true, features = ["esp32c6"] }
 esp-wifi-sys-esp32c6 = { version = "=0.2.0", optional = true }
 embassy-sync = { version = "0.8", optional = true }
 heapless = { version = "0.9", optional = true }
+
+[[example]]
+name = "surface"
+required-features = ["use-mutexes"]

@@ -48,7 +48,7 @@ The resident peer task owns the receiver and flash. One candidate uses bounded
 alignment storage and hash state, with no image-sized RAM buffer, updater task,
 allocator, or additional routing table. The transfer journal owns download
 progress; boot metadata owns trial/confirmation/reversion. Ordinary builds reserve
-12 KiB for the radio task, update builds 24 KiB. Acquisition and native-call
+12 KiB for the radio task, update builds 24 KiB. State-event and native-call
 tasks separately reserve three 4 KiB stacks; port fixtures enable stack guards.
 
 Trust comes from the provisioned release key, independently of the supplying
@@ -106,7 +106,7 @@ contiguous written prefix; buffered later ranges do not imply durable progress.
 Whole-image verification and package authorization remain mandatory.
 
 Busy means no flash progress occurred for that request. The largest radio frame
-is 124 bytes before FCS, within the 125-byte MAC limit. LVT v7 opcodes 16/17 and
+is 124 bytes before FCS, within the 125-byte MAC limit. LVT v8 opcodes 16/17 and
 host v4 kinds 5/0x85 reuse existing correlation, reverse paths, and routes. Relays
 retain no image. Older peers cannot relay unsupported records; receivers without
 the service return Unsupported. Wire records live in
@@ -228,8 +228,8 @@ that attempt; the package can be offered later. Native mutations are never retri
 by this mechanism.
 
 Native-call admission holds updates through task completion. A conflicting flash
-step can make admission report Busy. Acquisition uses a quiet exclusion hold:
-it does not restart activation deferral merely by reading unchanged hardware. Physical work continuing after a call uses
+step can make admission report Busy. Registered state events count as activity;
+there is no periodic sampling hold. Physical work continuing after a call uses
 `update::hold_updates(&context)?` when both flash pauses and reboot must wait, or
 `hold_activation` when only reboot must wait. These are physical-work guards, not
 appliance-defined update schedules. Explicit maintenance controls are overrides.
@@ -277,7 +277,7 @@ smaller radio address. New activity cancels the proposal. A final leaving notice
 precedes selection; failed TX or captured/in-progress reception postpones it.
 There is no network-wide lock or new scheduler.
 
-LVT v7 opcode 18 carries a nine-byte notice after the network tag: attempt u32,
+LVT v8 opcode 18 carries a nine-byte notice after the network tag: attempt u32,
 phase u8 (proposed=0, leaving=1, cancel=2), and outage milliseconds u32. Cancellation
 must match. Duplicates do not extend expiry; stale proposals cannot downgrade a
 leaving notice. Expiry includes outage, notice time, and five seconds of slack;
@@ -343,3 +343,7 @@ stable appliance ABI, component-specific package admission, and boot/trial/rever
 integration. Existing authenticated transfer, staging and local activation work
 can be assessed for reuse. Their current tests do not establish that the appliance
 binary remains untouched or runs correctly after a kernel-only update.
+
+LSF v3 introduces optional IR and changes the encoded surface fingerprint. Build
+release packages and installed definitions against the current description; an
+older fingerprint is not silently treated as the new interface.

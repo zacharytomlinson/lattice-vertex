@@ -10,19 +10,20 @@ implementation map and work order, not another protocol specification or run dia
 **Maintained activation and carried context are implemented in software on the
 shared C6/Nordic kernel.** Local changes resume their own fragment; selected output
 changes propagate downstream without a backward trip to the head. LPD predicates,
-branches, arithmetic and authored calls are unchanged. Local record dispatch remains;
-Selected two-board validation passed; LLVM native lowering follows. Hardware-offload research remains
-separate.
+branches, arithmetic and authored calls are unchanged. Selected two-board validation
+passed. Local record dispatch remains; the initial firmware state/event interface is implemented and awaits appliance
+integration before LLVM native lowering. Hardware-offload research remains separate.
 
 | Area | Current implementation | Boundary / next use |
 | --- | --- | --- |
-| RTOS and CPU ports | FreeRTOS-derived tasks, interrupts, timers and synchronization on C6/Nordic | Reuse; no new general process environment |
-| Appliance surface | Durable named bindings, typed getters/native operations, IR meanings and invariants | Getter callbacks do not describe an allocatable physical circuit |
-| Acquisition | Per-state event, interval and call-boundary acquisition into a software observation cache | IRQ wakeups are proven; direct physical state/component realization is not |
+| RTOS and CPU ports | FreeRTOS-derived tasks, interrupts, timers and synchronization on C6/Nordic | Reuse while useful; replaceable substrate beneath the Lattice firmware contract |
+| Appliance surface | Concrete State values, automatic field/event registration, ordinary native methods and optional IR metadata | Exercise the first interface in real appliance firmware; metadata is not interpreted as device control |
+| State changes | Typed captured-value FIFO, automatic cell transitions and hardware capture handlers; blocking state task | No getter polling or call-boundary sampling; actual appliance/IRQ integration still needs validation |
 | Program installation | Protected persistence, validation, local computation sharing, paired connections, removal and reconstruction | Reuse ownership; LPD v1/LPG v4 retained; no new logic grammar |
 | Program execution | Retained per-connection inputs/output, direct local reevaluation, sequenced HIGH/LOW updates and native-call argument tracking | Both chip directions checked; replace local record dispatch with LLVM-generated native code |
 | Time/solar | Commissioned UTC/location/civil rules, calculated boundaries, deadline events and peer reacquisition | Reuse local sources; deadline events resume the affected local connection |
 | Peer/radio | Formation, discovery, adjacency, addressed forwarding, MAC ACK/retry and protected receive queues | Reuse; addressed signals reuse delivery; active heartbeat remains deferred |
+| IR availability | Explicit optional models; discovery advertises absent/incomplete/declared-complete without extra frame bytes | Nucleus can skip incomplete declarations; native controls do not require IR |
 | Observation delivery | Best-effort exposed-value broadcasts plus reliable addressed connection updates | Retained input acceptance is independent of the bounded notice cache |
 | Receive policies | Shared Channel<Definition, Policies, Storage>; control/state-notice freshness and indexed program/firmware reception | Retained connection inputs use Unique + Temporal; relay-notice storage remains bounded |
 | Manual continuous control | Pinned paths, compact argument messages, latest-target preparation and feedback | Reuse where applicable; its coalescing policy is not automatically circuit policy |
@@ -48,15 +49,15 @@ archived outside the repository and must not become a substitute for compiled ci
 
 Solid arrows are current relationships. Dashed arrows are planned relationships.
 Native target lowering is the stage after maintained software connections and
-occurs **before activation**. Compiler packaging and the native artifact/call ABI
-remain to specify. Existing module names identify ownership, not a commitment to
-retain the old representation.
+occurs **before activation**. The compiler belongs in a separate lattice-ir crate;
+the native artifact/call ABI remains to specify. Existing module names identify
+ownership, not a commitment to retain the old representation.
 
 ```mermaid
 flowchart TB
-    firmware["Supplied appliance HAL and formal surface"]
-    appliance["surface / Appliance: current typed callbacks and durable bindings"]
-    acquisition["appliance/acquisition: events, getters and cached observations"]
+    firmware["Appliance firmware: state, operations and device controllers"]
+    appliance["surface / Appliance: declared fields, methods and optional IR"]
+    state_events["kernel/state + appliance/changes: state data, private registration and FIFO"]
     changes["kernel/change: registered observations"]
     program["program: current LPD/LPG loader, sharing and paired connections"]
     circuit["program/execution + evaluation: retained inputs and local evaluation"]
@@ -70,12 +71,14 @@ flowchart TB
     rtos["Inherited RTOS: tasks, notifications and timers"]
     host["Optional host endpoint / lattice-tools client"]
     channels["radio/channel: shared Unique, Temporal and Complete policies"]
-    compiler["LLVM target lowering: subsequent stage (planned)"]
+    tablet["Tablet: user-authored graph"]
+    nucleus["Nucleus: FSPS/synthesized program"]
+    compiler["lattice-ir LLVM backend crate (planned)"]
     hardware["Complete hardware signal paths: separate investigation"]
 
     firmware --> appliance
-    appliance --> acquisition
-    acquisition --> changes
+    appliance --> state_events
+    state_events --> changes
     changes -->|observation broadcasts| peer
     changes -->|affected local connections| circuit
     peer --> program
@@ -99,11 +102,13 @@ flowchart TB
     update -.->|select retained stock| ports
     ports --> storage
     ports --> rtos
-    acquisition --> rtos
+    state_events --> rtos
     native --> rtos
     peer --> rtos
 
     firmware -.-> compiler
+    tablet -.-> compiler
+    nucleus -.-> compiler
     hardware -.-> compiler
     compiler -.->|native local computation| circuit
     peer -->|decoded definition / storage binding| channels
@@ -122,12 +127,30 @@ flowchart TB
 The signal path has replaced upstream/forward visits. Existing local arithmetic
 and record dispatch remain the explicit intermediate backend. LLVM-generated
 computation will replace that dispatch while retaining input/output ownership and
-propagation. Kernel code owns installation, resources and networking. The appliance
-gains no evaluator, message construction or firmware main loop.
+propagation. Kernel code owns installation, resources and networking. Appliance
+firmware uses kernel primitives for its device behavior without implementing a
+graph evaluator or message construction. The state/event interface stays
+with the existing surface/appliance owners; it does not add a second runtime.
 
 ## Next implementation milestone
 
-**Define the native artifact/ABI for LLVM lowering on C6 and nRF52840.** The retained
+**Implement appliance firmware against the initial state/event interface, then prune.**
+The [firmware interface](../src/kernel/appliance/README.md) is implemented: State data, automatic field/event registration, native method declarations, local calls
+and device access for continuing controllers. Default polling, readiness-only event
+masks, observation mirrors and before/after native-call sampling are removed.
+Host checks and both maintained MCU firmware builds pass; this is not yet a physical
+IRQ/actuator validation or proof that the four appliance integrations are complete.
+The [consumer entry point](../README.md#start-an-appliance) uses the local checkout
+until these changes are published. Surface/argument boundary checks live beside
+their implementation; retired getter/callback integration tests are removed.
+
+Use the [integration exercise](PROGRAM_DESIGN.md#appliance-integration-exercise)
+for relay, dimmer, fan and diffuser firmware, plus the TV command-model review.
+Classify real blockers before extending the kernel, then prune redundant machinery.
+Keep broadcast state events separate from directed circuit continuations. Mathematical
+surface metadata serves synthesis/authoring; the kernel uses operational bindings.
+After those integrations, define the native artifact/ABI for LLVM lowering on C6 and
+nRF52840. The retained
 software engine has host checks, release builds and selected two-board evidence:
 local resume without head admission, HIGH/LOW propagation, argument changes,
 stale/duplicate acceptance, removal and reboot reconstruction. The physical runs
@@ -142,14 +165,20 @@ own the exact limits and wire layout. LPD v1/LPG v4 and protected appliance/time
 configuration remain unchanged; execution tags 10–13 are retired in favor of
 addressed signal tag 30. No deployed-automation compatibility runtime exists.
 
+LVT v8 and LSF v3 carry IR availability and optional models; host envelopes remain
+v4. All participating firmware must use the new RF version. Surface fingerprints
+change, so test programs/releases must be authored against the new descriptions.
+
 Incoming activation is LOW and volatile. Only enabled heads originate initial
 activation; local changes elsewhere resume against current upstream inputs.
 No neighbor snapshot/query or forced reannouncement was added. Retained HIGH
 persists between changes; the active heartbeat remains deferred.
 
-The following compiler stage must settle target entry ABI, executable placement,
-relocation and authorized native bindings before implementation. The authoring/
-compiler tool does not participate in ongoing evaluation. Hardware investigation
+The shared LLVM backend will live beside the core definitions in lattice-ir,
+as a separate crate used by tablet compilation and nucleus. Only nucleus runs
+synthesis. The following stage must settle target entry ABI, executable placement,
+relocation and authorized native bindings before implementation. The compiler
+does not participate in ongoing evaluation. Hardware investigation
 does not block native-code work.
 
 ## Boundaries of this work
@@ -160,8 +189,8 @@ does not block native-code work.
   continuity is a separate hardware goal. Do not claim the former proves the latter.
 - Reboot reconstructs definitions and enabled heads, not old activation. General
   replacement/cutover and active-path failure detection remain separate work.
-- The old getter fallback remains documented as implemented; it is not the intended
-  mandatory route for every physical signal in the new backend.
+- The getter fallback has been removed. State access is for explicit reads;
+  device qualification/acquisition belongs to the source, and captured events drive changes.
 - Manual continuous-control coalescing remains explicit. A duplicate circuit update
   and a distinct accepted target transition are different things.
 - Tickless completion, hardware cryptography and experimental RF-range work are
@@ -179,9 +208,12 @@ The Wi-Fi recovery-image proposal is deferred.
 ## Deferred work
 
 An end-to-end heartbeat while a circuit is active follows the software activation
-validation. Until then, retained HIGH can outlive an isolated upstream failure.
-The present shared-power bench tolerates that limitation; no heartbeat timer or
-forced neighbor-state recovery is introduced by the retained-input change.
+validation: periodic head-to-tail continuity traffic and a correlated pong, not a
+continuous stream or a repeated native invocation. Each DAG performs a discrete
+mutation; a sunset-on/midnight-off schedule contains two DAGs. LOW does not issue
+the opposite action. Interval, local expiry and recovery handling remain open in
+the implementation plan. Until implemented, retained HIGH can outlive an isolated
+upstream failure; the current shared-power bench tolerates that limitation.
 
 Independent kernel OTA remains slated after functional program installation and
 execution. It must eventually preserve an existing appliance binary through a
@@ -195,6 +227,7 @@ for preserving local configuration through combined-image updates.
 | Peer formation and maintained discovery checks | [peer/TESTING.md](../src/kernel/peer/TESTING.md) |
 | Adjacent links and guided traversal | [peer/LINKS.md](../src/kernel/peer/LINKS.md) |
 | Mathematical surface encoding/read path | [peer/EXPOSURE.md](../src/kernel/peer/EXPOSURE.md) |
+| Firmware-facing state/event primitives | [appliance/README.md](../src/kernel/appliance/README.md) |
 | Native calls, current-state reads and delta propagation | [peer/INVOCATION.md](../src/kernel/peer/INVOCATION.md) |
 | Numeric wire types and marginal communication cost | [peer/wire/README.md](../src/kernel/peer/wire/README.md) |
 | Continuous scalar intent and feedback | [control/README.md](../src/kernel/peer/control/README.md) |

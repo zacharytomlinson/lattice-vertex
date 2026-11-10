@@ -10,7 +10,7 @@ mod sealed {
 ///
 /// Implemented for `bool` and signed/unsigned 8-, 16-, 32-, and 64-bit integers.
 /// This trait is sealed so a state reader cannot declare one IR type and emit another.
-pub trait Scalar: sealed::Scalar + Copy + 'static {
+pub trait Scalar: sealed::Scalar + Copy + PartialEq + 'static {
     /// Mathematical scalar type.
     const TYPE: Type;
     /// Convert a native observation to its exact IR value.
@@ -80,7 +80,7 @@ pub enum ArgumentError {
 
 /// A native argument product and its exact mathematical signature.
 ///
-/// Unit, scalar tuples of up to four elements, and fixed arrays are provided.
+/// Unit, individual scalars, tuples of up to four scalars, and fixed arrays are provided.
 /// Implementors can supply another fixed product with its own decoder; it must
 /// reject values outside its declared signature and must not invoke hardware.
 pub trait Arguments: Sized {
@@ -91,6 +91,18 @@ pub trait Arguments: Sized {
     /// # Errors
     /// Rejects mismatched argument count or scalar types.
     fn decode(values: &[Value]) -> Result<Self, ArgumentError>;
+}
+
+impl<T: Scalar> Arguments for T {
+    const TYPES: &'static [Type] = &[T::TYPE];
+    fn decode(values: &[Value]) -> Result<Self, ArgumentError> {
+        check(Self::TYPES, values)?;
+        T::from_value(values[0]).ok_or(ArgumentError::Type {
+            index: 0,
+            expected: T::TYPE,
+            actual: values[0].ty(),
+        })
+    }
 }
 
 pub(super) fn check(signature: &[Type], values: &[Value]) -> Result<(), ArgumentError> {
@@ -139,3 +151,66 @@ macro_rules! tuples {
     )+};
 }
 tuples! { (A:0), (A:0, B:1), (A:0, B:1, C:2), (A:0, B:1, C:2, D:3) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scalar_domains() {
+        fn roundtrip<T: Scalar + core::fmt::Debug>(values: &[T]) {
+            for &value in values {
+                let encoded = value.into_value();
+                assert_eq!(
+                    (encoded.ty(), T::from_value(encoded)),
+                    (T::TYPE, Some(value))
+                );
+            }
+        }
+        roundtrip(&[false, true]);
+        roundtrip(&[u8::MIN, u8::MAX]);
+        roundtrip(&[u16::MIN, u16::MAX]);
+        roundtrip(&[u32::MIN, u32::MAX]);
+        roundtrip(&[u64::MIN, u64::MAX]);
+        roundtrip(&[i8::MIN, i8::MAX]);
+        roundtrip(&[i16::MIN, i16::MAX]);
+        roundtrip(&[i32::MIN, i32::MAX]);
+        roundtrip(&[i64::MIN, i64::MAX]);
+        assert_eq!(bool::from_value(1_u8.into_value()), None);
+        for value in [1_u16.into_value(), 1_i8.into_value(), true.into_value()] {
+            assert_eq!(u8::from_value(value), None);
+        }
+    }
+
+    #[test]
+    fn argument_products() {
+        assert_eq!(<()>::decode(&[]), Ok(()));
+        assert_eq!(bool::decode(&[true.into_value()]), Ok(true));
+        assert_eq!(u8::decode(&[255_u8.into_value()]), Ok(255));
+        assert_eq!(<(u8,)>::decode(&[255_u8.into_value()]), Ok((255,)));
+        assert_eq!(
+            <(bool, u64, i64, u8)>::decode(&[
+                true.into_value(),
+                u64::MAX.into_value(),
+                i64::MIN.into_value(),
+                255_u8.into_value()
+            ]),
+            Ok((true, u64::MAX, i64::MIN, 255))
+        );
+        assert_eq!(
+            <[u16; 5]>::decode(&[u16::MAX.into_value(); 5]),
+            Ok([u16::MAX; 5])
+        );
+        assert_eq!(<[u16; 0]>::decode(&[]), Ok([]));
+        for values in [&[][..], &[true.into_value(), false.into_value()][..]] {
+            assert!(matches!(
+                bool::decode(values),
+                Err(ArgumentError::Count { .. })
+            ));
+        }
+        assert!(matches!(
+            bool::decode(&[1_u8.into_value()]),
+            Err(ArgumentError::Type { .. })
+        ));
+    }
+}

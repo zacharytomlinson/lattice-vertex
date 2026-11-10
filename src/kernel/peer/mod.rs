@@ -216,7 +216,12 @@ fn participate(
     radio.enable_peer_runtime();
     let started = tasks::xTaskGetTickCount();
     let milliseconds = ((started as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
-    let arrival = forwarder.announce(started as u16, description.len(), milliseconds);
+    let arrival = forwarder.announce(
+        started as u16,
+        description.len(),
+        description.ir_status(),
+        milliseconds,
+    );
     send(radio, arrival, &mut sequence, &mut outgoing_buffer);
     let period = crate::milliseconds_to_ticks_checked(2_000 + local % 997).unwrap();
     let mut last_discovery = started;
@@ -605,10 +610,15 @@ fn participate(
                         super::radio::testing::Event::OwnerDiscoveryReceived,
                     );
                 }
-                let observed =
-                    forwarder.receive_discovery(message, description.len(), now, |out| {
+                let observed = forwarder.receive_discovery(
+                    message,
+                    description.len(),
+                    description.ir_status(),
+                    now,
+                    |out| {
                         send(radio, out, &mut sequence, &mut outgoing_buffer);
-                    });
+                    },
+                );
                 #[cfg(feature = "test-support")]
                 if let Some(owner) = observed {
                     let (hops, solicited) = match message.content {
@@ -885,7 +895,8 @@ mod tests {
                 network,
                 owner: frame::SurfaceOwner {
                     address: 1,
-                    surface_bytes: 13,
+                    surface_bytes: 14,
+                    ir_status: lattice_peer_wire::IrStatus::Absent,
                 },
                 sequence: 0,
                 hops: 1,
@@ -902,7 +913,8 @@ mod tests {
                 request: 0,
                 owner: frame::SurfaceOwner {
                     address: 1,
-                    surface_bytes: 13,
+                    surface_bytes: 14,
+                    ir_status: lattice_peer_wire::IrStatus::Absent,
                 },
                 hops: 1,
             },

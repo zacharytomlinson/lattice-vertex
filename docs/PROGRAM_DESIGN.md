@@ -47,6 +47,11 @@ bindings rather than creating a replica of every attribute in the network.
 
 ## Activation propagation
 
+Each DAG describes predicates leading to a discrete system-state mutation. A user
+schedule such as sunset-on and midnight-off compiles to two DAGs. Installed
+relationships and activation persist between changes; the automation is not a
+long-running call, and LOW does not imply a compensating off/zero mutation.
+
 Activation is retained between reliably delivered deltas in this first stage.
 There is no periodic continuity carrier or guessed expiry. A qualified local-state
 change, local deadline or accepted incoming signal update recomputes the affected
@@ -90,26 +95,107 @@ keep the existing logic and change only representation required by the migration
 Preserve unrelated appliance and clock configuration. Do not infer new mutations
 or resting actions from existing false-stop paths.
 
+## Appliance integration exercise
+
+Exercise the initial primitive interface through complete firmware for the four
+representative appliances below before treating it as settled. It is implemented in
+[the appliance component](../src/kernel/appliance/README.md); these requirements
+still need validation through complete appliance implementations. Mathematical
+surface descriptions serve FSPS/authoring; they do not make the kernel responsible
+for appliance calibration, scalar limits or control algorithms. Reuse the declared
+state/operation bindings when attaching that metadata, rather than adding a second
+registry or imposing a mathematical interpreter on firmware operation.
+
+| Capability to support | Why it is needed | Responsibility |
+| --- | --- | --- |
+| Typed state backed by registers, buffers or ordinary memory | Relay output, dimmer setting, fan/TV command model | Firmware supplies the location/access and meaning; kernel primitives provide integration independently of backing storage |
+| Initial state, unavailable values and later corrections | Hardware startup and externally controlled or partly observable appliances | Firmware establishes what it knows; initialization does not replay actuator commands |
+| Qualified external change events | Switch input, sensor/feedback IRQ or device response | Hardware/firmware establishes the change; kernel wires handling and delta production without a second getter-comparison loop |
+| Firmware-originated state transitions | Commands, controller phases and software-maintained models | Normal state/operation primitives automatically register changes; no separate Lattice publish call |
+| One operation affecting several states | Fan speed also changes power; dimmer behavior may couple power and brightness | Firmware defines the relationship; kernel must not impose a universal scalar-to-power rule |
+| Finite native operations and completion/failure | Relay writes, dimmer configuration, radio/TV commands | Appliance hook performs the operation inside a kernel-owned wrapper; request acceptance is not itself a state transition |
+| Ongoing controller tasks and rearmable deadlines | Diffuser duty cycling, ramping or appliance-specific timing | Firmware owns the algorithm; existing kernel execution primitives support waiting and resumption |
+| Appliance I/O independent of Lattice transport | Fan OOK radio, serial/bus hardware, TV protocol | Firmware/driver owns appliance communication; the kernel owns graph-network communication |
+| Shared-resource access and event handoff | ISR/task interactions and concurrent native calls/controller activity | Reuse kernel synchronization and bounded queues; state capture must not depend on later resampling |
+| Application settings and selected state persistence when needed | Calibration, retained fan/TV model and controller configuration | Firmware chooses what to retain and restore; reuse the existing storage owner and preserve OTA boundaries |
+| Declared math metadata alongside operational bindings | FSPS needs bounds, effects and invariants | Appliance defines semantics; authoring/synthesis consumes them; kernel keeps transport/type/resource checks distinct from device policy |
+
+The four implementation cases are:
+
+| Firmware | Concrete behavior the interface must accommodate |
+| --- | --- |
+| Binary relay | A command and a qualified physical switch event use the same relay control path. The Power transition automatically emits a delta. Switch interpretation is appliance-specific. |
+| Scalar dimmer | Firmware maps a declared level to the actual electrical control. A fade, if supported, changes levels through the same primitives. Kernel integration does not assume that off discards the selected brightness. |
+| Fan | The initial command-model implementation maps operations to appliance RF and changes its local state, including coupled speed/power changes. A feedback-equipped version binds observed changes through the same interface. Lack of feedback in the existing Jarvis implementation is not a fan/vertex limitation. |
+| Diffuser | SetIntensity configures a firmware-owned controller. Fan-running events and deadlines drive startup-compensated cycling. Intensity can remain unchanged while Power changes after the setter returns; every declared transition is integrated automatically. |
+
+Use the TV command model as an additional interface review case for software state,
+asynchronous replies and imperfect observability. This is not a requirement to add
+new TV hardware or implement a TV driver as part of the first four integrations.
+
+Start with complete firmware-facing sketches for all four so that a convenient
+relay-only interface does not constrain the others. Then implement the shared
+primitives through real appliance firmware, beginning with relay/dimmer and proceeding
+through fan/diffuser. Keep device logic with its appliance owner; generic kernel tests
+must not depend on those repositories. Board-specific proof waits for actual bindings
+and hardware; a software stand-in does not establish physical integration.
+
+For each blocker, identify the missing operation and where it belongs. First check
+whether an existing kernel/HAL facility or a simpler firmware composition resolves
+it. Extend the kernel only for a demonstrated missing primitive; an appliance rule,
+temporary board limitation or awkward provisional interface is not automatically a
+new kernel concept. Resolve implementation-defining ambiguity before adding code.
+
+After these integrations, review the kernel against what they actually use. Remove
+redundant state storage, duplicate event paths, polling fallbacks superseded by the
+new boundary, unused abstractions and temporary hooks. Preserve facilities justified
+by concrete kernel obligations such as recovery, even if no example directly calls
+them. Archive useful experimental material outside source. Apply the same review to
+tests and fixtures, and update the ownership map before moving to native lowering.
+
+## Declaration and model availability
+
+State is data, selected once through `StateHandle`; the old per-state trait,
+public StateInput and manual bind forwarding are removed. Kernel initialization
+connects software state and hardware events. Native methods register directly, or
+through the optional behavioral StateTransformer trait. Neither requires IR.
+
+IR operations and appliance mathematics are explicit attachments. Absence is
+unknown behavior for synthesis, never a default empty effect or permissive condition.
+The cheap discovery marker lets nucleus skip absent/incomplete models before a
+full transfer; declared complete still needs its assessment. LVT v8/LSF v3 encode
+this separation, with the exact format owned by the peer component.
+
 ## Compilation, setup and operation
 
-The appliance implementor supplies its HAL and formal surface. The surface declares
-typed state, transformations, physical meanings and invariants; it is also a resource
-request. The kernel/toolchain realizes it without appliance-authored event chains,
-reports, networking, automation callbacks or a main loop.
+The appliance implementor builds its device state machine using the kernel's primitives
+and supplies its hardware/state bindings. Mathematical surface metadata describes those
+members for synthesis and authoring. Declared state transitions and operation/event
+hooks carry automatic Lattice behavior through kernel-owned wrappers. Sealed internal
+interfaces protect required integration; appliance hooks remain implementable externally.
+Firmware owns device behavior, not reporting, graph evaluation or network participation.
 
-- The appliance build prepares the local signal/action realization from the surface
-  and supplied HAL. Opaque getter code alone cannot identify physical resources.
+The getter-sampling boundary has been replaced by typed state/event primitives.
+Complete the appliance integrations and pruning pass before the native backend.
+Broadcast appliance deltas and directed circuit continuations keep their separate jobs;
+receiving a general appliance broadcast is not an instruction to evaluate a foreign DAG.
+
+- The appliance build binds operational state, events and actions through the supplied
+  HAL and kernel primitives. Opaque getter code alone cannot identify physical resources.
 - Circuit authoring supplies owner-local logic and connections using existing IR
-  semantics. Target lowering may run on the authoring peer or receiving vertex at
-  installation; placement is open. No per-automation firmware rebuild is required.
-- Boot/install validates, completes any selected local translation, binds resources,
+  semantics. The tablet compiles its user-authored graph; nucleus synthesizes a
+  program and then uses the same compiler. The tablet does not run FSPS.
+  No per-automation firmware rebuild is required.
+- Boot/install validates the compiled artifact, relocates and binds resources,
   applies setup and establishes input validity before activation.
 - Ordinary operation propagates input/output changes through configured paths.
   Required CPU handlers are explicit, bounded target implementations; there is no
   implicit fallback to the old interpreter or per-delta expression reconstruction.
 
-The concrete artifact format, compiler packaging and resource relocation ABI are
-not selected. Keep semantics in lattice-ir, target recipes with their port owners,
+The concrete artifact format and resource relocation ABI are not selected.
+The shared LLVM backend belongs in a separate crate in the lattice-ir repository;
+the firmware-facing core remains `no_std` without LLVM dependencies.
+Keep semantics in lattice-ir, hardware recipes with their port owners,
 wire encoding in the existing shared codec and installation in program/storage.
 Do not create a parallel IR or a new generic runtime.
 
@@ -122,26 +208,27 @@ native bindings, relocation and executable-memory placement for Thumb and RV32.
 Preserve declared-width arithmetic, meaningful output changes and invocation
 semantics. A generated instruction image must not restore whole-graph traversal.
 
-Compiler ownership/packaging and artifact details remain to settle. They do not
-require a nucleus at execution time. Future hardware lowering must use the same
+Compiler crate ownership is settled; native artifact and interface details remain
+to settle with vertex. The tablet and nucleus use this compiler before installation;
+neither participates in ongoing execution. Future hardware lowering must use the same
 mathematical definitions; it must not infer intent by disassembling native code.
 
 ## Following behavior and validation scope
 
 Validate the retained-input implementation on both targets with installed predicates,
-branch paths and native calls. A potential later authored-rest example is:
+branch paths and native calls. A scalar example is:
 
     A: head enable and occupancy
     B: qualified illumination and local time-window signal
-    C: level output, active target computed by B, resting target 0
+    C: SetLevel with the argument computed by B
 
     A.out = enabled AND occupied
     B.out = A.out AND (illumination < threshold) AND time_window
-    C.target = B.active_target while B.out is high, otherwise 0
+    C invokes when B.out rises, or its required argument changes while high
 
-The existing LPD has no implicit LOW-action instruction: withdrawal closes the path
-without synthesizing `SetLevel(0)`. The example's resting behavior needs an explicit
-authored path/artifact; it is not claimed by this migration.
+Withdrawal closes the path without synthesizing `SetLevel(0)`. If the user also
+wants an off action under another condition or at another deadline, that is a
+separate DAG with an explicit SetLevel(0) endpoint.
 
 A, B and C are logical ownership roles. A two-board check can co-locate B and C;
 swap target roles to exercise both ports without claiming a three-owner radio run.
@@ -149,8 +236,8 @@ swap target roles to exercise both ports without claiming a three-owner radio ru
 An illumination change at B updates B from its maintained A input. It does not
 travel backward to A. A time boundary does the same through a local deadline event.
 A low from A propagates through B to C even if B's own predicate remains true.
-At C, a high transition applies the active target, a low applies the authored rest,
-and a changed argument while high applies the new target. Unchanged effective
+At C, a high transition invokes the mutation, a low withdraws activation,
+and a changed argument while high invokes with the new value. Unchanged effective
 output and duplicate delivery do not cause another action. Required current inputs
 must be established before this truth table applies; unavailable is not low.
 
@@ -182,7 +269,7 @@ radio and other installed components.
 | Analog predicate | LPCOMP/COMP references and crossing events; SAADC limits | SAR ADC digital threshold monitors and conversion events | Threshold representation, calibration, hysteresis, qualification and actual event routes |
 | Numerical value movement | Peripheral registers and EasyDMA buffers | Peripheral registers and supported GDMA paths | Format/alignment, coherent updates, buffer ownership and completion |
 | Time/counter predicate | TIMER/RTC compare/capture through PPI | GPTimer/SYSTIMER/RTC events through ETM where exposed | Reserved RTOS/radio resources and next deadline; retain bounded civil/solar calculation |
-| Scalar output | PWM sequence/data and tasks | LEDC/MCPWM or another declared output peripheral | Value conversion, update boundary and resting target |
+| Scalar output | PWM sequence/data and tasks | LEDC/MCPWM or another declared output peripheral | Value conversion, update boundary and explicit mutation |
 | Radio input/output | RADIO events/tasks, SHORTS and EasyDMA | 802.15.4 MAC/DMA/interrupt paths | Packet validation, connection selection, value placement, TX ownership and receipts; do not assume C6 RADIO is an ETM endpoint |
 
 Nordic's [PPI specification][ppi] documents 20 configurable channels, 12 fixed
@@ -213,7 +300,8 @@ not proof of a CPU-free Lattice node.
 | 1. Consolidate channel policies (implemented) | Define codec/storage bindings and implement shared Unique, Temporal and Complete admission in actual consumers. State updates reject duplicates/older arrivals; complete transfers collect every piece. | Existing radio/peer/program/update owners. No unused generic harness or duplicated payload storage. |
 | 2. Retain activation/value context (implemented) | Bind and budget the retained inputs needed to start evaluation at the affected local fragment. Preserve the existing operators, branches and mutations. | Existing program/image/validation and source/time owners. No backward activation requirement or new logic model. |
 | 3. Validate propagation on both ports (selected bench check passed) | Exercise local and upstream changes, both activation directions, argument changes, duplicate/late arrivals, reconstruction and pair isolation. | Compact component properties plus maintained hardware fixtures. Report latency and CPU work without claiming hardware realization. |
-| 4. Replace local interpretation | Lower IR through LLVM to native code for both targets, using the agreed typed input/output and native-call ABI. | Compiler and existing loader/port owners. Same evaluation meaning, correct target execution and no per-delta opcode dispatch. |
+| 4. Establish the firmware primitive boundary (initial API implemented) | Complete the appliance integration exercise above, address demonstrated blockers and prune redundant kernel machinery. | Existing surface/appliance and RTOS owners; real firmware implementations with automatic event integration. |
+| 5. Replace local interpretation | Lower IR through LLVM to native code for both targets, using the agreed typed input/output and native-call ABI. | Compiler and existing loader/port owners. Same evaluation meaning, correct target execution and no per-delta opcode dispatch. |
 
 Steps can share implementation work, but a packet-only demonstration does not
 establish the complete circuit. Stage 2's local evaluation reuse is an explicit
@@ -225,10 +313,14 @@ callback or preinstalled appliance-specific automation substitutes for installat
 Retained activation between delivered deltas, unchanged evaluation logic, and the
 common channel policy meanings are settled. These mechanics remain implementation work:
 
-- **Native artifact (following stage):** compiler packaging, entry ABI, relocation,
+- **Native artifact (following stage):** entry ABI, relocation,
   code placement and typed/native bindings for LLVM-generated Thumb/RV32 code.
-- **Active heartbeat (deferred):** end-to-end continuity/failure detection while
-  active. The retained-input implementation deliberately adds no expiry or carrier.
+- **Active heartbeat (deferred):** periodic head-to-tail traversal over the selected
+  active connections, with a correlated pong addressed to the head. Existing
+  connection identity distinguishes DAGs sharing one head; the MAC supplies the
+  return address. Choose interval, missed-pulse allowance, local activation expiry
+  and recovery/retrigger handling before implementation. A heartbeat is not an
+  action request or an appliance delta. No expiry or carrier is implemented.
 - **Hardware realization (separate investigation):** a complete receive/gate/transmit
   path and its resources. Adding a processor at each missing connection is not the
   selected solution, and a local comparator does not establish autonomous forwarding.

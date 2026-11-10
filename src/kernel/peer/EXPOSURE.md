@@ -14,7 +14,7 @@ vertices serve their own definitions and relay reads/replies, retaining no forei
 IR. The Linux client in `lattice-tablet` now requests and reconstructs one selected
 surface and inspects its declarations without executing IR. Content-based lookup
 and nucleus integration remain separate work. [Native control and current-state reads](INVOCATION.md)
-use separate messages; surface reads continue to expose immutable mathematics only.
+use separate messages; surface reads expose native signatures and optional authored mathematics.
 
 ## Progressive discovery direction
 
@@ -32,7 +32,13 @@ see [the link protocol](LINKS.md). Startup performs local link maintenance;
 
 ## Owner discovery
 
-Each vertex announces its address and encoded description length after joining.
+Each vertex announces its address, encoded description length and IR availability
+after joining. `Absent` and `Incomplete` allow nucleus to skip a full model read;
+`DeclaredComplete` is the implementor's claim, not kernel certification. The status
+uses the high nibble of the existing arrival/owner-found hop byte (0, 1 or 2);
+the low nibble remains the hop count 1–8. There are no additional discovery bytes.
+Relays preserve the declaration. The same status appears in the first LSF range for
+host consumers that discover owners through adjacency rather than announcements.
 That arrival notice travels up to eight links. Every relay preserves the original
 owner and sequence while using its own MAC source address; a recent-notice record
 suppresses duplicate copies. Arrival only reports the owner. It never causes a
@@ -89,7 +95,7 @@ Arrival and owner discovery now cross relays within the same eight-link bound.
 Channel formation remains link-local. Probabilistic delivery scoring, broadcast
 coverage optimization and content-addressed sharing remain later extensions.
 [Program installation and execution](../program/README.md) share owner routing.
-Execution reserves receiver storage and commits complete visits above this route;
+Directed circuit updates retain owner acceptance/retry semantics above this route;
 its admission receipts are distinct from immutable-read replies and MAC ACKs.
 The network tag and matching responses are not authentication credentials.
 Startup arrival/query tags use local tick values, not durable boot identities.
@@ -100,7 +106,7 @@ exactly-once delivery or complete membership protocol. Mutation calls have separ
 
 ## Read envelope
 
-`LVT` **version 7** retains discovery/arrival/search (0–3, 6–7), surface/state
+`LVT` **version 8** retains discovery/arrival/search (0–3, 6–7), surface/state
 reads (4–5, 11–12), native invocation/result and deltas (8–10), and link operations
 (13–15). The invocation control byte encodes hop and copy budgets; see
 [INVOCATION.md](INVOCATION.md#one-frame-per-call-read-result-or-delta). Older wire
@@ -146,11 +152,11 @@ Arrival/query/reply payloads start with the same four-byte magic, opcode, founde
 
 | Kind | Fields after network | MAC delivery | Total bytes before FCS |
 | --- | --- | --- | --- |
-| 3: arrival | Owner (`u64`), sequence (`u16`), description length (`u16`), distance (`u8`) | Broadcast | 42 |
+| 3: arrival | Owner (`u64`), sequence (`u16`), description length (`u16`), packed IR status/distance (`u8`) | Broadcast | 42 |
 | 6: find owners | Seeker (`u64`), request (`u16`), remaining scope (`u8`) | Broadcast | 40 |
-| 7: owner found | Seeker (`u64`), request (`u16`), owner (`u64`), description length (`u16`), distance (`u8`), path cost (`u32`) | Directed reverse path | 60 |
+| 7: owner found | Seeker (`u64`), request (`u16`), owner (`u64`), description length (`u16`), packed IR status/distance (`u8`), path cost (`u32`) | Directed reverse path | 60 |
 
-The owner description length is at least 13 bytes. Arrival and owner replies start
+The owner description length is at least 14 bytes. Arrival and owner replies start
 at distance 1 and relays increment it; an eight-link notice may be consumed but
 cannot travel farther. Queries start with scope 8 or less; scope 1 permits the
 local owner's reply but no additional forwarding. All messages fit one radio
@@ -158,7 +164,7 @@ frame. Discovery return paths remain open for multiple owner replies until expir
 or eviction. The node stores only recent duplicate keys and return directions,
 not the advertised descriptions or a record for every vertex in the network.
 
-## Mathematical description encoding
+## Surface format
 
 `exposure.rs` encodes the pinned `lattice-ir` vocabulary. Numbers are little-endian;
 no native Rust struct layout is copied. Native state and transformer references
@@ -166,18 +172,18 @@ are durable `u64` bindings scoped by the sending peer. They are not addresses or
 permission to invoke an operation. Native function pointers, binding-name strings
 and current appliance values are not serialized.
 
-The header is `4c 53 46 02` (`LSF`, version 2), reference width (`u8`, always 64),
-then four `u16` counts: states, transformers, axioms, invariants. Records follow
+The header is `4c 53 46 03` (`LSF`, version 3), reference width (`u8`, always 64),
+IR status (`u8`: absent=0, incomplete=1, declared complete=2), then four `u16` counts: states, transformers, axioms, invariants. Records follow
 in that order, retaining the surface's declaration order:
 
 | Record | Encoding |
 | --- | --- |
 | State/attribute reference | Declaration reference, scalar type |
-| Transformer | Native handle reference, precondition predicate, effect |
+| Transformer | Native handle reference, native argument-type list, model-present byte (0/1); only when 1, precondition predicate and effect follow |
 | Axiom/invariant | Inline predicate reference, predicate |
 | Predicate | Definition, list of bound input attributes |
 | Definition | Definition reference, argument-type list, symbolic-input-type list, body expression |
-| Effect | Argument-type list, input-attribute list, output-attribute list, result-expression list |
+| Effect | Input-attribute list, output-attribute list, result-expression list; arguments use the separately declared native signature |
 
 Every list begins with its `u16` count. Attribute references include their types,
 including those reached through predicates/effects. Mathematical definition and
@@ -187,14 +193,23 @@ offsets. These offsets identify encoded occurrences, not callable or persistent
 appliance bindings. No pointer or assigned-ID table is needed. The native binding
 references and complete encoded bytes survive address relocation; reordering
 declarations or changing mathematics can still change the description/fingerprint.
-LSF v1 consumers must be updated to v2. Radio LVT v7 and host v4 envelopes retain
-their layouts; old address-based native requests no longer select these bindings.
+LSF v3 consumers distinguish an absent model from an explicitly authored empty
+effect. A native callable is still present and usable when model-present is zero.
+IR readiness is a declaration, not kernel proof. Unencodable optional mathematics
+is omitted with status Incomplete; no permissive conditions or effects are generated.
+This preserves the native interface if an authored model exceeds wire size/depth bounds.
+
+RF peers use LVT v8 for the owner availability field; all participants must be updated
+together. Host envelopes remain v4. The first surface range contains the readiness
+marker, so an attached consumer can inspect it before requesting remaining ranges.
+The encoded description/fingerprint changes from v2; installed test programs and
+release packages need the new fingerprint.
 
 ### Durable declaration names
 
 Declare hardware bindings with permanent names, for example
-`StateHandle::new::<Power>("power")` and
-`TransformerHandle::new::<SetPower>("set-power")`. These constructor arguments
+`StateHandle::new("power", |device| &device.power)` and
+`TransformerHandle::from_fn("set-power", Relay::set_power)`. These constructor arguments
 are evaluated at compile time in static declarations; only the resulting eight
 bytes are retained. Renaming a Rust type or moving a declaration does not change
 the binding. Repurposing it for another physical meaning requires a new name.

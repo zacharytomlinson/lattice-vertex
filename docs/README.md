@@ -4,9 +4,10 @@ Each document has one owner and purpose:
 
 | Document | Purpose |
 | --- | --- |
+| [Repository README](../README.md) | Consumer dependency, port selection and entry points |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Canonical system semantics, ownership, interfaces and architectural requirements |
 | [KERNEL_DIRECTION.md](KERNEL_DIRECTION.md) | Current implementation map, capability gaps and immediate next work |
-| [PROGRAM_DESIGN.md](PROGRAM_DESIGN.md) | Maintained software connections on nRF52840 and ESP32-C6, subsequent LLVM/native lowering, open mechanics and deferred hardware mappings |
+| [PROGRAM_DESIGN.md](PROGRAM_DESIGN.md) | Firmware primitive integration exercise, maintained software connections, subsequent LLVM/native lowering and deferred hardware mappings |
 | [AGENTS.md](../AGENTS.md) | Collaboration, code organization, test discipline and review procedure |
 | [FIRMWARE_UPDATES.md](FIRMWARE_UPDATES.md) | Implemented updater behavior, wire/storage boundaries and remaining limits |
 | Component notes beside source | Current APIs, protocols and maintained usage/validation procedures |
@@ -34,6 +35,7 @@ Useful component entry points:
 - [Hardware checks](../src/port/TESTING.md), including port-owned build/upload recipes.
 - [Package/transfer tools](../tools/README.md) and
   [shared flash storage](../src/kernel/storage/README.md).
+- [Firmware-facing state/event interface](../src/kernel/appliance/README.md).
 - [Resident program records and installation](../src/kernel/program/README.md),
   [local time and solar](../src/kernel/time/README.md).
 

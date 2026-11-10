@@ -36,8 +36,8 @@ implemented. [Surface reads](EXPOSURE.md) now use bounded exploration and learne
 owner directions. Compact arrivals and owner queries now cross relays without sending
 complete surfaces.
 [Native invocation, state reads, and registered deltas](INVOCATION.md) now share that runtime.
-Resident distributed-program bindings, installation and semantic traversal remain
-unimplemented. Firmware callbacks are not substitutes for those facilities.
+Program installation and retained activation use the same resident peer;
+their maintained checks belong to the [program component](../program/README.md#maintained-checks).
 
 The on-air discovery profile is:
 
@@ -47,7 +47,7 @@ The on-air discovery profile is:
 | Discovery destination | PAN `0x4c56`, short broadcast `0xffff` |
 | Presence destination | PAN `0x4c56`, requesting peer's extended address |
 | Proposal destination | Broadcast solicits an answer; directed reply carries the candidate's preferred record |
-| Discovery payload | `4c 56 54 07` (`LVT`, version 7), then kind 0 (discover), 1 (present), or 2 (propose) |
+| Discovery payload | `4c 56 54 08` (`LVT`, version 8), then kind 0 (discover), 1 (present), or 2 (propose) |
 | Present/propose fields | Founding address: 8 bytes little-endian; channel: 1 byte |
 | Size before hardware FCS | 20 bytes discovery; 35 bytes directed presence/proposal; 29 bytes broadcast proposal |
 
@@ -92,8 +92,9 @@ wrong resident channel, invalid network tags, and wrong addressing for a kind
 are rejected. Candidates advertise and answer broadcasts while visiting channels,
 with their proposed operating channel in the payload. That proposal
 may name another channel; established presence must match the receive channel.
-Versions 1–6 are intentionally incompatible with version 7; host v4 is paired
-with its 63-byte ranges and normalized link costs.
+Versions 1–7 are intentionally incompatible with version 8; host v4 uses its
+63-byte ranges and normalized link costs. LSF v3 adds explicit IR availability
+and optional models; discovery carries that availability in the existing hop byte.
 Host checks cover wire vectors, rejection boundaries, channel selection, proposal
 ordering, inherited network replies, response termination, and rendezvous overlap:
 

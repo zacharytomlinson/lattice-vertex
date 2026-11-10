@@ -108,9 +108,6 @@ pub struct UpdateHold {
 pub fn hold_updates(_: &crate::sync::TaskContext) -> Result<UpdateHold, Status> {
     hold_access(activation::try_hold()?)
 }
-pub(crate) fn hold_observation(_: &crate::sync::TaskContext) -> Result<UpdateHold, Status> {
-    hold_access(activation::observation_hold()?)
-}
 fn hold_access(hold: super::ActivationHold) -> Result<UpdateHold, Status> {
     ACCESS
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -199,25 +196,8 @@ mod tests {
         }
     }
     #[test]
-    fn reboot_holds_allow_staging_but_appliance_access_excludes_flash() {
+    fn flash_exclusion() {
         let context = unsafe { crate::sync::TaskContext::assume() };
-        let epoch = activation::epoch();
-        let observation = hold_observation(&context).unwrap();
-        assert!(FlashStep::enter().is_none());
-        assert!(FLASH_WAITING.load(Ordering::Acquire));
-        assert!(activation::Commit::enter().is_none());
-        assert_eq!(activation::epoch(), epoch);
-        assert!(
-            !activation::work_held(),
-            "sampling must not restart the quiet interval"
-        );
-        drop(observation);
-        assert!(!FLASH_WAITING.load(Ordering::Acquire));
-        assert_eq!(
-            activation::epoch(),
-            epoch,
-            "sampling alone is not user activity"
-        );
         let reboot = activation::try_hold().unwrap();
         let flash = FlashStep::enter().unwrap();
         assert!(hold_updates(&context).is_err());

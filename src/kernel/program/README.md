@@ -124,7 +124,7 @@ The [time component](../time/README.md) owns its clock/deadline semantics.
 The invoke record describes continuation on the returned native result. It does
 not infer physical completion or encode an acceptance-only continuation. A
 physical completion dependency belongs to an observed state. The existing native task returns its result before that evaluation follows either edge;
-other evaluations, acquisition and radio service can continue meanwhile.
+other evaluations, state-event processing and radio service can continue meanwhile.
 
 Lists start with their `u8` count. Operands are a tag followed by their data:
 constant (0: existing typed scalar encoding), carried location (1: scalar type
@@ -206,7 +206,7 @@ the surface fingerprint and resolves the same references to the current handles.
 
 ## Installation transport
 
-LVT v7 adds program request/result opcodes **21/22**. Retired callback opcodes
+LVT v8 adds program request/result opcodes **21/22**. Retired callback opcodes
 19/20 remain reserved. Program exchanges share the existing eight reverse paths,
 read-token namespace, owner routes and hop limit. They add no route catalog or
 special tablet/nucleus role. The envelope is founder `u64`, channel `u8`, reader

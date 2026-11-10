@@ -1,4 +1,4 @@
-//! Encode bounded reads of this appliance's immutable IR surface.
+//! Encode bounded reads of this appliance's native catalog and optional IR.
 //! No reader, transformer, or IR expression is executed. References identify
 //! durable native bindings or inline mathematical records. No remote catalog is built.
 
@@ -18,7 +18,7 @@ pub(crate) enum EncodeError {
 }
 
 trait Encode: Sync {
-    fn encode(&self, writer: &mut Writer<'_>) -> Result<(), EncodeError>;
+    fn encode(&self, writer: &mut Writer<'_>, include_ir: bool) -> Result<(), EncodeError>;
 }
 
 /// Borrow the authored surface and its encoded length. Byte ranges are emitted
@@ -26,6 +26,8 @@ trait Encode: Sync {
 pub(crate) struct Description {
     source: &'static dyn Encode,
     length: u16,
+    ir_status: lattice_peer_wire::IrStatus,
+    include_ir: bool,
 }
 
 impl Description {
@@ -34,21 +36,16 @@ impl Description {
         appliance: &'static crate::kernel::Appliance<A, E>,
     ) -> Result<Self, EncodeError> {
         appliance.seal();
-        let mut writer = Writer {
-            output: &mut [],
-            offset: 0,
-            position: 0,
-            copied: 0,
-            counting: true,
-        };
-        appliance.encode(&mut writer)?;
-        Ok(Self {
-            source: appliance,
-            length: writer.position as u16,
-        })
+        Self::prepare(appliance, appliance.ir_status())
     }
     pub(crate) fn new<A: 'static, E: 'static>(
         surface: &'static Surface<'static, A, E>,
+    ) -> Result<Self, EncodeError> {
+        Self::prepare(surface, surface.ir_status())
+    }
+    fn prepare(
+        source: &'static dyn Encode,
+        mut status: lattice_peer_wire::IrStatus,
     ) -> Result<Self, EncodeError> {
         let mut writer = Writer {
             output: &mut [],
@@ -57,11 +54,29 @@ impl Description {
             copied: 0,
             counting: true,
         };
-        surface.encode(&mut writer)?;
+        let include_ir = match source.encode(&mut writer, true) {
+            Ok(()) => true,
+            // An unencodable optional model must not disable native controls.
+            // Omit that model and explicitly advertise incomplete IR; invent no
+            // substitute preconditions/effects. Native declaration errors still fail.
+            Err(EncodeError::TooDeep | EncodeError::TooLarge) => {
+                writer.position = 0;
+                source.encode(&mut writer, false)?;
+                status = lattice_peer_wire::IrStatus::Incomplete;
+                false
+            }
+            Err(error) => return Err(error),
+        };
         Ok(Self {
-            source: surface,
+            source,
             length: writer.position as u16,
+            ir_status: status,
+            include_ir,
         })
+    }
+
+    pub(crate) fn ir_status(&self) -> lattice_peer_wire::IrStatus {
+        self.ir_status
     }
 
     pub(crate) fn len(&self) -> u16 {
@@ -92,7 +107,7 @@ impl Description {
             copied: 0,
             counting: false,
         };
-        match self.source.encode(&mut writer) {
+        match self.source.encode(&mut writer, self.include_ir) {
             Ok(()) | Err(EncodeError::Full) => writer.copied,
             // The immutable surface was checked in full before scheduler startup.
             Err(error) => panic!("validated surface changed: {:?}", error),
@@ -295,19 +310,26 @@ fn binary_tag(op: Binary) -> u8 {
 }
 
 impl<A: 'static, E> Encode for Surface<'_, A, E> {
-    fn encode(&self, writer: &mut Writer<'_>) -> Result<(), EncodeError> {
-        encode_surface(self, core::iter::empty(), core::iter::empty(), writer)
+    fn encode(&self, writer: &mut Writer<'_>, include_ir: bool) -> Result<(), EncodeError> {
+        encode_surface(
+            self,
+            core::iter::empty(),
+            core::iter::empty(),
+            writer,
+            include_ir,
+        )
     }
 }
 
 #[cfg(feature = "use-mutexes")]
 impl<A: Send + Sync + 'static, E: 'static> Encode for crate::kernel::Appliance<A, E> {
-    fn encode(&self, writer: &mut Writer<'_>) -> Result<(), EncodeError> {
+    fn encode(&self, writer: &mut Writer<'_>, include_ir: bool) -> Result<(), EncodeError> {
         encode_surface(
             self.surface(),
             self.installations().flat_map(|i| i.states()),
             self.installations().map(|i| i.definition),
             writer,
+            include_ir,
         )
     }
 }
@@ -317,17 +339,34 @@ fn encode_surface<A: 'static, E>(
     states: impl Iterator<Item = &'static ir::Attribute<Read<A>>> + Clone,
     axioms: impl Iterator<Item = &'static crate::surface::Predicate<A>> + Clone,
     writer: &mut Writer<'_>,
+    include_ir: bool,
 ) -> Result<(), EncodeError> {
     if writer.counting && !surface.unique_bindings() {
         return Err(EncodeError::DuplicateBinding);
     }
-    writer.bytes(b"LSF\x02")?;
+    writer.bytes(b"LSF\x03")?;
     writer.byte(64)?; // Binding-reference width, independent of CPU pointer width.
+    let mut status = surface.ir_status();
+    if status == lattice_peer_wire::IrStatus::Absent && axioms.clone().next().is_some() {
+        status = lattice_peer_wire::IrStatus::Incomplete;
+    }
+    if !include_ir {
+        status = lattice_peer_wire::IrStatus::Incomplete;
+    }
+    writer.byte(status as u8)?;
     for count in [
         surface.states.len() + states.clone().count(),
         surface.transformers.len(),
-        surface.axioms.len() + axioms.clone().count(),
-        surface.invariants.len(),
+        if include_ir {
+            surface.axioms().len() + axioms.clone().count()
+        } else {
+            0
+        },
+        if include_ir {
+            surface.invariants().len()
+        } else {
+            0
+        },
     ] {
         writer.count(count)?;
     }
@@ -339,9 +378,13 @@ fn encode_surface<A: 'static, E>(
     }
     for transformer in surface.transformers {
         writer.reference(transformer.reference())?;
-        let definition = transformer.definition();
+        writer.types(transformer.arguments())?;
+        let model = transformer.definition().filter(|_| include_ir);
+        writer.byte(u8::from(model.is_some()))?;
+        let Some(definition) = model else {
+            continue;
+        };
         writer.predicate(&definition.precondition)?;
-        writer.types(definition.effect.arguments)?;
         writer.attributes(definition.effect.inputs)?;
         writer.attributes(definition.effect.outputs)?;
         writer.count(definition.effect.results.len())?;
@@ -349,7 +392,10 @@ fn encode_surface<A: 'static, E>(
             writer.expression(expression, 0)?;
         }
     }
-    for predicate in surface.axioms {
+    if !include_ir {
+        return Ok(());
+    }
+    for predicate in surface.axioms() {
         writer.inline_reference()?;
         writer.predicate(predicate)?;
     }
@@ -357,7 +403,7 @@ fn encode_surface<A: 'static, E>(
         writer.inline_reference()?;
         writer.predicate(predicate)?;
     }
-    for predicate in surface.invariants {
+    for predicate in surface.invariants() {
         writer.inline_reference()?;
         writer.predicate(predicate)?;
     }
@@ -371,19 +417,15 @@ mod tests {
     use self::std::vec::Vec;
     use super::*;
     use crate::surface::{
-        Definition, Operation, Predicate, State, StateHandle, StateTransformer, TransformerHandle,
+        Definition, Operation, Predicate, StateHandle, StateTransformer, TransformerHandle,
     };
 
     struct Switch;
-    struct On;
-    impl State for On {
-        type Appliance = Switch;
-        type Value = bool;
-        fn read(_: &Switch) -> Option<bool> {
-            panic!("exposure must not read hardware")
-        }
-    }
-    static ON: StateHandle<Switch> = StateHandle::new::<On>("on");
+    static ON: StateHandle<Switch> = StateHandle::hardware::<bool>(
+        "on",
+        |_| panic!("exposure must not read hardware"),
+        |_| panic!("exposure must not register hardware"),
+    );
     static TRUE: Definition<Switch> = Definition {
         body: Expr::Constant(ir::Value::boolean(true)),
         arguments: &[],
@@ -403,32 +445,37 @@ mod tests {
         inputs: &[],
     };
     struct Toggle;
+    static TOGGLE_MODEL: Operation<Switch> = Operation {
+        precondition: Predicate {
+            definition: &TRUE,
+            inputs: &[],
+        },
+        effect: ir::Effect {
+            inputs: &[ON.definition()],
+            outputs: &[ON.definition()],
+            results: &[Expr::Not(&Expr::Input(0))],
+            arguments: &[],
+        },
+    };
     impl StateTransformer for Toggle {
         type Appliance = Switch;
         type Arguments = ();
         type Error = ();
-        const DEFINITION: Operation<Switch> = Operation {
-            precondition: Predicate {
-                definition: &TRUE,
-                inputs: &[],
-            },
-            effect: ir::Effect {
-                inputs: &[ON.definition()],
-                outputs: &[ON.definition()],
-                results: &[Expr::Not(&Expr::Input(0))],
-                arguments: &[],
-            },
-        };
-        fn invoke(_: &Switch, _: ()) -> Result<(), ()> {
+
+        fn invoke(_: &crate::sync::TaskContext, _: &Switch, _: ()) -> Result<(), ()> {
             panic!("exposure must not invoke hardware")
         }
     }
-    static TOGGLE: TransformerHandle<Switch, ()> = TransformerHandle::new::<Toggle>("toggle");
+    static TOGGLE: TransformerHandle<Switch, ()> =
+        TransformerHandle::new::<Toggle>("toggle").with_model(&TOGGLE_MODEL);
     static SURFACE: Surface<'static, Switch, ()> = Surface {
         states: &[&ON],
         transformers: &[&TOGGLE],
-        axioms: &[&AXIOM],
-        invariants: &[&INVARIANT],
+        model: Some(&crate::surface::IrModel {
+            complete: true,
+            axioms: &[&AXIOM],
+            invariants: &[&INVARIANT],
+        }),
     };
 
     fn reference(out: &mut Vec<u8>, value: u64) {
@@ -440,14 +487,15 @@ mod tests {
 
     #[test]
     fn range_encoding() {
-        let mut expected = Vec::from(&b"LSF\x02"[..]);
-        expected.extend_from_slice(&[64, 1, 0, 1, 0, 1, 0, 1, 0]);
+        let mut expected = Vec::from(&b"LSF\x03"[..]);
+        expected.extend_from_slice(&[64, 2, 1, 0, 1, 0, 1, 0, 1, 0]);
         reference(&mut expected, ON.reference());
         expected.push(0); // Boolean state
         reference(&mut expected, TOGGLE.reference());
+        expected.extend_from_slice(&[0, 0, 1]); // native signature and explicit model
         inline(&mut expected);
         expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 1, 0, 0]); // signatures, true literal, no bound inputs
-        expected.extend_from_slice(&[0, 0, 1, 0]); // effect arguments and one input
+        expected.extend_from_slice(&[1, 0]); // one effect input; signature is already declared
         reference(&mut expected, ON.reference());
         expected.extend_from_slice(&[0, 1, 0]);
         reference(&mut expected, ON.reference());
@@ -471,6 +519,52 @@ mod tests {
                 result.extend_from_slice(&piece[..n]);
             }
             assert_eq!(result, expected, "piece size {width}");
+        }
+    }
+
+    #[test]
+    fn model_availability() {
+        use lattice_peer_wire::IrStatus::*;
+        static NATIVE: TransformerHandle<Switch, ()> = TransformerHandle::new::<Toggle>("toggle");
+        static COMPLETE: crate::surface::IrModel<Switch> = crate::surface::IrModel {
+            complete: true,
+            axioms: &[],
+            invariants: &[],
+        };
+        static PARTIAL: crate::surface::IrModel<Switch> = crate::surface::IrModel {
+            complete: false,
+            axioms: &[],
+            invariants: &[],
+        };
+        static CASES: [(Surface<Switch, ()>, lattice_peer_wire::IrStatus, bool); 5] = [
+            (Surface::new(&[&ON], &[&NATIVE]), Absent, false),
+            (Surface::new(&[&ON], &[&TOGGLE]), Incomplete, true),
+            (
+                Surface::new(&[&ON], &[&NATIVE]).with_model(&COMPLETE),
+                Incomplete,
+                false,
+            ),
+            (
+                Surface::new(&[&ON], &[&TOGGLE]).with_model(&PARTIAL),
+                Incomplete,
+                true,
+            ),
+            (
+                Surface::new(&[&ON], &[&TOGGLE]).with_model(&COMPLETE),
+                DeclaredComplete,
+                true,
+            ),
+        ];
+        for (surface, status, model) in &CASES {
+            let description = Description::new(surface).unwrap();
+            let mut bytes = [0; 256];
+            let length = description.encode_part(0, &mut bytes);
+            assert_eq!(description.ir_status(), *status);
+            assert_eq!(bytes[5], *status as u8);
+            assert_eq!(bytes[33], u8::from(*model)); // header, state, reference, empty native signature
+            if !model {
+                assert_eq!(length, 34);
+            }
         }
     }
 
@@ -532,17 +626,31 @@ mod tests {
         static BAD: Surface<'static, Switch, ()> = Surface {
             states: &[],
             transformers: &[],
-            axioms: &[&P],
-            invariants: &[],
+            model: Some(&crate::surface::IrModel {
+                complete: true,
+                axioms: &[&P],
+                invariants: &[],
+            }),
         };
         static BIG: Surface<'static, Switch, ()> = Surface {
             states: &[],
             transformers: &[],
-            axioms: &[&AXIOM; 4096],
-            invariants: &[],
+            model: Some(&crate::surface::IrModel {
+                complete: true,
+                axioms: &[&AXIOM; 4096],
+                invariants: &[],
+            }),
         };
-        assert!(matches!(Description::new(&BAD), Err(EncodeError::TooDeep)));
-        assert!(matches!(Description::new(&BIG), Err(EncodeError::TooLarge)));
+        for surface in [&BAD, &BIG] {
+            let description = Description::new(surface).unwrap();
+            assert_eq!(
+                description.ir_status(),
+                lattice_peer_wire::IrStatus::Incomplete
+            );
+            let mut native = [0; 14];
+            assert_eq!(description.encode_part(0, &mut native), 14);
+            assert_eq!(native, *b"LSF\x03\x40\x01\0\0\0\0\0\0\0\0");
+        }
     }
 
     #[test]
@@ -574,8 +682,14 @@ mod tests {
             (true, true, false),
         ] {
             // Distinct declarations with the same durable name must not alias.
-            let on = Box::leak(Box::new(StateHandle::new::<On>("on")));
-            let toggle = Box::leak(Box::new(TransformerHandle::new::<Toggle>("toggle")));
+            let on = Box::leak(Box::new(StateHandle::hardware::<bool>(
+                "on",
+                |_| panic!("metadata only"),
+                |_| panic!("metadata only"),
+            )));
+            let toggle = Box::leak(Box::new(
+                TransformerHandle::new::<Toggle>("toggle").with_model(&TOGGLE_MODEL),
+            ));
             let surface = Box::leak(Box::new(Surface {
                 states: if states {
                     Box::leak(Box::new([&ON, &*on]))
@@ -587,8 +701,11 @@ mod tests {
                 } else {
                     SURFACE.transformers
                 },
-                axioms: &[],
-                invariants: &[],
+                model: Some(&crate::surface::IrModel {
+                    complete: true,
+                    axioms: &[],
+                    invariants: &[],
+                }),
             }));
             assert_eq!(
                 Description::new(surface).map(|_| ()),
@@ -608,8 +725,14 @@ mod tests {
         for _ in 0..2 {
             // Separately allocated native declarations and mathematical nodes.
             // Relocation changes their addresses, never the encoded definition.
-            let on = Box::leak(Box::new(StateHandle::new::<On>("on")));
-            let toggle = Box::leak(Box::new(TransformerHandle::new::<Toggle>("toggle")));
+            let on = Box::leak(Box::new(StateHandle::hardware::<bool>(
+                "on",
+                |_| panic!("metadata only"),
+                |_| panic!("metadata only"),
+            )));
+            let toggle = Box::leak(Box::new(
+                TransformerHandle::new::<Toggle>("toggle").with_model(&TOGGLE_MODEL),
+            ));
             let definition = Box::leak(Box::new(Definition {
                 arguments: &[],
                 inputs: &[],
@@ -622,8 +745,11 @@ mod tests {
             let surface = Box::leak(Box::new(Surface {
                 states: Box::leak(Box::new([&*on])),
                 transformers: Box::leak(Box::new([&*toggle])),
-                axioms: Box::leak(Box::new([&*axiom])),
-                invariants: &[],
+                model: Some(Box::leak(Box::new(crate::surface::IrModel {
+                    complete: true,
+                    axioms: Box::leak(Box::new([&*axiom])),
+                    invariants: &[],
+                }))),
             }));
             let description = Description::new(surface).unwrap();
             let mut bytes = self::std::vec![0; description.len() as usize];

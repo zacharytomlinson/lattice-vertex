@@ -23,7 +23,7 @@
 //!
 //! ## API Functions
 //!
-//! - [`xEventGroupCreate`] / [`xEventGroupCreateStatic`] - Create an event group
+//! - `xEventGroupCreate` (allocator required) / [`xEventGroupCreateStatic`] - Create an event group
 //! - [`xEventGroupWaitBits`] - Wait for bits to be set
 //! - [`xEventGroupSetBits`] - Set bits in the event group
 //! - [`xEventGroupClearBits`] - Clear bits in the event group

@@ -5,9 +5,13 @@ Read [the architecture](docs/ARCHITECTURE.md) for system semantics and
 before implementation. [Documentation ownership](docs/README.md) identifies where
 changes belong. The DOCX white paper is generated; never edit it independently.
 
-We extend the inherited RTOS into one kernel. Preserve the architecture's stable
-firmware boundary: appliance code encapsulates hardware; the kernel owns Lattice
-participation. Do not make firmware authors precompile automations, construct
+The current kernel reuses FreeRTOS-derived mechanisms. Lattice owns the public
+contract; retaining FreeRTOS is an implementation choice, not an architectural
+requirement. Preserve the stable firmware boundary: appliance code implements its
+device state machine through kernel-provided primitives; the kernel automatically
+wires Lattice participation into those primitives. Keep mandatory integration in
+kernel-owned wrappers/sealed internal interfaces while leaving appliance hooks
+implementable by firmware authors. Do not make them precompile automations, construct
 messages, or understand program/transport internals. Keep changes concrete and
 small; neighboring repositories are references, not sources of workflow gates.
 
@@ -32,6 +36,17 @@ by its removal imposes avoidable double work.
 
 ## Naming and organization
 
+- Judge firmware-facing APIs by complete consumer code. A simple appliance should
+  read as a procedural, expressive narrative: introduce its hardware/state, then
+  describe its behavior. Aim for a novice's first small firmware project to be
+  approachable in a day; this is an ergonomics goal, not a promise about every device.
+- Keep registration, routing, ownership plumbing and allocation machinery internal
+  wherever possible. Complexity in firmware should reflect the appliance's needs,
+  not compensate for missing kernel abstraction. Do not hide a cumbersome API behind
+  a large macro/DSL layer. Use actual firmware call sites to identify the simplification.
+- Model concrete state/data as concrete types and use traits for behaviors/capabilities.
+  Prefer names that expose the memory or device meaning. Firmware APIs should work
+  naturally with static storage and references without requiring heap containers.
 - Organize modules around concrete responsibilities, keeping related records and
   operations together. Memory efficiency and readability are both requirements.
 - Names must describe the record or operation. Distinguish reading state, changing
@@ -42,6 +57,8 @@ by its removal imposes avoidable double work.
   Use Redox and Bitcoin as references for clear responsibility-based organization.
 - Keep useful FreeRTOS-derived mechanisms and their attribution within this kernel.
   Use existing owners rather than adding parallel bookkeeping or execution systems.
+  If adapting Lattice to those mechanisms becomes the source of unnecessary
+  complexity, replacing the RTOS substrate is valid; preserve the firmware contract.
 
 ## Tests and experiments
 

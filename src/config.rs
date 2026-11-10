@@ -515,10 +515,10 @@ pub const tskSTACK_FILL_BYTE: u8 = 0xA5;
 pub const configLATTICE_NATIVE_STATES: usize = 32;
 pub const configLATTICE_NATIVE_TASKS: usize = 2;
 pub const configLATTICE_NATIVE_STACK_WORDS: usize = 1024;
-pub const configLATTICE_ACQUISITION_STACK_WORDS: usize = 1024;
-/// Compatibility interval for getter-only State implementations. Event-backed
-/// states do not use this timeout; unchanged acquisitions emit no deltas.
-pub const configLATTICE_ACQUISITION_MS: u32 = 10;
+pub const configLATTICE_STATE_STACK_WORDS: usize = 1024;
+/// Captured source changes awaiting task-context delta/history processing.
+/// Shared by all states of one appliance; preserves values and FIFO order.
+pub const configLATTICE_STATE_CHANGES: usize = 32;
 /// Evaluation slots, plus one reserved for incoming/local continuation progress.
 pub const configLATTICE_EVALUATIONS: usize = 4;
 /// Resident local components; input/action bindings have two slots per component.

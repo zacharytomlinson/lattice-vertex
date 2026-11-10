@@ -2,42 +2,28 @@
 //! Only the kernel emits packets. Each record describes one range, not a
 //! completed surface transfer; no foreign mathematical surface is retained.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering::Relaxed};
+use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use lattice_vertex::kernel::State;
 use lattice_vertex::{
     ir::{Binary, Effect, Expr, Integer, Unary, Value},
+    kernel::history::{History, RetainedState},
     kernel::radio::testing::Event,
-    kernel::state::{History, RetainedState},
     surface::{
-        Arguments, Definition, Operation, Predicate, State, StateHandle, StateTransformer, Surface,
+        Arguments, Definition, Operation, Predicate, StateHandle, StateTransformer, Surface,
         TransformerHandle,
     },
 };
 
 pub struct Controls {
-    power: AtomicBool,
-    level: AtomicU8,
+    power: State<bool>,
+    level: State<u8>,
 }
-struct Power;
-impl State for Power {
-    type Appliance = Controls;
-    type Value = bool;
-    fn read(a: &Controls) -> Option<bool> {
-        Some(a.power.load(Relaxed))
-    }
-}
-struct Level;
-impl State for Level {
-    type Appliance = Controls;
-    type Value = u8;
-    fn read(a: &Controls) -> Option<u8> {
-        Some(a.level.load(Relaxed))
-    }
-}
-static POWER: StateHandle<Controls> = StateHandle::new::<Power>("power");
-static LEVEL: StateHandle<Controls> = StateHandle::new::<Level>("level");
+static POWER: StateHandle<Controls> = StateHandle::new("power", |a| &a.power);
+static LEVEL: StateHandle<Controls> = StateHandle::new("level", |a| &a.level);
 // Native fixture history: the adapter only changes hardware-backed values.
-// Kernel acquisition owns detection, history maintenance and delta publication.
-static LEVEL_HISTORY: RetainedState<Controls, u8, i16, 4> = RetainedState::new("level-history", &LEVEL);
+// State primitives register transitions; the kernel maintains history and broadcasts.
+static LEVEL_HISTORY: RetainedState<Controls, u8, i16, 4> =
+    RetainedState::new("level-history", &LEVEL);
 static LEVEL_DIFFERENCE: Definition<Controls> = Definition {
     body: Expr::Binary(
         Binary::Equal,
@@ -115,69 +101,87 @@ static PERMITTED: Definition<Controls> = Definition {
     inputs: &[],
 };
 struct SetPower;
+static SETPOWER_MODEL: Operation<Controls> = Operation {
+    precondition: Predicate {
+        definition: &TRUE,
+        inputs: &[],
+    },
+    effect: Effect {
+        inputs: &[],
+        outputs: &[POWER.definition()],
+        results: &[Expr::Argument(0)],
+        arguments: <<SetPower as StateTransformer>::Arguments as Arguments>::TYPES,
+    },
+};
 impl StateTransformer for SetPower {
     type Appliance = Controls;
     type Arguments = (bool,);
     type Error = ();
-    const DEFINITION: Operation<Controls> = Operation {
-        precondition: Predicate {
-            definition: &TRUE,
-            inputs: &[],
-        },
-        effect: Effect {
-            inputs: &[],
-            outputs: &[POWER.definition()],
-            results: &[Expr::Argument(0)],
-            arguments: Self::Arguments::TYPES,
-        },
-    };
-    fn invoke(a: &Controls, (power,): (bool,)) -> Result<(), ()> {
-        a.power.store(power, Relaxed);
+
+    fn invoke(
+        _: &lattice_vertex::sync::TaskContext,
+        a: &Controls,
+        (power,): (bool,),
+    ) -> Result<(), ()> {
+        a.power.set(power).map_err(|_| ())?;
         Ok(())
     }
 }
 struct SetLevel;
+static SETLEVEL_MODEL: Operation<Controls> = Operation {
+    precondition: Predicate {
+        definition: &PERMITTED,
+        inputs: &[],
+    },
+    effect: Effect {
+        inputs: &[],
+        outputs: &[POWER.definition(), LEVEL.definition()],
+        results: &[
+            Expr::Binary(Binary::Greater, &Expr::Argument(0), &Expr::Constant(ZERO)),
+            Expr::Argument(0),
+        ],
+        arguments: <<SetLevel as StateTransformer>::Arguments as Arguments>::TYPES,
+    },
+};
 impl StateTransformer for SetLevel {
     type Appliance = Controls;
     type Arguments = (u8,);
     type Error = ();
-    const DEFINITION: Operation<Controls> = Operation {
-        precondition: Predicate {
-            definition: &PERMITTED,
-            inputs: &[],
-        },
-        effect: Effect {
-            inputs: &[],
-            outputs: &[POWER.definition(), LEVEL.definition()],
-            results: &[
-                Expr::Binary(Binary::Greater, &Expr::Argument(0), &Expr::Constant(ZERO)),
-                Expr::Argument(0),
-            ],
-            arguments: Self::Arguments::TYPES,
-        },
-    };
-    fn invoke(a: &Controls, (level,): (u8,)) -> Result<(), ()> {
+
+    fn invoke(
+        _: &lattice_vertex::sync::TaskContext,
+        a: &Controls,
+        (level,): (u8,),
+    ) -> Result<(), ()> {
         if level > 200 {
             return Err(());
         }
-        a.level.store(level, Relaxed);
-        a.power.store(level != 0, Relaxed);
+        a.level.set(level).map_err(|_| ())?;
+        a.power.set(level != 0).map_err(|_| ())?;
         Ok(())
     }
 }
-static SET_POWER: TransformerHandle<Controls, ()> = TransformerHandle::new::<SetPower>("set-power");
-static SET_LEVEL: TransformerHandle<Controls, ()> = TransformerHandle::new::<SetLevel>("set-level");
+static SET_POWER: TransformerHandle<Controls, ()> =
+    TransformerHandle::new::<SetPower>("set-power").with_model(&SETPOWER_MODEL);
+static SET_LEVEL: TransformerHandle<Controls, ()> =
+    TransformerHandle::new::<SetLevel>("set-level").with_model(&SETLEVEL_MODEL);
 pub static SWITCH: Surface<'static, Controls, ()> = Surface {
     states: &[&POWER],
     transformers: &[&SET_POWER],
-    axioms: &[],
-    invariants: &[],
+    model: Some(&lattice_vertex::surface::IrModel {
+        complete: true,
+        axioms: &[],
+        invariants: &[],
+    }),
 };
 pub static DIMMER: Surface<'static, Controls, ()> = Surface {
     states: &[&POWER, &LEVEL],
     transformers: &[&SET_LEVEL],
-    axioms: &[&POWER_LEVEL],
-    invariants: &[&SAFE_LEVEL],
+    model: Some(&lattice_vertex::surface::IrModel {
+        complete: true,
+        axioms: &[&POWER_LEVEL],
+        invariants: &[&SAFE_LEVEL],
+    }),
 };
 
 /// Initialize the selected native fixture before ordinary kernel startup.
@@ -197,8 +201,8 @@ pub fn appliance(
     appliance.initialize(
         context,
         Controls {
-            power: AtomicBool::new(false),
-            level: AtomicU8::new(0),
+            power: State::new(false),
+            level: State::new(0),
         },
     );
     if dimmer {

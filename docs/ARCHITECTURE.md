@@ -43,10 +43,10 @@ component notes.
 | Separate kinds of change | Appliance-state notices and addressed circuit-signal updates have different recipients and execution meaning. |
 | Compile-time assembly | The build/authoring toolchain constructs typed components and target mappings; a vertex applies prepared configuration. |
 | Hardware realization | Pins, latches, comparators, timers, event routes and DMA implement the model wherever the target mapping permits. |
-| Minimal firmware boundary | HAL plus formal surface; no appliance-owned networking, circuit evaluator, notification loop or resource arbitration. |
+| Minimal firmware boundary | Appliance behavior uses kernel primitives and supplied hardware/state bindings; no appliance-owned Lattice networking, evaluator or reporting loop. |
 | Bounded ownership | Peripheral resources, signal storage and accepted delivery state have explicit local limits. |
 | Independent changes | Connections preserve their own state; later changes do not cancel hardware calls already running. |
-| Explicit semantics | Arithmetic, qualification, active/resting targets and fault behavior are declared, not guessed by the kernel. |
+| Explicit semantics | Arithmetic, qualification, discrete mutations and fault behavior are declared, not guessed by the kernel. |
 
 The objective is minimal CPU work during ordinary Lattice operation. Hardware setup,
 installation, delivery management and explicitly required native operations still exist.
@@ -90,31 +90,55 @@ unavailability prevents work that requires that service, such as a new admission
 not by itself invalidate an already installed program.
 
 The basic installation is vertices and a tablet daemon peer; nucleus is optional. The
-tablet can author a limited graph directly and supplies intent IR when nucleus is present.
-Nucleus owns FSPS/proof/compilation, not an obligatory natural-language interface or
-runtime control path. Existing RTOS mechanisms own scheduling, interrupt entry and
-synchronization. Board integration supplies only the minimal hardware/state adapters; the
+tablet compiles the graph the user constructs, without FSPS or program synthesis.
+When nucleus is present, the tablet can supply intent IR to its FSPS. Nucleus owns
+synthesis and proof, then passes the resulting program to the same compiler used by
+the tablet. Neither compiler use creates a runtime control authority. Nucleus has no
+obligatory natural-language interface. Existing RTOS mechanisms own scheduling,
+interrupt entry and synchronization. Board integration supplies only the minimal hardware/state adapters; the
 common kernel owns networking, enumeration, state propagation, resident programs and their
 storage.
 
 ### Local driver responsibility
 
-Appliance firmware supplies the board/appliance HAL and the formal surface: typed inputs
-and outputs, transformation meanings, calibration, qualification and operating invariants.
-It has no independent main loop, circuit evaluation loop or reporting task. The kernel
-owns startup, physical resource allocation, network participation and any required RTOS
-execution contexts. An entry stub connects the supplied hardware; it does not turn
-Lattice into a periodically called library.
+Appliance firmware implements its device state machine using kernel-provided primitives
+and supplies its hardware/state bindings. Its mathematical surface describes scalar
+domains, transformations and invariants for synthesis and authoring consumers. That
+mathematical description is not the kernel's runtime control model. The kernel needs
+operational bindings, value representations, callable signatures and change facilities;
+it need not interpret an appliance's admissible scalar range to publish a value or
+dispatch a call. Firmware owns device limits, calibration and qualification.
+The kernel may expose the mathematical metadata to consumers without evaluating it.
+Appliance-specific tasks, event handlers and
+control logic belong to that firmware. Scheduling, resource ownership and Lattice
+participation belong to the kernel. The implementor does not write a graph evaluator,
+network/reporting loop or periodically call a service routine to keep Lattice running.
 
-The surface is also a declarative resource request. Its realization should use the
-actual electrical or peripheral representation of state: a qualified pin level, output
-latch, analog signal, comparator result, PWM setting, counter or DMA-backed measurement.
-Software-maintained state is appropriate for a remote appliance or a logical quantity
-without an accessible physical representation. Directly attached digital sensors may
-use bus peripherals and buffers; an analog pin is not a requirement for participation.
+Kernel-owned state, event and operation primitives wrap the implementor's trait hooks
+or closures. Their mandatory behavior wires declared state transitions into delta
+publication automatically, including intermediate changes during a native operation.
+Protect this path with concrete wrappers and sealed internal interfaces; externally
+implemented appliance hooks remain open. An overridable default trait method alone
+does not enforce the wrapper. Ordinary static dispatch suffices; reflection,
+source rewriting and extensive macros are not requirements.
+
+The hardware/state binding supplies the value location and relevant change facility.
+The kernel wires the event into its handling path. A qualified change is already a
+change; general getter polling and comparison are not the intended detection model.
+An appliance may need sampling or software qualification internally, but that does not
+make polling every exposed getter a kernel responsibility.
+
+Operational bindings identify storage and available hardware/event facilities. State
+may reside in a peripheral register, ordinary memory, or a device-managed buffer.
+These are first-class sources under the same state/event contract; their access and
+notification mechanics are supplied by the binding. A software-maintained command
+model is valid for an initial integration or a device whose actual internal state is
+inaccessible. A fan can later use custom feedback hardware without changing graph
+participation. A TV may continue to require a firmware-maintained model. Neither
+an analog input nor a directly readable peripheral register is mandatory.
 
 Types and formulas alone cannot identify which appliance pin or peripheral supplies an
-input. That association comes through the HAL/surface binding already supplied by the
+input. That association comes through the hardware/state binding supplied by the
 implementor. The target implementation must preserve enough of that association for
 compilation and allocation; it must not attempt to infer hardware from an opaque getter's
 machine code. The implementor does not choose circuit-specific PPI/ETM channels, allocate
@@ -134,7 +158,7 @@ still require ADC conversion or a bus read. Raw noise and repeated above-thresho
 events are not automatically distinct system deltas. Preserve required intervening changes
 through the available latch, counter, FIFO or bounded storage.
 
-The kernel configures event paths and data buffers from compiled definitions. When a
+The kernel configures event paths and data buffers from supplied bindings and prepared definitions. When a
 physical task can implement a mutation, that task is the endpoint. Where an adapter must
 perform a finite native operation, existing RTOS contexts let it run while acquisition,
 communication and unrelated circuits continue. It must not supply its own scheduler or
@@ -183,7 +207,7 @@ entities.
 | Optional relay binding | Represent an established communication path without changing the program predicate. |
 | Optional safety and watchdog slot | Declare fault behavior and retain the bounded state needed while a protected condition is open. |
 | Head enablement | Supply the circuit's enabling signal without a global AutomationID lookup on every update. |
-| Connection signal state | Retain established incoming continuity, required typed values and emitted output state; validity is distinct from low. |
+| Connection signal state | Retain incoming activation, required typed values and emitted output state; activation defaults LOW while missing scalar values remain unavailable. |
 
 These are logical requirements, not a demand for heap-allocated objects or one large
 structure at every attachment. Concrete layouts may use fixed arrays, compact indices,
@@ -235,6 +259,25 @@ mathematical surface, not automations that might later use it. Nucleus may prove
 synthesize circuits; a basic-install authoring peer can compile a graph without a solver.
 Neither service becomes an execution coordinator.
 
+The `lattice-ir` repository owns the shared language and its planned LLVM backend.
+The backend is a separate compiler crate, so firmware can consume the `no_std`
+definitions without LLVM dependencies. Vertex owns the native loading/binding
+interface and ongoing execution. Compiler validation and optimization preserve an
+already authored or synthesized program; they do not add synthesis to the tablet.
+
+Mathematical descriptions are optional for appliance firmware. Native state and
+callable signatures suffice for ordinary participation and explicit authoring.
+The kernel does not generate, infer or execute a default model to fill a gap.
+Provided IR is authored data for nucleus to assess; a future build-time authoring
+tool may assist the implementor, but no such generator runs on the vertex.
+
+Discovery carries the implementor's IR availability/completeness declaration so
+nucleus can avoid fetching an absent or known-incomplete model. This is neither a
+kernel certification nor a reason to reject a native-only vertex from the basic
+installation. A claim of completeness still requires nucleus validation. Optional
+IR that cannot be encoded within kernel resource bounds is omitted and marked
+incomplete while the native interface remains available.
+
 The circuit primitive vocabulary uses those same types and meanings. Typed sources,
 Boolean gates, comparisons, supported value transformations and output endpoints form a
 small circuit instruction set. Each target port supplies concrete implementations and
@@ -244,27 +287,27 @@ and no competing arithmetic language beside lattice-ir.
 ### Compile-time circuit assembly
 
 Circuit assembly and native code generation occur before activation, never on each delta.
-Target-lowering placement remains open: an authoring-peer compiler can use LLVM, or a
-bounded vertex-local translator can realize portable binary definitions at installation.
-Chip-specific mapping knowledge is unavoidable; where selection runs is not settled.
-Selection uses the typed IR, not disassembly of previously emitted native code.
+The selected software path uses the shared LLVM backend on the tablet or nucleus
+to emit machine code for the receiving target. LLVM is not part of MCU firmware.
+Future hardware realization uses the typed IR, not disassembly of previously emitted
+native code; concrete hardware selection and resource mappings remain separate work.
 
-The appliance build realizes its surface through the supplied HAL and target components.
+The appliance build binds its state and operations through the supplied HAL and kernel
+primitives, with mathematical metadata referring to those same declared members.
 Later authoring partitions circuit logic by ownership without a firmware rebuild or a
 firmware-authored evaluator per automation. The selected lowering path prepares physical
 configuration and any required native instruction sequences before activation.
 
 | Stage | Responsibility |
 | --- | --- |
-| Appliance build | Resolve physical sources/actions and their mathematical meaning; prepare the local surface realization. |
-| Circuit authoring and target lowering | Partition logic and resolve implementations, constants, data locations, connections and resource requirements. Backend placement remains open. |
-| Boot or installation | Validate, complete local translation if selected, bind resources, apply setup and establish valid inputs before activation. |
+| Appliance build | Bind state, events and operations; supply mathematical descriptions for synthesis/authoring consumers. |
+| Circuit authoring and target lowering | Compile the tablet-authored or nucleus-synthesized program through the shared backend; resolve target code, constants, data locations and connections. |
+| Boot or installation | Validate the compiled artifact, relocate/bind resources, apply setup and establish valid inputs before activation. |
 | Ordinary operation | Propagate qualified input/output changes through the established hardware and communication paths. |
 
 Installation may validate, relocate handles, reserve resources and write configuration
-registers. A selected local translator can match known implementations and emit native
-code once; it does not run FSPS, invent an automation or interpret operations per delta.
-Concrete peripheral assignments must respect resources
+registers. It does not run LLVM or FSPS, invent an automation or interpret operations
+per delta in the native backend. Concrete peripheral assignments must respect resources
 already used by the RTOS, radio and other installed connections. Prepared setup is limited
 to admitted HAL resources and target operations, not arbitrary MCU register writes.
 The resource description and relocation format remain implementation work; no fixed recipe
@@ -331,7 +374,14 @@ operations, not an informal claim about Turing completeness.
 
 ## Maintained circuits and delta propagation
 
-An automation is a maintained distributed circuit. Its head supplies enablement; it is
+An authored automation can produce several discrete DAGs. Each DAG connects a set
+of predicates to an explicit system-state mutation; it is not a long-lived execution
+holding an appliance in a target state. Turning the dining-room sconces on at sunset
+and off at midnight produces two DAGs, each with its own trigger and mutation.
+The installed relationships and their predicate activation can persist between
+invocations, while each resulting native invocation remains finite.
+
+Each DAG forms a maintained distributed circuit. Its head supplies enablement; it is
 not a central evaluator or the destination of a round trip on every change. For a serial
 AND path, a component's outgoing continuity is its established upstream continuity AND
 its local predicate. A true local predicate alone cannot power the circuit.
@@ -375,12 +425,22 @@ the LOW activation default does not fabricate an appliance measurement or infer 
 new resting mutation. Circuit state reflects received changes, not a simultaneous
 system-wide snapshot.
 
-The interim software implementation retains activation between changes. An active
-path's periodic end-to-end heartbeat is deferred until after that implementation;
-it will provide a way to detect lost continuity when no LOW update was issued.
-ACK/retry provides delivery of issued messages, not evidence that a silent source
-is still operating. The interim model does not claim to handle isolated power loss
-as an actual powered wire would.
+The implemented software retains activation between changes. A deferred heartbeat
+will check an active chain periodically instead of requiring a continuous carrier.
+The head sends a heartbeat along its selected active connections; the tail returns
+a correlated pong to the head's address. This confirms a completed continuity check,
+not another invocation or proof that an appliance action physically succeeded.
+The existing connection binding identifies the DAG: a head MAC alone cannot
+distinguish several DAGs originating at the same vertex. Pulse correlation must
+also distinguish current evidence from a delayed or duplicate pong.
+
+The interval, missed-heartbeat allowance, local activation expiry and recovery
+behavior remain to specify. A pong timeout alone informs only the head; clearing
+stale activation downstream of a silent head or broken link needs local expiry.
+Expiry must not invent an appliance mutation, and heartbeat traffic must not count
+as a fresh execution request. ACK/retry still owns delivery of issued updates;
+it cannot establish that a silent source remains operational. No heartbeat or
+expiry is implemented yet, so isolated failure can leave retained HIGH downstream.
 
 ### System-state and circuit-state changes
 
@@ -406,14 +466,17 @@ floating-point execution language.
 | Established output change at a mutation endpoint | Required behavior |
 | --- | --- |
 | Low to high, active arguments available | Apply the declared active target. |
-| High to low | Apply the declared resting target. |
+| High to low | Withdraw activation; do not invoke an opposite or resting action. |
 | High remains high, effective arguments change | Apply the new target. |
 | Continuity and effective arguments unchanged | Do not invoke again. |
 | Low remains low while inputs/arguments change | Update required input state without invoking an active target. |
 | Same update retransmitted | Preserve its original identity; do not manufacture another transition. |
+| Continuity heartbeat/pong | Refresh path-health evidence only; do not invoke the mutation again. |
 
-The resting target is part of the output's authored behavior, not a universal zero/off
-default. A falling signal is therefore an output change, not the old false-path stop.
+An opposite state change requires its own authored DAG. LOW is a circuit update,
+not an implicit off/zero command; it cannot undo a completed native operation.
+Explicit appliance safety behavior remains separately defined by its surface and
+protection obligations. It is not inferred from ordinary circuit continuity.
 An unchanged high carrying a changed required argument is also a meaningful delta;
 an additional "execute again" bit is not inherently required. Circuit connections may
 carry different types or widths along one graph as comparisons reduce values to Boolean
@@ -458,7 +521,7 @@ also deferred; it is not a prerequisite for addressed dependent delivery.
 ### Mutation and independent changes
 
 The endpoint's installed binding determines the physical task or finite native function
-and its active/resting targets. Packet acceptance, command completion and physical
+and its mutation arguments. Packet acceptance, command completion and physical
 achievement remain different facts. A physical completion dependency uses an observed
 state or another explicitly declared result; receipt alone cannot supply it.
 
@@ -640,9 +703,9 @@ receive logs and a distributed historical ledger remain deferred.
 
 ### Completion and uncertain outcomes
 
-A maintained circuit has no overall traversal-complete event: it remains installed and
-responds to its inputs. Individual deliveries and finite native operations still have
-completion or failure outcomes. Their evidence must not be confused with physical
+An installed DAG can remain available after its discrete action completes; retained
+activation is not evidence of a still-running automation. Individual deliveries
+and finite native operations have completion or failure outcomes. Their evidence must not be confused with physical
 convergence or network-wide quiescence. Termination accounting such as
 Dijkstra-Scholten concerns finite work under stated assumptions, not proof that a
 maintained circuit has permanently finished [1].
@@ -815,10 +878,10 @@ unstarted work for the removed connection is canceled. Hardware/DMA resources ca
 reused while their previous owner can still touch them. Work already delivered to another
 vertex cannot be recalled by local deletion.
 
-Normal high-to-low signal propagation applies the declared resting target. The exact
-ordering of a requested rest transition, local disconnection and deletion at other owners
-still needs a circuit lifecycle rule; explicit deletion must not be represented as an
-already implemented network-wide rest or drain operation.
+High-to-low propagation withdraws activation without an implicit appliance command.
+Deleting a DAG does not reverse a mutation that already happened. A requested opposite
+mutation is separately authored; explicit deletion must not be represented as a
+network-wide rest or drain operation.
 
 ### Replacement lifecycle
 
@@ -829,7 +892,7 @@ different times. A failed staging attempt leaves the incumbent available.
 
 The previous model's policy of draining whole admitted traversals cannot simply be
 renamed for maintained signals. Cutover must account for established input levels,
-pending updates, active/resting output transitions, in-progress native operations and
+pending updates, discrete output mutations, in-progress native operations and
 shared hardware resources. The exact cutover and output reconciliation protocol remains
 open. Consistent-update research [5] is relevant but does not choose that protocol.
 
@@ -848,8 +911,8 @@ The head retains the enabling signal. Local predicates may be true while the cir
 disabled; that truth cannot energize its outputs. Disabled definitions remain installed
 and participate in consistency/resource accounting. Enabling establishes the outputs
 from valid current inputs. Repeating the same accepted enable command is not another
-edge. Disabling produces a low signal whose ordinary propagation reaches the declared
-resting targets; it does not erase the graph or preempt a running hardware function.
+edge. Disabling propagates LOW through its connections without changing the appliance
+back, erasing the graph or preempting a running hardware function.
 
 Manual control remains an authorized direct operation or control stream, without an
 implicit hold timer or invented expected-starting-state guard. A later meaningful circuit
@@ -1018,7 +1081,8 @@ it belongs in the authored circuit; neither requires a special clock/solar verte
 broadcast for every temporal boundary. Commissioning supplies a UTC reference and
 approximate location. Local elapsed counters and calculated boundaries drive deadline
 records; an expiry changes the local temporal signal and updates its connected circuit
-outputs. A closed time window propagates low toward its resting targets. The kernel arms
+outputs. A closed time window propagates LOW without an implicit opposite mutation.
+A sunset-on/midnight-off schedule authors separate DAGs for those two changes. The kernel arms
 the next relevant deadline rather than repeatedly scanning every program or comparing
 the clock once per second. Calendar/solar boundary computation remains bounded support
 work; it is not evidence that all such mathematics runs in a hardware comparator.
@@ -1068,19 +1132,24 @@ Backpressure cannot make arbitrary physical change rates lossless under a stalle
 
 ### Processor and platform choices
 
-Lattice extends the existing FreeRTOS-derived kernel. Its scheduler, CPU context
-switching, interrupt integration and synchronization are the foundation to reuse, not
-functions each appliance implementer must supply. The extensions must be as
-straightforward to bring up on another supported RTOS target as a small hardware adapter
-and ordinary initialization. Kernel or transport evolution must preserve that
-firmware-facing source interface. Independent binary replacement is deferred as
+The current kernel reuses FreeRTOS-derived scheduling, CPU context switching,
+interrupt integration and synchronization. These facilities avoid reinventing useful
+primitives; FreeRTOS does not define Lattice's architecture or firmware-facing contract.
+Keep it while it simplifies the implementation. If accommodating it becomes a source
+of unnecessary complexity or incompatible constraints, replacement by another RTOS
+or an integrated Lattice implementation is valid. This is not a decision to replace
+the current substrate or introduce a generic multi-RTOS layer now.
+
+Board integration must remain a small hardware binding and ordinary initialization;
+firmware authors do not reimplement kernel execution primitives. Internal RTOS or
+transport changes must preserve the firmware-facing source interface. Independent binary replacement is deferred as
 described above; persisted graph references and appliance-image compatibility
 retain their separate requirements.
 
 Local multiprocessing, threads, interrupt work, and cooperative tasks should be chosen
 where they simplify correctness or materially improve throughput. Configured peripheral
 paths need no software process for each circuit, and finite native operations need no
-new scheduler beyond the inherited RTOS. The earlier central-host processor choice does
+separate scheduler alongside the kernel's execution facilities. The earlier central-host processor choice does
 not dictate MCU selection for every peripheral node.
 
 Hard real-time claims require a deployment profile: maximum local execution costs,

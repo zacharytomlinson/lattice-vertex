@@ -223,7 +223,7 @@ impl TaskHandle {
     /// Spawn a task using caller-owned static stack and TCB storage.
     ///
     /// The storage is borrowed for `'static`, which prevents safe code from
-    /// reusing it while the task might still exist.  As with [`TaskHandle::spawn`],
+    /// reusing it while the task might still exist. As with the allocator-backed `TaskHandle::spawn`,
     /// `name` is copied into bounded temporary C-compatible storage.
     pub fn spawn_static(
         _context: &TaskContext,
@@ -311,7 +311,7 @@ impl TaskHandle {
     /// Borrow this live task without granting deletion authority.
     ///
     /// The returned reference may query or resume the task.  Its lifetime
-    /// prevents this owner from being consumed by [`TaskHandle::delete`] or
+    /// prevents this owner from being consumed by `TaskHandle::delete` (feature `task-delete`) or
     /// [`TaskHandle::into_raw`] until the borrow ends.
     ///
     /// ```compile_fail

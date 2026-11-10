@@ -13,6 +13,26 @@ pub const CALL_ARGUMENT_BYTES: usize = 61;
 pub const MAX_CALL_ARGUMENTS: usize = 30;
 pub const SURFACE_BYTES: usize = 63;
 
+/// Implementor-declared IR availability. DeclaredComplete is a claim for a
+/// synthesis consumer to validate, never kernel certification of model correctness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum IrStatus {
+    Absent = 0,
+    Incomplete = 1,
+    DeclaredComplete = 2,
+}
+impl IrStatus {
+    pub fn decode(value: u8) -> Option<Self> {
+        Some(match value {
+            0 => Self::Absent,
+            1 => Self::Incomplete,
+            2 => Self::DeclaredComplete,
+            _ => return None,
+        })
+    }
+}
+
 /// Result of dispatch, never a claim that physical state has converged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]

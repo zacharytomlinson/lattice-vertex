@@ -28,11 +28,10 @@
 //! - `stream_buffer` - Optional stream and message buffers
 
 #[cfg(feature = "use-mutexes")]
-mod appliance;
-#[cfg(feature = "use-mutexes")]
-pub use appliance::acquisition::{Acquisition, AcquisitionEvent};
+pub(crate) mod appliance;
 #[cfg(feature = "use-mutexes")]
 pub use appliance::{Appliance, InstallError};
+pub use state::{State, StateChangeError, StateEvent};
 #[cfg(feature = "use-mutexes")]
 pub(crate) mod change;
 pub mod event_groups;
@@ -47,9 +46,10 @@ pub(crate) mod time;
 pub mod update;
 #[cfg(feature = "host-link")]
 pub use peer::host;
+#[cfg(feature = "use-mutexes")]
+pub mod history;
 pub mod queue;
 pub mod radio;
-#[cfg(feature = "use-mutexes")]
 pub mod state;
 #[cfg(feature = "stream-buffers")]
 pub mod stream_buffer;
@@ -58,8 +58,8 @@ pub mod tasks;
 pub mod timers;
 
 /// Establish the kernel-owned radio task and start local execution.
-/// Hardware clocks/CPU-port initialization and the passive appliance binding must
-/// be ready. The kernel creates acquisition, native-call and radio tasks.
+/// Hardware clocks/CPU-port initialization and the appliance binding must
+/// be ready. The kernel creates blocking state-event, native-call and radio tasks.
 /// The resident radio enters common peer discovery. Appliance code supplies no
 /// channel, PAN, discovery loop, or diagnostic workload.
 /// `appliance` owns the initialized native instance and borrows its static surface.
@@ -71,7 +71,8 @@ pub mod timers;
 ///
 /// # Panics
 /// Before scheduler startup, rejects uninitialized/already-bound appliances, an
-/// encoded surface over 65,535 bytes, or expression nesting reaching 32 levels.
+/// invalid native declaration or a native catalog over 65,535 bytes. Optional IR
+/// beyond the size/depth bounds is omitted and advertised as incomplete.
 #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
 pub fn start<A: Send + Sync + 'static, E: 'static>(
     context: crate::sync::TaskContext,

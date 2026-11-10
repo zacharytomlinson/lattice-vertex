@@ -1,6 +1,6 @@
-//! Passive appliance binding, kernel-owned acquisition and native dispatch.
+//! Appliance bindings, captured state changes and native dispatch.
 
-pub(crate) mod acquisition;
+pub(crate) mod changes;
 pub(crate) mod execution;
 
 use super::{
@@ -17,7 +17,7 @@ use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU8, Ordering},
 };
 
 /// Local retained-state installation failure. No new binding is published on failure.
@@ -43,25 +43,22 @@ pub enum InstallError {
 
 /// Static storage for an appliance's native state and mathematical surface.
 /// Initialize once before scheduler startup, then pass it to `kernel::start`.
-/// The kernel samples getters and invokes native functions in its own tasks.
-/// The adapter has no report loop. Hardware resources use their own scoped access.
+/// The kernel binds typed change inputs and invokes native functions in its tasks.
+/// Firmware owns device behavior; integration requires no report loop.
 pub struct Appliance<A: 'static, E: 'static> {
     surface: &'static Surface<'static, A, E>,
     control: UnsafeCell<StaticQueue_t>,
     native: UnsafeCell<MaybeUninit<A>>,
-    observations: UnsafeCell<MaybeUninit<Mutex<Observations>>>,
+    maintenance: UnsafeCell<MaybeUninit<Mutex<()>>>,
     instance: AtomicPtr<()>,
     ready: AtomicU8,
-    sampled: AtomicBool,
-    cache_waiting: AtomicBool,
-    acquiring: AtomicBool,
-    acquisition: acquisition::Signals,
-    installed: AtomicPtr<super::state::Installation<A>>,
+    events: changes::Events,
+    installed: AtomicPtr<super::history::Installation<A>>,
 }
 
 // Initialization is once-only and published with release/acquire. After that,
-// A is shared only after publication and must be Sync. The observation mutex
-// protects acquisition/history, never the lifetime of a native operation.
+// A is shared only after publication and must be Sync. The maintenance mutex
+// protects derived values, never the lifetime of a native operation.
 unsafe impl<A: Send + Sync, E> Sync for Appliance<A, E> {}
 
 impl<A: Send + Sync, E> Appliance<A, E> {
@@ -76,13 +73,10 @@ impl<A: Send + Sync, E> Appliance<A, E> {
             surface,
             control: UnsafeCell::new(StaticQueue_t::new()),
             native: UnsafeCell::new(MaybeUninit::uninit()),
-            observations: UnsafeCell::new(MaybeUninit::uninit()),
+            maintenance: UnsafeCell::new(MaybeUninit::uninit()),
             instance: AtomicPtr::new(ptr::null_mut()),
             ready: AtomicU8::new(0),
-            sampled: AtomicBool::new(false),
-            cache_waiting: AtomicBool::new(false),
-            acquiring: AtomicBool::new(false),
-            acquisition: acquisition::Signals::new(),
+            events: changes::Events::new(),
             installed: AtomicPtr::new(ptr::null_mut()),
         }
     }
@@ -90,7 +84,7 @@ impl<A: Send + Sync, E> Appliance<A, E> {
     /// Install the actual device once, before starting the scheduler.
     ///
     /// Panics on repeated initialization or unavailable static mutex storage.
-    pub fn initialize(&'static self, context: &TaskContext, value: A) {
+    pub fn initialize(&'static self, context: &TaskContext, value: A) -> &'static A {
         assert_eq!(
             tasks::xTaskGetSchedulerState(),
             tasks::taskSCHEDULER_NOT_STARTED
@@ -102,19 +96,23 @@ impl<A: Send + Sync, E> Appliance<A, E> {
             "appliance already initialized"
         );
         // The initialized native object never moves and only shared references
-        // escape. The distinct mutex serializes acquisition, not appliance calls.
+        // escape. The distinct mutex serializes derived-state maintenance, not appliance calls.
         unsafe {
             (*self.native.get()).write(value);
             self.instance.store(
                 (*self.native.get()).as_ptr().cast_mut().cast(),
                 Ordering::Release,
             );
-            let observations =
-                Mutex::new_static(context, Observations::new(), &mut *self.control.get())
-                    .expect("observation mutex");
-            (*self.observations.get()).write(observations);
+            let maintenance = Mutex::new_static(context, (), &mut *self.control.get())
+                .expect("state maintenance mutex");
+            (*self.maintenance.get()).write(maintenance);
         }
         self.ready.store(2, Ordering::Release);
+        self.events.initialize(context);
+        for (index, state) in self.surface.states.iter().enumerate() {
+            state.bind(self.native(), &self.events, index as u16);
+        }
+        self.native()
     }
 
     fn native(&self) -> &A {
@@ -124,11 +122,43 @@ impl<A: Send + Sync, E> Appliance<A, E> {
         );
         unsafe { (*self.native.get()).assume_init_ref() }
     }
-    fn observations(&self) -> &Mutex<Observations> {
-        unsafe { (*self.observations.get()).assume_init_ref() }
+    /// Access the initialized firmware state machine for long-lived appliance
+    /// tasks and event handlers. This borrows no mutex or update hold. Protect
+    /// shared physical I/O with its normal kernel/HAL synchronization.
+    pub fn device(&'static self) -> &'static A {
+        self.native()
     }
 
-    /// Access the passive hardware adapter. Native functions use shared access;
+    /// Invoke a typed appliance operation locally through the same kernel-owned
+    /// update guard used for remote operations. Changes originate in the state/
+    /// event primitives used by the operation, not from sampling around this call.
+    pub fn call<R>(
+        &self,
+        context: &TaskContext,
+        operation: impl FnOnce(&A) -> Result<R, E>,
+    ) -> Result<R, InvokeError<E>> {
+        self.operation(context, |device| {
+            operation(device).map_err(InvokeError::Appliance)
+        })
+    }
+
+    fn operation<R>(
+        &self,
+        context: &TaskContext,
+        run: impl FnOnce(&A) -> Result<R, InvokeError<E>>,
+    ) -> Result<R, InvokeError<E>> {
+        crate::sync::assert_task_context("appliance operation");
+        #[cfg(feature = "firmware-update")]
+        let _hold = super::update::hold_updates(context).map_err(|_| InvokeError::Busy)?;
+        let _ = context;
+        run(self.native())
+    }
+
+    fn maintenance(&self) -> &Mutex<()> {
+        unsafe { (*self.maintenance.get()).assume_init_ref() }
+    }
+
+    /// Run a finite operation on the firmware state machine. Native functions use shared access;
     /// synchronization of physical resources belongs to their hardware binding.
     pub fn with<R>(&self, context: &TaskContext, access: impl FnOnce(&A) -> R) -> R {
         #[cfg(feature = "firmware-update")]
@@ -142,99 +172,43 @@ impl<A: Send + Sync, E> Appliance<A, E> {
         access(self.native())
     }
 
-    fn state_mask(&self) -> u32 {
-        let count = self.surface.states.len();
-        if count == 0 {
-            0
-        } else {
-            u32::MAX >> (32 - count)
+    fn process_changes(&self, context: &TaskContext) {
+        // One consumer handles captured values in FIFO order. The mutex only
+        // protects derived-state maintenance/read consistency, never hardware I/O.
+        while self.events.pending(context) {
+            let guard = self.maintenance().try_lock(context).or_else(|| {
+                (tasks::xTaskGetSchedulerState() == tasks::taskSCHEDULER_RUNNING)
+                    .then(|| self.maintenance().lock(context))
+                    .flatten()
+            });
+            let Some(guard) = guard else {
+                return;
+            };
+            let Some(change) = self.events.take(context) else {
+                break;
+            };
+            let state = self.surface.states[change.index as usize];
+            let batch = super::change::batch();
+            state.record_change(self.native(), change.value());
+            super::history::maintain(state, self.native(), change.value());
+            // Publication may immediately wake the higher-priority peer. Release
+            // maintenance first so that wake cannot strand a Busy evaluation.
+            drop(guard);
+            drop(batch);
         }
     }
-    fn sample(&self, context: &TaskContext) {
-        let mask = self.state_mask();
-        if !self.sample_selected(context, mask) {
-            self.acquisition.request(mask);
-        }
-    }
-    fn sample_selected(&self, context: &TaskContext, mask: u32) -> bool {
-        let mask = if self.sampled.load(Ordering::Acquire) {
-            mask & self.state_mask()
-        } else {
-            self.state_mask()
-        };
-
-        let native = self.native();
-        #[cfg(feature = "firmware-update")]
-        let Ok(_hold) = super::update::hold_observation(context) else {
-            return false;
-        };
-        if self
-            .acquiring
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return false;
-        }
-        struct Finish<'a>(&'a AtomicBool);
-        impl Drop for Finish<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
-        }
-        let _acquisition = Finish(&self.acquiring);
-        let mut after = [None; crate::configLATTICE_NATIVE_STATES];
-        for (index, state) in self.surface.states.iter().enumerate() {
-            if mask & (1 << index) != 0 {
-                after[index] = state.read(native);
-            }
-        }
-        // No observation mutex is held during physical I/O. Readers can return
-        // the previous established observation while a getter is in progress.
-        let Some(mut samples) = self.observations().try_lock(context) else {
-            return false;
-        };
-        let batch = super::change::batch();
-        // Capture every selected native input before maintenance publishes derived state.
-        for (index, state) in self.surface.states.iter().enumerate() {
-            if mask & (1 << index) != 0
-                && samples.values[index].is_some_and(|before| before != after[index])
-            {
-                state.record_change(native, after[index]);
-            }
-        }
-        for (index, state) in self.surface.states.iter().enumerate() {
-            if mask & (1 << index) == 0 {
-                continue;
-            }
-            if let Some(before) = samples.values[index] {
-                if before != after[index] {
-                    super::state::maintain(state, native, after[index]);
-                }
-            }
-            // First acquisition establishes the baseline, not an invented change.
-            samples.values[index] = Some(after[index]);
-        }
-        let baseline = !self.sampled.swap(true, Ordering::AcqRel);
-        drop(samples);
-        drop(batch);
-        let waiting = self.cache_waiting.swap(false, Ordering::AcqRel);
-        if baseline || waiting {
-            #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
-            super::radio::task::notify_work();
-        }
-        true
+    /// Number of source changes rejected by bounded local event storage.
+    pub fn state_change_overflow(&self) -> u32 {
+        self.events.overflow()
     }
 
-    fn try_read_observations(
-        &self,
-        context: &TaskContext,
-    ) -> Option<crate::sync::MutexGuard<'_, Observations>> {
-        self.observations().try_lock(context).or_else(|| {
-            self.cache_waiting.store(true, Ordering::Release);
-            // Register interest before retrying so a concurrent release cannot
-            // leave an event-driven reader waiting for an unrelated future delta.
-            self.observations().try_lock(context)
-        })
+    pub(crate) fn ir_status(&self) -> lattice_peer_wire::IrStatus {
+        let status = self.surface.ir_status();
+        if status == lattice_peer_wire::IrStatus::Absent && self.installations().next().is_some() {
+            lattice_peer_wire::IrStatus::Incomplete
+        } else {
+            status
+        }
     }
 
     pub(crate) fn surface(&self) -> &'static Surface<'static, A, E> {
@@ -251,8 +225,8 @@ impl<A: Send + Sync, E> Appliance<A, E> {
     >(
         &'static self,
         context: &TaskContext,
-        state: &'static super::state::RetainedState<A, T, U, N>,
-        update: fn(&super::state::History<T, N>) -> Option<U>,
+        state: &'static super::history::RetainedState<A, T, U, N>,
+        update: fn(&super::history::History<T, N>) -> Option<U>,
         definition: &'static crate::surface::Predicate<A>,
     ) -> Result<(), InstallError> {
         self.with_installation(context, |appliance| {
@@ -313,7 +287,7 @@ impl<A: Send + Sync, E> Appliance<A, E> {
         }
         let _finish = Finish(&self.ready);
         let native = unsafe { (*self.native.get()).assume_init_ref() };
-        let Some(_guard) = self.observations().try_lock(context) else {
+        let Some(_guard) = self.maintenance().try_lock(context) else {
             return Err(InstallError::Busy);
         };
         install(native)
@@ -330,7 +304,7 @@ impl<A: Send + Sync, E> Appliance<A, E> {
     }
     pub(crate) fn installations(
         &self,
-    ) -> impl Iterator<Item = &'static super::state::Installation<A>> + Clone {
+    ) -> impl Iterator<Item = &'static super::history::Installation<A>> + Clone {
         let first = unsafe { self.installed.load(Ordering::Acquire).as_ref() };
         core::iter::successors(first, |node| node.next_appliance)
     }
@@ -353,34 +327,28 @@ impl<A: Send + Sync + 'static, E: 'static> crate::ir::Surface for Appliance<A, E
             .map(|state| -> &'s crate::ir::Attribute<Self::Location> { state })
     }
     fn transformers(&self) -> impl Iterator<Item = &crate::ir::Operation<'_, '_, Self::Location>> {
-        self.surface.transformers.iter().map(|t| t.definition())
+        self.surface
+            .transformers
+            .iter()
+            .filter_map(|t| t.definition())
     }
     fn axioms(&self) -> impl Iterator<Item = &crate::ir::Predicate<'_, '_, Self::Location>> {
         self.surface
-            .axioms
+            .axioms()
             .iter()
             .copied()
             .chain(self.installations().map(|i| i.definition))
     }
     fn invariants(&self) -> impl Iterator<Item = &crate::ir::Predicate<'_, '_, Self::Location>> {
-        self.surface.invariants.iter().copied()
+        self.surface.invariants().iter().copied()
     }
 }
 
 pub(crate) trait Native: Sync {
     fn ready(&self) -> bool;
     fn seal(&self) {}
-    fn acquire(&self, _context: &TaskContext) {}
-    fn acquire_selected(&self, context: &TaskContext, _mask: u32) -> bool {
-        self.acquire(context);
-        true
-    }
-    fn acquisition_source(&'static self, _index: usize) -> Option<acquisition::Acquisition> {
-        None
-    }
-    fn acquisition_signals(&'static self) -> Option<&'static acquisition::Signals> {
-        None
-    }
+    fn process_changes(&self, _context: &TaskContext) {}
+    fn wait_changes(&self, _context: &TaskContext) {}
     fn owns(&self, instance: *const (), attribute: u64) -> bool;
     fn read(&self, context: &TaskContext, attribute: u64) -> StateReadResult;
     fn invoke(&self, context: &TaskContext, transformer: u64, arguments: &[Value]) -> InvokeStatus;
@@ -410,7 +378,7 @@ impl<A: Send + Sync, E> Native for Appliance<A, E> {
             .transformers
             .iter()
             .find(|t| t.reference() == reference)
-            .map(|t| t.definition().effect.arguments)
+            .map(|t| t.arguments())
     }
     fn clear_dependencies(&self) {
         for state in self.state_definitions() {
@@ -432,60 +400,49 @@ impl<A: Send + Sync, E> Native for Appliance<A, E> {
                 .state_definitions()
                 .any(|s| s.location.reference() == attribute)
     }
-    fn acquire(&self, context: &TaskContext) {
-        self.sample(context);
+    fn process_changes(&self, context: &TaskContext) {
+        Appliance::process_changes(self, context);
     }
-    fn acquire_selected(&self, context: &TaskContext, mask: u32) -> bool {
-        self.sample_selected(context, mask)
-    }
-    fn acquisition_source(&'static self, index: usize) -> Option<acquisition::Acquisition> {
-        self.surface
-            .states
-            .get(index)
-            .map(|s| s.acquisition(self.native()))
-    }
-    fn acquisition_signals(&'static self) -> Option<&'static acquisition::Signals> {
-        Some(&self.acquisition)
+    fn wait_changes(&self, context: &TaskContext) {
+        self.events.wait(context);
     }
     fn read(&self, context: &TaskContext, attribute: u64) -> StateReadResult {
         if !self.ready() {
             return StateReadResult::Busy;
         }
-        if let Some(index) = self
-            .surface
-            .states
-            .iter()
-            .position(|s| s.reference() == attribute)
-        {
-            let Some(samples) = self.try_read_observations(context) else {
-                return StateReadResult::Busy;
-            };
-            return StateReadResult::Value {
-                sequence: super::change::sequence(),
-                value: samples.values[index].flatten(),
-            };
-        }
-        let Some(state) = self
-            .installations()
-            .flat_map(|i| i.states())
-            .find(|s| s.location.reference() == attribute)
-        else {
-            return StateReadResult::UnknownAttribute;
-        };
-        let Some(_guard) = self.try_read_observations(context) else {
+        let Some(_guard) = self.maintenance().try_lock(context) else {
             return StateReadResult::Busy;
         };
-        StateReadResult::Value {
-            sequence: super::change::sequence(),
-            value: state.location.read(self.native()),
-        }
+        super::state::atomic(|| {
+            // Never return a new primitive value with a pre-transition sequence.
+            // The event consumer publishes every queued transition first.
+            if self.events.pending(context) {
+                return StateReadResult::Busy;
+            }
+            let value = if let Some(state) = self
+                .surface
+                .states
+                .iter()
+                .find(|s| s.reference() == attribute)
+            {
+                state.read(self.native())
+            } else if let Some(state) = self
+                .installations()
+                .flat_map(|i| i.states())
+                .find(|s| s.location.reference() == attribute)
+            {
+                state.location.read(self.native())
+            } else {
+                return StateReadResult::UnknownAttribute;
+            };
+            StateReadResult::Value {
+                sequence: super::change::sequence(),
+                value,
+            }
+        })
     }
 
     fn invoke(&self, context: &TaskContext, transformer: u64, arguments: &[Value]) -> InvokeStatus {
-        #[cfg(feature = "firmware-update")]
-        let Ok(_activity) = super::update::hold_updates(context) else {
-            return InvokeStatus::Busy;
-        };
         let Some(handle) = self
             .surface
             .transformers
@@ -494,28 +451,13 @@ impl<A: Send + Sync, E> Native for Appliance<A, E> {
         else {
             return InvokeStatus::UnknownTransformer;
         };
-        self.sample(context);
-        if !self.sampled.load(Ordering::Acquire) {
-            return InvokeStatus::Busy;
-        }
-        let result = match handle.invoke(self.native(), arguments) {
+        let result = match self.operation(context, |a| handle.invoke(context, a, arguments)) {
             Ok(()) => InvokeStatus::Invoked,
+            Err(InvokeError::Busy) => InvokeStatus::Busy,
             Err(InvokeError::Arguments(_)) => InvokeStatus::Arguments,
             Err(InvokeError::Appliance(_)) => InvokeStatus::ApplianceError,
         };
-        self.sample(context);
         result
-    }
-}
-
-struct Observations {
-    values: [Option<Option<Value>>; crate::configLATTICE_NATIVE_STATES],
-}
-impl Observations {
-    const fn new() -> Self {
-        Self {
-            values: [None; crate::configLATTICE_NATIVE_STATES],
-        }
     }
 }
 

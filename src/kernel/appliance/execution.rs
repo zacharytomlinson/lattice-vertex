@@ -1,4 +1,4 @@
-//! Statically provisioned RTOS contexts for acquisition and finite native calls.
+//! Statically provisioned RTOS contexts for state events and finite native calls.
 //! Ready records belong to a reserved task; there is no waiting-job queue.
 
 use super::Native;
@@ -275,9 +275,9 @@ mod tasks {
         [[0; crate::configLATTICE_NATIVE_STACK_WORDS]; COUNT];
     static mut CONTROLS: [tasks::StaticTask_t; COUNT] =
         [const { tasks::StaticTask_t::new() }; COUNT];
-    static mut ACQUISITION_STACK: [StackType_t; crate::configLATTICE_ACQUISITION_STACK_WORDS] =
-        [0; crate::configLATTICE_ACQUISITION_STACK_WORDS];
-    static mut ACQUISITION_CONTROL: tasks::StaticTask_t = tasks::StaticTask_t::new();
+    static mut STATE_STACK: [StackType_t; crate::configLATTICE_STATE_STACK_WORDS] =
+        [0; crate::configLATTICE_STATE_STACK_WORDS];
+    static mut STATE_CONTROL: tasks::StaticTask_t = tasks::StaticTask_t::new();
     static mut NATIVE: Option<&'static dyn Native> = None;
     pub(crate) fn start(context: &TaskContext, native: &'static dyn Native) {
         assert!(COUNT != 0);
@@ -294,7 +294,7 @@ mod tasks {
                     b"native",
                     stack,
                     tcb,
-                    // Peer service and acquisition outrank user hardware work.
+                    // Peer service and state events outrank user hardware work.
                     // Equal-priority host I/O still receives RTOS time slices.
                     1,
                     invoke,
@@ -304,11 +304,11 @@ mod tasks {
             }
             TaskHandle::spawn_static(
                 context,
-                b"acquire",
-                &mut ACQUISITION_STACK,
-                &mut ACQUISITION_CONTROL,
+                b"state",
+                &mut STATE_STACK,
+                &mut STATE_CONTROL,
                 2,
-                acquire,
+                state_events,
             )
             .unwrap();
         }
@@ -325,10 +325,13 @@ mod tasks {
             }
         }
     }
-    extern "C" fn acquire(_: *mut c_void) {
+    extern "C" fn state_events(_: *mut c_void) {
         let context = unsafe { TaskContext::assume() };
         let native = unsafe { NATIVE.unwrap() };
-        super::super::acquisition::run(native, &context)
+        loop {
+            native.process_changes(&context);
+            native.wait_changes(&context);
+        }
     }
 }
 #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
