@@ -5,6 +5,7 @@ pub(crate) mod activation;
 mod evaluation;
 mod execution;
 mod image;
+mod settings;
 use image::Definition;
 pub(crate) mod runtime;
 mod validation;
@@ -26,7 +27,7 @@ const IMAGE_CAPACITY: usize = 8192;
 const FRAGMENT_CAPACITY: usize = 512;
 const _: () = assert!(IMAGE_CAPACITY < super::time::SOURCE as usize);
 const PREFIX: usize = 24;
-const MAGIC: [u8; 4] = *b"LPG\x04";
+const MAGIC: [u8; 4] = *b"LPG\x05";
 const CLOCK_BYTES: usize = PREFIX + lattice_peer_wire::clock::PROFILE_BYTES;
 
 struct InterruptMask(crate::types::UBaseType_t);
@@ -176,6 +177,7 @@ pub(crate) struct Configuration {
     temporal_dirty: bool,
     last_activity: u32,
     state: Status,
+    storage_ready: bool,
 }
 impl Configuration {
     fn clock(&self) -> Option<(u32, lattice_peer_wire::clock::Profile)> {
@@ -310,6 +312,7 @@ impl Configuration {
             temporal_dirty: false,
             last_activity: 0,
             state: Status::Unsupported,
+            storage_ready: false,
         }
     }
     pub(crate) fn restore<F: NorFlash>(
@@ -324,6 +327,7 @@ impl Configuration {
         self.initial_pending = false;
         self.clock_offset = NONE;
         self.state = Status::Storage;
+        self.storage_ready = false;
         let store = Snapshot::open(flash).map_err(|_| Status::Storage)?;
         let used = store.current().map_or(4, |i| i.length() as usize);
         if !(4..=IMAGE_CAPACITY).contains(&used) {
@@ -341,7 +345,8 @@ impl Configuration {
         let legacy = self.bytes[..4] == *b"LPG\x01";
         let older = legacy || self.bytes[..4] == *b"LPG\x02";
         let version3 = self.bytes[..4] == *b"LPG\x03";
-        if self.bytes[..4] != MAGIC && !older && !version3 {
+        let version4 = self.bytes[..4] == *b"LPG\x04";
+        if self.bytes[..4] != MAGIC && !older && !version3 && !version4 {
             self.state = Status::Invalid;
             return Err(self.state);
         }
@@ -354,6 +359,7 @@ impl Configuration {
                     return Err(Status::Invalid);
                 }
             }
+            self.restore_settings(native)?;
             let clock = context_record(&self.bytes[..used])?;
             if older && clock.is_some() {
                 return Err(Status::Invalid);
@@ -374,7 +380,13 @@ impl Configuration {
                 {
                     return Err(Status::Invalid);
                 }
-                validation::validate_definition(part.definition, native, surface)
+            }
+            // Storage/settings integrity is independent of whether the saved
+            // programs bind to this firmware's native catalog.
+            self.storage_ready = true;
+            self.bytes[..4].copy_from_slice(&MAGIC);
+            for part in parts(&self.bytes[..used]) {
+                validation::validate_definition(part?.definition, native, surface)
                     .map_err(status)?;
             }
             Ok(())
@@ -745,10 +757,17 @@ impl Configuration {
         };
         self.progress(result)
     }
+    pub(crate) fn configuration_ready(&self) -> bool {
+        self.storage_ready
+            && matches!(
+                self.state,
+                Status::Ok | Status::Compatibility | Status::Binding
+            )
+    }
     pub(crate) fn pending_write(&self) -> bool {
         (self.checkpoint_pending.is_some()
             || self.pending.is_some_and(|p| p.phase != Phase::Receiving))
-            && self.state == Status::Ok
+            && self.configuration_ready()
     }
     fn wait_ms(&self, now: u32, writable: bool) -> Option<u32> {
         if self.pending_write() {
@@ -850,7 +869,7 @@ impl Configuration {
         if self.checkpoint_pending.is_some() || self.pending.is_some() {
             return Err(Status::Busy);
         }
-        if self.state != Status::Ok {
+        if !self.configuration_ready() {
             return Err(self.state);
         }
         self.store
@@ -1101,6 +1120,9 @@ impl Configuration {
         entry
     }
     fn recovery(&self, after: u16) -> Option<(u16, lattice_peer_wire::program::execution::Entry)> {
+        if self.state != Status::Ok {
+            return None;
+        }
         use lattice_peer_wire::program::execution::Entry;
         parts(&self.bytes[..self.used as usize])
             .filter_map(Result::ok)

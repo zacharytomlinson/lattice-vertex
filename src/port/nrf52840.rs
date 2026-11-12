@@ -16,7 +16,10 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use cortex_m::peripheral::SYST;
 
+mod input;
 mod radio;
+pub use input::on_edge;
+pub(crate) use input::start as start_inputs;
 #[cfg(feature = "nrf52840-update")]
 pub mod update;
 #[cfg(feature = "nrf52840-update")]
@@ -28,6 +31,31 @@ pub type RadioPeripheral = hal::Peri<'static, hal::peripherals::RADIO>;
 
 pub use super::cortex_m4f::*;
 pub use embassy_nrf as hal;
+
+/// Consume a GPIO pin as authoritative Boolean output state. True is electrical
+/// HIGH. Configuration happens once; subsequent access uses the output latch and
+/// its SET/CLR aliases. The pin remains owned by the kernel until reset.
+pub fn output(
+    pin: hal::Peri<'static, impl hal::gpio::Pin>,
+    initial: bool,
+) -> crate::kernel::State<bool> {
+    use hal::gpio::{Output, OutputDrive, Port};
+    let mask = 1u32 << pin.pin();
+    let registers = match pin.port() {
+        Port::Port0 => hal::pac::P0,
+        Port::Port1 => hal::pac::P1,
+    };
+    core::mem::forget(Output::new(pin, initial.into(), OutputDrive::Standard));
+    // The consumed HAL token established configuration and exclusive pin ownership.
+    crate::kernel::State::mapped(unsafe {
+        crate::kernel::RegisterField::set_clear(
+            registers.out().as_ptr().cast(),
+            registers.outset().as_ptr().cast(),
+            registers.outclr().as_ptr().cast(),
+            mask,
+        )
+    })
+}
 
 use crate::{kernel::tasks, types::BaseType_t};
 

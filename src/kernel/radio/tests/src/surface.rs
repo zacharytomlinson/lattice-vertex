@@ -119,8 +119,7 @@ impl StateTransformer for SetPower {
     type Error = ();
 
     fn invoke(
-        _: &lattice_vertex::sync::TaskContext,
-        a: &Controls,
+        a: &'static Controls,
         (power,): (bool,),
     ) -> Result<(), ()> {
         a.power.set(power).map_err(|_| ())?;
@@ -149,8 +148,7 @@ impl StateTransformer for SetLevel {
     type Error = ();
 
     fn invoke(
-        _: &lattice_vertex::sync::TaskContext,
-        a: &Controls,
+        a: &'static Controls,
         (level,): (u8,),
     ) -> Result<(), ()> {
         if level > 200 {

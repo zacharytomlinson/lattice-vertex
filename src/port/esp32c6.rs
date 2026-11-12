@@ -24,7 +24,10 @@
 
 use core::{arch::asm, ffi::c_void};
 
+mod input;
 mod radio;
+pub use input::on_edge;
+pub(crate) use input::start as start_inputs;
 #[cfg(feature = "esp32c6-update")]
 pub mod update;
 #[cfg(feature = "esp32c6-update")]
@@ -32,6 +35,27 @@ pub(crate) mod watchdog;
 pub(crate) use radio::Radio;
 /// Transfer this peripheral to [`crate::kernel::start`].
 pub type RadioPeripheral = esp_hal::peripherals::IEEE802154<'static>;
+
+/// Consume a GPIO pin as authoritative Boolean output state. True is electrical
+/// HIGH. The pin remains owned until reset; no software output mirror is retained.
+pub fn output(
+    pin: impl esp_hal::gpio::OutputPin + 'static,
+    initial: bool,
+) -> crate::kernel::State<bool> {
+    use esp_hal::gpio::{Output, OutputConfig};
+    let mask = 1u32 << pin.number();
+    core::mem::forget(Output::new(pin, initial.into(), OutputConfig::default()));
+    let registers = esp_hal::peripherals::GPIO::regs();
+    // The consumed HAL token established configuration and exclusive pin ownership.
+    crate::kernel::State::mapped(unsafe {
+        crate::kernel::RegisterField::set_clear(
+            registers.out().as_ptr(),
+            registers.out_w1ts().as_ptr(),
+            registers.out_w1tc().as_ptr(),
+            mask,
+        )
+    })
+}
 
 use esp_hal::{
     interrupt::{

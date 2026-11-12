@@ -63,13 +63,10 @@ pub(crate) fn start(
 // never exits, and no deletion handle escapes startup. Wakeups signal hardware
 // availability, not distinct graph deltas; packet bytes remain in driver buffers.
 unsafe fn wake(data: *const ()) {
-    let task = data as TaskHandle_t;
-    if port::xPortIsInsideInterrupt() != pdFALSE {
-        #[cfg(feature = "test-support")]
-        super::testing::event(super::testing::Event::InterruptWake);
+    crate::kernel::state::atomic(|| {
         let mut woken = pdFALSE;
         tasks::xTaskGenericNotifyFromISR(
-            task,
+            data as TaskHandle_t,
             0,
             1,
             tasks::eNotifyAction::eSetBits as i32,
@@ -77,15 +74,7 @@ unsafe fn wake(data: *const ()) {
             &mut woken,
         );
         port::portYIELD_FROM_ISR(woken);
-    } else {
-        tasks::xTaskGenericNotify(
-            task,
-            0,
-            1,
-            tasks::eNotifyAction::eSetBits as i32,
-            ptr::null_mut(),
-        );
-    }
+    });
 }
 unsafe fn clone_waker(data: *const ()) -> RawWaker {
     RawWaker::new(data, &WAKER_VTABLE)
@@ -108,9 +97,9 @@ fn local_pending() -> bool {
     if crate::kernel::peer::host::pending() {
         return true;
     }
-    WORK_READY.load(Ordering::Acquire)
+    crate::kernel::peer::command_pending()
+        || WORK_READY.load(Ordering::Acquire)
         || crate::kernel::change::pending()
-        || crate::kernel::appliance::execution::completion_pending()
 }
 
 #[derive(Clone, Copy)]
@@ -215,7 +204,10 @@ pub(crate) fn watchdog_progress(radio_completed: bool) {
 
 impl Transport {
     pub(crate) fn pending_receive(&self) -> bool {
-        self.received.pending() || port::Radio::receiving_frame()
+        self.received.pending()
+            || port::Radio::queued_receive()
+            || port::Radio::receiving_frame()
+            || crate::kernel::peer::command_pending()
     }
     /// Formation uses its own receive windows. Resident traffic also gives
     /// neighbors a receive turn between transmissions and accepts local work.
@@ -260,13 +252,16 @@ impl Transport {
         let start = tasks::xTaskGetTickCount();
         loop {
             let result = if let Some(length) = self.received.pop(frame) {
-                Some(Ok(length))
+                Some(Ok(super::Reception::Frame(length)))
             } else {
                 let remaining =
                     timeout.saturating_sub(tasks::xTaskGetTickCount().wrapping_sub(start));
                 if remaining == 0 {
                     return None;
                 }
+                let _order = crate::kernel::state::atomic(|| {
+                    super::ReceiveOrder::enter(!port::Radio::queued_receive())
+                });
                 wait(
                     self.radio.receive(frame),
                     &self.waker,
@@ -279,8 +274,14 @@ impl Transport {
                 )
             };
             match result {
-                Some(Ok(length)) if !self.accept_received(&frame[..length]) => continue,
-                _ => return result,
+                Some(Ok(super::Reception::Handled)) => return None,
+                Some(Ok(super::Reception::Frame(length))) => {
+                    if self.accept_received(&frame[..length]) {
+                        return Some(Ok(length));
+                    }
+                }
+                Some(Err(error)) => return Some(Err(error)),
+                None => return None,
             }
         }
     }
@@ -398,13 +399,18 @@ impl Transport {
             // Pending local changes must not cancel this receive opportunity.
             // Retain frames for ordinary dispatch; receive turns end at the first,
             // while retry backoff listens through the entire chosen interval.
+            let _order = crate::kernel::state::atomic(|| {
+                super::ReceiveOrder::enter(
+                    !self.received.pending() && !port::Radio::queued_receive(),
+                )
+            });
             match wait(
                 self.radio.receive(&mut frame),
                 &self.waker,
                 remaining,
                 WaitMode::Receive { local_work: false },
             ) {
-                Some(Ok(length)) => {
+                Some(Ok(super::Reception::Frame(length))) => {
                     if mac::is_ack(&frame[..length]) {
                         continue;
                     }
@@ -414,6 +420,11 @@ impl Transport {
                         super::testing::event(super::testing::Event::ReceiveEvicted);
                     }
                     let _ = dropped;
+                    if first_only {
+                        return;
+                    }
+                }
+                Some(Ok(super::Reception::Handled)) => {
                     if first_only {
                         return;
                     }
@@ -432,6 +443,8 @@ extern "C" fn run(_: *mut c_void) {
     WAKE_TARGET.store(tasks::xTaskGetCurrentTaskHandle(), Ordering::Release);
     // Restore on the resident task's stack, before PHY startup/formation and
     // before a trial can be confirmed. This requires no peer or physical sample.
+    crate::kernel::program::runtime::restore();
+    crate::port::start_inputs();
     crate::kernel::program::runtime::poll();
     let peripheral = unsafe { PERIPHERAL.take().unwrap() };
     let radio = port::Radio::new(peripheral);

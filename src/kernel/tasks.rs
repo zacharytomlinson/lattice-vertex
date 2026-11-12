@@ -2883,6 +2883,8 @@ pub unsafe fn xTaskNotifyWaitIndexed(
 ///
 /// The handle must identify a live task and the ISR must be permitted to call
 /// kernel APIs. A non-null wake pointer must be uniquely writable.
+/// Kernel code may also use a masked task atomic region with scheduling stopped
+/// or suspended and defer any requested switch until that region ends.
 pub unsafe fn xTaskNotifyFromISR(
     xTaskToNotify: TaskHandle_t,
     ulValue: u32,
@@ -3165,6 +3167,8 @@ pub unsafe fn xTaskGenericNotifyWait(
 ///
 /// The target/index/action must be valid and the ISR must be permitted to call
 /// kernel APIs. Non-null output pointers must be uniquely writable.
+/// Kernel code may also use a masked task atomic region with scheduling stopped
+/// or suspended and defer any requested switch until that region ends.
 pub unsafe fn xTaskGenericNotifyFromISR(
     xTaskToNotify: TaskHandle_t,
     uxIndexToNotify: UBaseType_t,

@@ -120,3 +120,33 @@ pub use device::PlatformStorage;
 pub(crate) use device::{enable_updates, is_trial, receiver};
 #[cfg(any(feature = "nrf52840-update", feature = "esp32c6-update"))]
 pub(crate) use device::{initialize, startup_progress, with_storage};
+
+// A settings snapshot captures the latest values, not a transition ledger.
+// Swapping this flag under the state boundary cannot erase a later mutation.
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+static SETTINGS_DIRTY: AtomicBool = AtomicBool::new(false);
+static SETTINGS_CHANGED: AtomicU32 = AtomicU32::new(0);
+pub(crate) fn settings_changed() {
+    crate::kernel::state::atomic(|| {
+        let now = ((crate::kernel::tasks::xTaskGetTickCountFromISR() as u64 * 1000)
+            / crate::configTICK_RATE_HZ as u64) as u32;
+        SETTINGS_CHANGED.store(now, Ordering::Relaxed);
+        SETTINGS_DIRTY.store(true, Ordering::Release);
+    });
+    #[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
+    crate::kernel::radio::task::notify_work();
+}
+pub(crate) fn settings_pending() -> bool {
+    SETTINGS_DIRTY.load(Ordering::Acquire)
+}
+pub(crate) fn take_settings() -> bool {
+    SETTINGS_DIRTY.swap(false, Ordering::AcqRel)
+}
+
+pub(crate) fn settings_wait_ms(now: u32) -> Option<u32> {
+    settings_pending()
+        .then(|| 1000u32.saturating_sub(now.wrapping_sub(SETTINGS_CHANGED.load(Ordering::Acquire))))
+}
+pub(crate) fn take_quiet_settings(now: u32) -> bool {
+    crate::kernel::state::atomic(|| settings_wait_ms(now) == Some(0) && take_settings())
+}

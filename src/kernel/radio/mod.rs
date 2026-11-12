@@ -16,20 +16,8 @@ pub(crate) use task::start;
 #[doc(hidden)]
 pub mod testing;
 
-#[cfg(any(
-    test,
-    feature = "firmware-update",
-    feature = "port-nrf52840",
-    feature = "port-esp32c6"
-))]
 pub(crate) mod receive;
 
-#[cfg(any(
-    test,
-    feature = "firmware-update",
-    feature = "port-nrf52840",
-    feature = "port-esp32c6"
-))]
 pub(crate) mod mac;
 
 /// Maximum MAC frame size, excluding the hardware checksum.
@@ -50,3 +38,39 @@ pub enum Error {
 pub mod cost;
 
 pub(crate) mod channel;
+
+/// A consumed command retains its reply in the peer owner, not the raw RX queue.
+#[derive(Clone, Copy)]
+pub(crate) enum Reception {
+    Frame(usize),
+    Handled,
+}
+static IMMEDIATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub(crate) struct ReceiveOrder;
+impl ReceiveOrder {
+    pub(crate) fn enter(empty: bool) -> Self {
+        IMMEDIATE.store(empty, core::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+impl Drop for ReceiveOrder {
+    fn drop(&mut self) {
+        IMMEDIATE.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+pub(crate) fn receive_immediate(frame: &[u8]) -> bool {
+    if !IMMEDIATE.load(core::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    if mac::is_ack(frame) {
+        return false;
+    }
+    #[cfg(feature = "use-mutexes")]
+    let handled = crate::kernel::peer::interrupt::receive(frame);
+    #[cfg(not(feature = "use-mutexes"))]
+    let handled = false;
+    if !handled {
+        IMMEDIATE.store(false, core::sync::atomic::Ordering::Release);
+    }
+    handled
+}

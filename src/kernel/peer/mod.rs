@@ -12,6 +12,8 @@ pub(crate) mod frame;
 #[cfg(feature = "host-link")]
 pub mod host;
 #[cfg(feature = "use-mutexes")]
+pub(crate) mod interrupt;
+#[cfg(feature = "use-mutexes")]
 mod invocation;
 mod links;
 
@@ -103,9 +105,8 @@ fn update_control_complete(
 
 #[cfg(feature = "use-mutexes")]
 fn receive_request(
-    control: &mut control::Control,
     native: &'static dyn crate::kernel::appliance::Native,
-    context: &crate::sync::TaskContext,
+    _context: &crate::sync::TaskContext,
     caller: u64,
     request: lattice_peer_wire::program::transfer::Request<'_>,
     now: u32,
@@ -123,17 +124,18 @@ fn receive_request(
             .encode(output);
         }
         let mut bytes = [0; lattice_peer_wire::program::transfer::DATA_BYTES];
-        control
-            .receive(
-                caller,
-                request,
-                crate::kernel::program::runtime::epoch(),
-                native,
-                context,
-                now,
-                &mut bytes,
-            )
-            .encode(output)
+        control::access(|control| {
+            control
+                .receive(
+                    caller,
+                    request,
+                    crate::kernel::program::runtime::epoch(),
+                    native,
+                    now,
+                    &mut bytes,
+                )
+                .encode(output)
+        })
     } else {
         crate::kernel::program::runtime::receive(caller, request, output)
     }
@@ -208,11 +210,10 @@ fn participate(
     let mut outgoing_buffer = [0; MAX_FRAME_SIZE];
     let mut piece = [0; frame::SURFACE_BYTES];
     let mut forwarder = forwarding::Forwarder::new(local, network);
-    let mut invocations = invocation::Invocations::new();
-    let mut control = control::take();
     #[cfg(feature = "host-link")]
     let mut host = host::Host::new();
     let context = unsafe { crate::sync::TaskContext::assume() };
+    interrupt::start(native, network, local);
     radio.enable_peer_runtime();
     let started = tasks::xTaskGetTickCount();
     let milliseconds = ((started as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
@@ -233,14 +234,18 @@ fn participate(
         if !radio.pending_receive() {
             crate::kernel::program::runtime::poll();
         }
+        interrupt::set_epoch(crate::kernel::program::runtime::epoch());
         let now = tasks::xTaskGetTickCount();
         let milliseconds = ((now as u64 * 1000) / crate::configTICK_RATE_HZ as u64) as u32;
+        while let Some((stream, previous, at)) = control::access(|c| c.take_acquired()) {
+            forwarder.stream_acquired(stream, previous, at);
+        }
         forwarder.expire(milliseconds);
         #[cfg(feature = "host-link")]
         while let Some(target) = host::take_target() {
-            control.offer(target, milliseconds);
+            control::access(|control| control.offer(target, milliseconds));
         }
-        control.poll(native, &context, milliseconds);
+        control::access(|control| control.poll(native, milliseconds));
         crate::kernel::program::runtime::poll_work(local, &context, milliseconds);
         if let Some((index, request, owner, sent)) = crate::kernel::program::runtime::awaiting() {
             if milliseconds.wrapping_sub(sent) >= 2_000 {
@@ -252,39 +257,45 @@ fn participate(
                 crate::kernel::program::runtime::retry(index, milliseconds);
             }
         }
-        if let Some((index, sent)) = control.awaiting(milliseconds) {
+        if let Some((index, sent)) = control::access(|control| control.awaiting(milliseconds)) {
             if milliseconds.wrapping_sub(sent) >= 200 {
-                control.retry(index, milliseconds);
+                control::access(|control| control.retry(index, milliseconds));
             }
         }
-        if let Some((index, remote, packet)) = control.outgoing(milliseconds) {
-            control.sent(index, milliseconds);
+        if let Some((index, remote, packet)) =
+            control::access(|control| control.outgoing(milliseconds))
+        {
+            control::access(|control| control.sent(index, milliseconds));
             if remote == local {
-                if let Some(reply) = control.receive_stream(
-                    local,
-                    packet,
-                    crate::kernel::program::runtime::epoch(),
-                    native,
-                    &context,
-                    milliseconds,
-                ) {
+                if let Some(reply) = control::access(|control| {
                     control.receive_stream(
                         local,
-                        reply,
+                        packet,
                         crate::kernel::program::runtime::epoch(),
                         native,
-                        &context,
                         milliseconds,
-                    );
+                    )
+                }) {
+                    control::access(|control| {
+                        control.receive_stream(
+                            local,
+                            reply,
+                            crate::kernel::program::runtime::epoch(),
+                            native,
+                            milliseconds,
+                        )
+                    });
                 }
             } else if let Some(message) = forwarder.originate_stream(remote, packet, milliseconds) {
                 send(radio, message, &mut sequence, &mut outgoing_buffer);
             } else {
-                control.interrupt(
-                    remote,
-                    packet.id(),
-                    lattice_peer_wire::program::transfer::Status::Stale,
-                );
+                control::access(|control| {
+                    control.interrupt(
+                        remote,
+                        packet.id(),
+                        lattice_peer_wire::program::transfer::Status::Stale,
+                    )
+                });
             }
         }
         let mut program_bytes = [0; lattice_peer_wire::program::transfer::REQUEST_BYTES];
@@ -309,7 +320,7 @@ fn participate(
                 crate::kernel::program::runtime::retry(index, milliseconds);
             }
         }
-        if let Some(done) = invocations.take_completion() {
+        if let Some(done) = invocation::access(|invocations| invocations.take_completion()) {
             for previous in done.previous.into_iter().filter(|p| *p != 0) {
                 let reply = Message {
                     source: local,
@@ -338,15 +349,7 @@ fn participate(
         if let Some(outgoing) = if radio.pending_receive() && host::staging_pending() {
             None
         } else {
-            host.poll(
-                &mut forwarder,
-                &description,
-                native,
-                &mut invocations,
-                &mut control,
-                &context,
-                milliseconds,
-            )
+            host.poll(&mut forwarder, &description, native, &context, milliseconds)
         } {
             if !send(radio, outgoing, &mut sequence, &mut outgoing_buffer) {
                 forwarder.transmit_failed(&outgoing);
@@ -386,9 +389,10 @@ fn participate(
         let timeout =
             period.saturating_sub(tasks::xTaskGetTickCount().wrapping_sub(last_discovery));
 
-        let timeout = control.wait_ms(measured_at).map_or(timeout, |ms| {
-            timeout.min(crate::milliseconds_to_ticks_checked(ms as u64).unwrap())
-        });
+        let timeout = control::access(|control| control.wait_ms(measured_at))
+            .map_or(timeout, |ms| {
+                timeout.min(crate::milliseconds_to_ticks_checked(ms as u64).unwrap())
+            });
         let timeout = crate::kernel::program::runtime::wait_ms(measured_at).map_or(timeout, |ms| {
             timeout.min(
                 crate::milliseconds_to_ticks_checked(ms).unwrap_or(crate::types::portMAX_DELAY),
@@ -397,6 +401,9 @@ fn participate(
         #[cfg(feature = "host-link")]
         let timeout = host.wait_ms(measured_at).map_or(timeout, |ms| {
             timeout.min(crate::milliseconds_to_ticks_checked(ms as u64).unwrap())
+        });
+        forwarder.bind_local_streams(|caller, nonce, previous| {
+            control::access(|c| c.bind_hop(caller, nonce, previous))
         });
         #[cfg(all(
             feature = "firmware-update",
@@ -464,7 +471,7 @@ fn participate(
                         if let Some(nonce) =
                             forwarder.stream_binding(local, read.owner, state.ticket)
                         {
-                            control.opened(read.owner, nonce, state);
+                            control::access(|control| control.opened(read.owner, nonce, state));
                         }
                     }
                 }
@@ -473,14 +480,15 @@ fn participate(
             if matches!(message.content, Content::Stream(_)) {
                 if let Some(reply) =
                     forwarder.receive_stream(message, measured_at, |remote, packet| {
-                        control.receive_stream(
-                            remote,
-                            packet,
-                            crate::kernel::program::runtime::epoch(),
-                            native,
-                            &context,
-                            measured_at,
-                        )
+                        control::access(|control| {
+                            control.receive_stream(
+                                remote,
+                                packet,
+                                crate::kernel::program::runtime::epoch(),
+                                native,
+                                measured_at,
+                            )
+                        })
                     })
                 {
                     send(radio, reply, &mut sequence, &mut outgoing_buffer);
@@ -493,15 +501,7 @@ fn participate(
                     milliseconds,
                     &mut reply_bytes,
                     |caller, request, output| {
-                        receive_request(
-                            &mut control,
-                            native,
-                            &context,
-                            caller,
-                            request,
-                            milliseconds,
-                            output,
-                        )
+                        receive_request(native, &context, caller, request, milliseconds, output)
                     },
                 ) {
                     if !send(radio, reply, &mut sequence, &mut outgoing_buffer) {
@@ -514,7 +514,8 @@ fn participate(
                 }
             } else if matches!(message.content,Content::Update{network:n,..}|Content::Updated{network:n,..} if n==network)
             {
-                let busy = forwarder.ordinary_work_pending() || radio.pending_receive();
+                let busy =
+                    forwarder.ordinary_work_pending() || radio.pending_receive() || interactive();
                 if let Some(reply) = forwarder.receive_update(message, milliseconds, |request| {
                     handle_update(request, busy)
                 }) {
@@ -550,9 +551,13 @@ fn participate(
                 }
                 for reply in forwarder
                     .receive_control(message, now, |call, arguments| {
-                        let status = invocations.submit(native, &context, call, arguments);
+                        let status = invocation::access(|invocations| {
+                            invocations.submit(native, call, arguments)
+                        });
                         if status.is_none() {
-                            invocations.return_via(call, message.source);
+                            invocation::access(|invocations| {
+                                invocations.return_via(call, message.source)
+                            });
                         }
                         status
                     })
@@ -568,8 +573,8 @@ fn participate(
             {
                 let now = ((tasks::xTaskGetTickCount() as u64 * 1000)
                     / crate::configTICK_RATE_HZ as u64) as u32;
-                if let Some(reply) = forwarder
-                    .receive_state(message, now, |attribute| native.read(&context, attribute))
+                if let Some(reply) =
+                    forwarder.receive_state(message, now, |attribute| native.read(attribute))
                 {
                     if !send(radio, reply, &mut sequence, &mut outgoing_buffer) {
                         forwarder.transmit_failed(&reply);
@@ -687,6 +692,9 @@ fn participate(
                 );
             }
         }
+        forwarder.bind_local_streams(|caller, nonce, previous| {
+            control::access(|c| c.bind_hop(caller, nonce, previous))
+        });
         #[cfg(all(
             feature = "firmware-update",
             any(feature = "nrf52840-update", feature = "esp32c6-update")
@@ -702,7 +710,7 @@ fn participate(
                 conflict,
                 forwarder.work_pending()
                     || crate::kernel::program::runtime::pending()
-                    || control.pending(),
+                    || control::access(|control| control.pending()),
                 |notice| {
                     let sent = send(
                         radio,
@@ -943,4 +951,14 @@ mod tests {
             );
         }
     }
+}
+
+#[cfg(feature = "use-mutexes")]
+pub(crate) fn command_pending() -> bool {
+    invocation::access(|calls| calls.pending()) || control::access(|c| c.acquired())
+}
+
+#[cfg(feature = "use-mutexes")]
+pub(crate) fn interactive() -> bool {
+    control::access(|c| c.active())
 }

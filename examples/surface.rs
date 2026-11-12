@@ -21,7 +21,7 @@ impl From<StateChangeError> for Error {
     }
 }
 impl Lamp {
-    fn set_brightness(&self, _context: &TaskContext, brightness: u8) -> Result<(), Error> {
+    fn set_brightness(&self, brightness: u8) -> Result<(), Error> {
         if brightness > 200 {
             return Err(Error::Brightness);
         }
@@ -50,8 +50,7 @@ fn main() {
             brightness: State::new(0),
         },
     );
-    LAMP.call(&context, |lamp| lamp.set_brightness(&context, 128))
-        .unwrap();
+    LAMP.call(|lamp| lamp.set_brightness(128)).unwrap();
     println!(
         "Power: {:?}; brightness: {:?}; IR: {:?}",
         LAMP.device().power.get(),

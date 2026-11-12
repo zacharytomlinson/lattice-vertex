@@ -29,10 +29,10 @@ impl Native for Device {
     fn owns(&self, _: *const (), _: u64) -> bool {
         false
     }
-    fn read(&self, _: &TaskContext, _: u64) -> StateReadResult {
+    fn read(&self, _: u64) -> StateReadResult {
         panic!("loading must not sample hardware")
     }
-    fn invoke(&self, _: &TaskContext, _: u64, _: &[crate::ir::Value]) -> InvokeStatus {
+    fn invoke(&self, _: u64, _: &[crate::ir::Value]) -> InvokeStatus {
         panic!("loading must not mutate hardware")
     }
     fn state_binding(&self, r: u64) -> Option<(Type, &AtomicU16)> {
@@ -306,6 +306,15 @@ fn installation_publication() {
     );
     assert_eq!(restarted.head.load(Ordering::Acquire), NONE);
     assert_eq!(flash.0, old);
+    assert!(restored.configuration_ready());
+    assert!(restored.recovery(0).is_none());
+    restored.checkpoint_settings(&restarted).unwrap();
+    persist(&mut restored, &mut flash, &restarted);
+    assert_eq!(restored.state, Status::Compatibility);
+    assert_eq!(restarted.head.load(Ordering::Acquire), NONE);
+    // A compatible image can recover the retained definitions after a settings commit.
+    restored.restore(&mut flash, &restarted, &SURFACE).unwrap();
+    assert_ne!(restarted.head.load(Ordering::Acquire), NONE);
 }
 
 #[test]
@@ -600,7 +609,7 @@ fn admission_commit() {
 
 #[test]
 fn configuration_versions() {
-    for version in [1, 2, 3, 4, 5] {
+    for version in [1, 2, 3, 4, 5, 6] {
         let native = Device::new();
         let mut flash = Flash::new();
         let mut p = install(&definition(true), &native, &mut flash);
@@ -611,8 +620,8 @@ fn configuration_versions() {
         }
         let mut restored = Configuration::new();
         let result = restored.restore(&mut flash, &native, &SURFACE);
-        assert_eq!(result.is_ok(), version <= 4);
-        if version <= 4 {
+        assert_eq!(result.is_ok(), version <= 5);
+        if version <= 5 {
             assert_eq!(&restored.bytes[..4], &MAGIC);
             assert_eq!(restored.part(4, 1).unwrap().definition.head(), Some(60));
             let before = restored.epoch();
@@ -733,7 +742,7 @@ impl Native for Running {
     fn owns(&self, instance: *const (), attribute: u64) -> bool {
         instance == core::ptr::from_ref(self).cast() && attribute == STATE
     }
-    fn read(&self, _: &TaskContext, reference: u64) -> StateReadResult {
+    fn read(&self, reference: u64) -> StateReadResult {
         assert_eq!(reference, STATE);
         StateReadResult::Value {
             sequence: 0,
@@ -742,7 +751,7 @@ impl Native for Running {
             )),
         }
     }
-    fn invoke(&self, _: &TaskContext, reference: u64, args: &[crate::ir::Value]) -> InvokeStatus {
+    fn invoke(&self, reference: u64, args: &[crate::ir::Value]) -> InvokeStatus {
         assert_eq!(reference, CALL);
         assert_eq!(args.len(), 1);
         self.last
@@ -912,7 +921,6 @@ fn settle(
     context: &TaskContext,
     loss: &mut Option<bool>,
 ) -> (u32, u32) {
-    use crate::kernel::appliance::execution as calls;
     use lattice_peer_wire::program::execution::Request as E;
     let mut counts = (0, 0);
     let mut wire = [0; lattice_peer_wire::program::transfer::REQUEST_BYTES];
@@ -948,7 +956,7 @@ fn settle(
                 }
             }
         }
-        calls::run_ready(context);
+
         if !ea.pending() && !eb.pending() {
             return counts;
         }
@@ -985,11 +993,10 @@ fn conditional_pair() -> (Vec<u8>, Vec<u8>) {
 #[test]
 fn retained_activation() {
     use super::execution::Execution;
-    use crate::kernel::appliance::execution as calls;
     use lattice_peer_wire::program::execution::{Entry, Request as E};
     for initial_loss in [None, Some(false), Some(true)] {
         crate::port::test_port_reset();
-        calls::reset();
+
         crate::kernel::change::reset();
         let context = unsafe { TaskContext::assume() };
         let na = running(false);
@@ -1096,7 +1103,6 @@ fn retained_activation() {
         assert_eq!(nb.calls.load(Ordering::Relaxed), 3);
         assert_eq!((ea.statistics.faults, eb.statistics.faults), (0, 0));
         assert_eq!((ea.wait_ms(0, true), eb.wait_ms(0, true)), (None, None));
-        calls::reset();
     }
 }
 
@@ -1108,7 +1114,6 @@ fn settle_local(
 ) {
     for now in 0..16 {
         e.poll(p, native, context, now);
-        crate::kernel::appliance::execution::run_ready(context);
         if !e.pending() {
             return;
         }
@@ -1119,10 +1124,9 @@ fn settle_local(
 #[test]
 fn local_connection_removal() {
     use super::execution::Execution;
-    use crate::kernel::appliance::execution as calls;
     use lattice_peer_wire::program::execution::{Entry, Request as E};
     crate::port::test_port_reset();
-    calls::reset();
+
     crate::kernel::change::reset();
     let context = unsafe { TaskContext::assume() };
     let native = running(true);
@@ -1164,16 +1168,14 @@ fn local_connection_removal() {
     settle_local(&mut e, &mut p, native, &context);
     assert_eq!(native.calls.load(Ordering::Relaxed), 1);
     assert_eq!((e.statistics.faults, e.wait_ms(0, true)), (0, None));
-    calls::reset();
 }
 
 #[test]
 fn activation_and_arguments() {
     use super::execution::Execution;
-    use crate::kernel::appliance::execution as calls;
     use lattice_peer_wire::program::execution::{Entry, Request as E};
     crate::port::test_port_reset();
-    calls::reset();
+
     crate::kernel::change::reset();
     let context = unsafe { TaskContext::assume() };
     let native = running(true);
@@ -1240,16 +1242,14 @@ fn activation_and_arguments() {
         );
     }
     assert_eq!(e.statistics.faults, 0);
-    calls::reset();
 }
 
 #[test]
 fn connection_activation_isolation() {
     use super::execution::Execution;
-    use crate::kernel::appliance::execution as calls;
     use lattice_peer_wire::program::execution::{Entry, Request as E};
     crate::port::test_port_reset();
-    calls::reset();
+
     crate::kernel::change::reset();
     let context = unsafe { TaskContext::assume() };
     let native = running(true);
@@ -1308,16 +1308,14 @@ fn connection_activation_isolation() {
     }
     assert_eq!(native.calls.load(Ordering::Relaxed), 3);
     assert_eq!(e.statistics.faults, 0);
-    calls::reset();
 }
 
 #[test]
 fn branch_publications() {
     use super::execution::Execution;
-    use crate::kernel::appliance::execution as calls;
     use lattice_peer_wire::program::execution::{Entry, Request as E};
     crate::port::test_port_reset();
-    calls::reset();
+
     crate::kernel::change::reset();
     let context = unsafe { TaskContext::assume() };
     let native = running(false);
@@ -1384,10 +1382,9 @@ fn branch_publications() {
 #[test]
 fn incoming_edge_independence() {
     use super::execution::Execution;
-    use crate::kernel::appliance::execution as calls;
     use lattice_peer_wire::program::execution::{Entry, Request as E};
     crate::port::test_port_reset();
-    calls::reset();
+
     crate::kernel::change::reset();
     let context = unsafe { TaskContext::assume() };
     let native = running(true);
@@ -1454,16 +1451,14 @@ fn incoming_edge_independence() {
     e.activate(&p, target).unwrap();
     settle_local(&mut e, &mut p, native, &context);
     assert_eq!(native.calls.load(Ordering::Relaxed), 2);
-    calls::reset();
 }
 
 #[test]
-fn running_call_and_withdrawal() {
+fn completed_call_and_withdrawal() {
     use super::execution::Execution;
-    use crate::kernel::appliance::execution as calls;
     use lattice_peer_wire::program::execution::{Entry, Request as E};
     crate::port::test_port_reset();
-    calls::reset();
+
     crate::kernel::change::reset();
     let context = unsafe { TaskContext::assume() };
     let native = running(true);
@@ -1510,13 +1505,11 @@ fn running_call_and_withdrawal() {
         );
         e.poll(&mut p, native, &context, 0);
     }
-    assert_eq!(native.calls.load(Ordering::Relaxed), 0);
-    settle_local(&mut e, &mut p, native, &context);
+    assert_eq!(native.calls.load(Ordering::Relaxed), 1);
     assert_eq!(native.calls.load(Ordering::Relaxed), 1);
     let mut wire = [0; lattice_peer_wire::program::transfer::REQUEST_BYTES];
-    assert!(e.outgoing(0, &mut wire).is_none());
+    assert!(e.outgoing(0, &mut wire).is_some());
     assert_eq!(e.statistics.faults, 0);
-    calls::reset();
 }
 
 /// Different continuation widths change record offsets, but not computation.
@@ -1750,5 +1743,66 @@ fn reused_extent_publication() {
         restored.restore(&mut flash, &native, &SURFACE).unwrap();
         assert_eq!(restored.part(reference.0, reference.1).is_ok(), committed);
         assert_eq!(restored.clock(), Some((1, profile)));
+    }
+}
+
+#[test]
+fn settings_commit_boundary() {
+    use core::sync::atomic::AtomicU8;
+    struct Setting(AtomicU8);
+    impl Native for Setting {
+        fn ready(&self) -> bool {
+            true
+        }
+        fn owns(&self, _: *const (), _: u64) -> bool {
+            false
+        }
+        fn read(&self, _: u64) -> StateReadResult {
+            panic!("no public state")
+        }
+        fn invoke(&self, _: u64, _: &[crate::ir::Value]) -> InvokeStatus {
+            panic!("restoration is not invocation")
+        }
+        fn settings(&self, visit: &mut dyn FnMut(u64, Type, Option<crate::ir::Value>)) {
+            visit(
+                STATE,
+                Type::Bool,
+                Some(crate::ir::Value::boolean(
+                    self.0.load(Ordering::Relaxed) != 0,
+                )),
+            );
+        }
+        fn restore_setting(
+            &self,
+            key: u64,
+            ty: Type,
+            value: Option<crate::ir::Value>,
+        ) -> Result<(), crate::kernel::StateChangeError> {
+            assert_eq!((key, ty), (STATE, Type::Bool));
+            self.0.store(
+                u8::from(value.unwrap().as_bool().unwrap()),
+                Ordering::Relaxed,
+            );
+            Ok(())
+        }
+    }
+    let native = Setting(AtomicU8::new(0));
+    let mut flash = Flash::new();
+    let mut image = Configuration::new();
+    image.restore(&mut flash, &native, &SURFACE).unwrap();
+    image.checkpoint_settings(&native).unwrap();
+    persist(&mut image, &mut flash, &native);
+    native.0.store(1, Ordering::Relaxed);
+    image.checkpoint_settings(&native).unwrap();
+    loop {
+        let committed = !image.pending_write();
+        let mut reboot = Configuration::new();
+        let restored = Setting(AtomicU8::new(99));
+        reboot.restore(&mut flash, &restored, &SURFACE).unwrap();
+        assert_eq!(restored.0.load(Ordering::Relaxed), u8::from(committed));
+        if committed {
+            break;
+        }
+        image.poll(&mut flash, &native).unwrap();
     }
 }

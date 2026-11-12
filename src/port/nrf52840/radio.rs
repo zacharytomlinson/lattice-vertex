@@ -169,6 +169,9 @@ impl Radio {
         .await
     }
 
+    pub(crate) fn queued_receive() -> bool {
+        false
+    }
     pub(crate) fn receiving_frame() -> bool {
         receive::active_frame()
     }
@@ -176,7 +179,10 @@ impl Radio {
         ACK_WAIT.load(Ordering::Acquire)
     }
 
-    pub async fn receive(&mut self, out: &mut [u8; MAX_FRAME_SIZE]) -> Result<usize, Error> {
+    pub async fn receive(
+        &mut self,
+        out: &mut [u8; MAX_FRAME_SIZE],
+    ) -> Result<crate::kernel::radio::Reception, Error> {
         self.receive.receive(self.pan, self.address(), out).await
     }
 
@@ -212,7 +218,9 @@ impl Radio {
         loop {
             // The resident task bounds the ACK wait independently of frame TX.
             // Other frames received here still enter its ordinary receive ring.
-            if let Ok(length) = self.receive(&mut incoming).await {
+            if let Ok(crate::kernel::radio::Reception::Frame(length)) =
+                self.receive(&mut incoming).await
+            {
                 if mac::matches_ack(&incoming[..length], frame[2]) {
                     return Ok(());
                 }

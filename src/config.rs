@@ -513,8 +513,6 @@ pub const tskSTACK_FILL_BYTE: u8 = 0xA5;
 // Lattice resident execution storage. Values are kernel build policy, not
 // appliance networking settings. All stacks and control blocks remain static.
 pub const configLATTICE_NATIVE_STATES: usize = 32;
-pub const configLATTICE_NATIVE_TASKS: usize = 2;
-pub const configLATTICE_NATIVE_STACK_WORDS: usize = 1024;
 pub const configLATTICE_STATE_STACK_WORDS: usize = 1024;
 /// Captured source changes awaiting task-context delta/history processing.
 /// Shared by all states of one appliance; preserves values and FIFO order.

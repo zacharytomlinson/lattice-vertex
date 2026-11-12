@@ -1,15 +1,9 @@
 //! Captured state changes awaiting the existing state task.
 use super::super::state::StateChangeError;
-use crate::{
-    ir::Value,
-    kernel::{queue::StaticQueue_t, tasks},
-    port,
-    sync::{Queue, TaskContext},
-    types::*,
-};
+use crate::{ir::Value, kernel::tasks, sync::TaskContext};
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
 const CAPACITY: usize = crate::configLATTICE_STATE_CHANGES;
 const _: () = assert!(CAPACITY > 0 && crate::configLATTICE_NATIVE_STATES <= u16::MAX as usize);
@@ -43,74 +37,61 @@ impl Captured {
 }
 const _: () = assert!(core::mem::size_of::<Captured>() <= 12);
 pub(crate) struct Events {
-    queue: UnsafeCell<Option<Queue<Captured>>>,
-    control: UnsafeCell<StaticQueue_t>,
-    storage: UnsafeCell<[Captured; CAPACITY]>,
-    initialized: AtomicBool,
+    owner: UnsafeCell<Option<&'static dyn super::Native>>,
+    pending: AtomicU32,
     overflow: AtomicU32,
 }
 unsafe impl Sync for Events {}
 impl Events {
     pub const fn new() -> Self {
         Self {
-            queue: UnsafeCell::new(None),
-            control: UnsafeCell::new(StaticQueue_t::new()),
-            storage: UnsafeCell::new([Captured::EMPTY; CAPACITY]),
-            initialized: AtomicBool::new(false),
+            owner: UnsafeCell::new(None),
+            pending: AtomicU32::new(0),
             overflow: AtomicU32::new(0),
         }
     }
-    pub fn initialize(&'static self, context: &TaskContext) {
+    pub fn initialize(&'static self, _context: &TaskContext, owner: &'static dyn super::Native) {
         assert_eq!(
             tasks::xTaskGetSchedulerState(),
             tasks::taskSCHEDULER_NOT_STARTED
         );
-        assert!(
-            !self.initialized.load(Ordering::Acquire),
-            "state events already initialized"
-        );
         unsafe {
-            *self.queue.get() = Some(
-                Queue::new_static(context, &mut *self.storage.get(), &mut *self.control.get())
-                    .expect("state event queue"),
+            assert!(
+                (*self.owner.get()).is_none(),
+                "state events already initialized"
             );
+            *self.owner.get() = Some(owner);
         }
-        self.initialized.store(true, Ordering::Release);
-    }
-    fn queue(&self) -> &Queue<Captured> {
-        assert!(
-            self.initialized.load(Ordering::Acquire),
-            "state events not initialized"
-        );
-        unsafe { (*self.queue.get()).as_ref().unwrap() }
     }
     pub(crate) fn send(&self, event: Captured) -> Result<(), StateChangeError> {
-        let sent = if port::xPortIsInsideInterrupt() != pdFALSE {
-            let mut woken = pdFALSE;
-            let sent = unsafe { self.queue().send_from_isr(&event, &mut woken) };
-            port::portYIELD_FROM_ISR(woken);
-            sent
-        } else {
-            self.queue()
-                .try_send(&unsafe { TaskContext::assume() }, &event)
-        };
-        if sent {
-            #[cfg(feature = "firmware-update")]
-            crate::kernel::update::activation::activity();
-            Ok(())
-        } else {
-            self.overflow.fetch_add(1, Ordering::Relaxed);
-            Err(StateChangeError::Capacity)
-        }
+        super::super::state::atomic(|| {
+            let owner = unsafe { (*self.owner.get()).expect("state events not initialized") };
+            if super::super::work::capture(owner, event) {
+                self.pending.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "firmware-update")]
+                super::super::update::activation::activity();
+                Ok(())
+            } else {
+                self.overflow.fetch_add(1, Ordering::Relaxed);
+                Err(StateChangeError::Capacity)
+            }
+        })
     }
-    pub fn take(&self, context: &TaskContext) -> Option<Captured> {
-        self.queue().try_receive(context)
+    pub(crate) fn completed(&self) {
+        assert!(
+            self.pending.fetch_sub(1, Ordering::Relaxed) != 0,
+            "uncaptured state completion"
+        );
     }
-    pub fn pending(&self, context: &TaskContext) -> bool {
-        !self.queue().is_empty(context)
+    #[cfg(test)]
+    pub fn take(&self, _context: &TaskContext) -> Option<Captured> {
+        let owner = unsafe { (*self.owner.get()).unwrap() };
+        let captured = super::super::work::take_capture(owner)?;
+        self.completed();
+        Some(captured)
     }
-    pub fn wait(&self, context: &TaskContext) {
-        let _ = self.queue().peek(context);
+    pub fn pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire) != 0
     }
     pub fn overflow(&self) -> u32 {
         self.overflow.load(Ordering::Relaxed)

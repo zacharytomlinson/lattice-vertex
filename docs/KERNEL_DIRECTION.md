@@ -11,15 +11,15 @@ implementation map and work order, not another protocol specification or run dia
 shared C6/Nordic kernel.** Local changes resume their own fragment; selected output
 changes propagate downstream without a backward trip to the head. LPD predicates,
 branches, arithmetic and authored calls are unchanged. Selected two-board validation
-passed. Local record dispatch remains; the initial firmware state/event interface is implemented and awaits appliance
-integration before LLVM native lowering. Hardware-offload research remains separate.
+passed. Local record dispatch remains; the firmware state/event interface now supports immediate mutations and
+bounded deferred work, awaiting physical qualification before appliance integration or LLVM native lowering. Hardware-offload research remains separate.
 
 | Area | Current implementation | Boundary / next use |
 | --- | --- | --- |
 | RTOS and CPU ports | FreeRTOS-derived tasks, interrupts, timers and synchronization on C6/Nordic | Reuse while useful; replaceable substrate beneath the Lattice firmware contract |
 | Appliance surface | Compile-time names exposed on demand, concrete State values, automatic field/event registration, ordinary native methods and optional IR metadata | Exercise the first interface in real appliance firmware; names do not change durable bindings or compatibility fingerprints |
-| State changes | Typed captured-value FIFO, automatic cell transitions and hardware capture handlers; blocking state task | No getter polling or call-boundary sampling; actual appliance/IRQ integration still needs validation |
-| Program installation | Protected persistence, validation, local computation sharing, paired connections, removal and reconstruction | Reuse ownership; LPD v1/LPG v4 retained; no new logic grammar |
+| State changes | Authoritative RAM/register fields; atomic mutation followed by nonblocking capture | Both ports provide GPIO output/edge bindings and immediate validated command dispatch; selected GPIO/radio checks passed, hard timing bounds remain unproved |
+| Program installation | Protected persistence, validation, local computation sharing, paired connections, removal and reconstruction | Reuse ownership; LPD v1 retained; LPG v5 adds typed settings; no new logic grammar |
 | Program execution | Retained per-connection inputs/output, direct local reevaluation, sequenced HIGH/LOW updates and native-call argument tracking | Both chip directions checked; replace local record dispatch with LLVM-generated native code |
 | Time/solar | Commissioned UTC/location/civil rules, calculated boundaries, deadline events and peer reacquisition | Reuse local sources; deadline events resume the affected local connection |
 | Peer/radio | Formation, discovery, adjacency, addressed forwarding, MAC ACK/retry and protected receive queues | Reuse; addressed signals reuse delivery; active heartbeat remains deferred |
@@ -27,8 +27,9 @@ integration before LLVM native lowering. Hardware-offload research remains separ
 | Observation delivery | Best-effort exposed-value broadcasts plus reliable addressed connection updates | Retained input acceptance is independent of the bounded notice cache |
 | Receive policies | Shared Channel<Definition, Policies, Storage>; control/state-notice freshness and indexed program/firmware reception | Retained connection inputs use Unique + Temporal; relay-notice storage remains bounded |
 | Manual continuous control | Pinned paths, compact argument messages, latest-target preparation and feedback | Reuse where applicable; its coalescing policy is not automatically circuit policy |
-| Native execution | Finite RTOS call tasks, admission/completion, update holds and duplicate handling | Running calls finish; hardware tasks should implement suitable physical actions |
-| Storage and updates | One flash owner, protected configuration, signed whole-image OTA, boot confirmation/recovery | Preserve configuration and recovery while changing the execution representation |
+| Native execution | Bounded immediate typed calls, kernel setters/toggles and deferred responses; native workers removed | Validate physical IRQ/command latency on both ports |
+| Deferred work and timers | One dispatcher replaces the state task; priority/FIFO work, one-shot/rearming timers and queued-callback cancellation | Register commits are atomic; callbacks are interruptible. Timings still require qualification |
+| Storage and updates | One flash owner; protected programs/time/settings; coalesced nonvolatile commitment and startup restore; signed OTA | Settings share existing capacity; flash stalls and physical recovery require hardware qualification |
 | Host and retained state | Optional USB attachment; firmware-bound history helper | USB is not an ordinary appliance requirement; automation-authored history stays deferred |
 | Hardware circuit backend | Not implemented on either chipset | Separate investigation of complete signal paths, including RF; isolated predicate offload is not end-to-end proof |
 
@@ -57,11 +58,12 @@ ownership, not a commitment to retain the old representation.
 flowchart TB
     firmware["Appliance firmware: state, operations and device controllers"]
     appliance["surface / Appliance: name, declared fields, methods and optional IR"]
-    state_events["kernel/state + appliance/changes: state data, private registration and FIFO"]
+    state_events["kernel/state + appliance/changes: state data, registration and captured work"]
     changes["kernel/change: registered observations"]
+    work["kernel/work: bounded dispatch and timed invocations"]
     program["program: current LPD/LPG loader, sharing and paired connections"]
     circuit["program/execution + evaluation: retained inputs and local evaluation"]
-    native["appliance/execution: finite native calls"]
+    native["surface / appliance: immediate typed mutations"]
     peer["kernel/peer + radio: discovery, delivery, MAC and fixed buffers"]
     control["peer/control + forwarding: manual bound streams"]
     time["kernel/time: commissioned context and local deadlines"]
@@ -78,7 +80,8 @@ flowchart TB
 
     firmware --> appliance
     appliance --> state_events
-    state_events --> changes
+    state_events --> work
+    work --> changes
     changes -->|observation broadcasts| peer
     changes -->|affected local connections| circuit
     peer --> program
@@ -102,8 +105,11 @@ flowchart TB
     update -.->|select retained stock| ports
     ports --> storage
     ports --> rtos
-    state_events --> rtos
-    native --> rtos
+    work --> rtos
+    ports -->|qualified IRQ actions| native
+    peer -->|validated commands| native
+    state_events -->|dirty settings| storage
+    storage -->|startup restoration| state_events
     peer --> rtos
 
     firmware -.-> compiler
@@ -134,35 +140,35 @@ with the existing surface/appliance owners; it does not add a second runtime.
 
 ## Next implementation milestone
 
-**Implement appliance firmware against the initial state/event interface, then prune.**
-The [firmware interface](../src/kernel/appliance/README.md) is implemented: State data, automatic field/event registration, native method declarations, local calls
-and device access for continuing controllers. Default polling, readiness-only event
-masks, observation mirrors and before/after native-call sampling are removed.
-Host checks and both maintained MCU firmware builds pass; this is not yet a physical
-IRQ/actuator validation or proof that the four appliance integrations are complete.
-The [consumer entry point](../README.md#start-an-appliance) covers local development
-and pinned Git consumption. Surface/argument boundary checks live beside
-their implementation; retired getter/callback integration tests are removed.
+**Complete the kernel contract before changing appliance firmware.**
 
-Use the [integration exercise](PROGRAM_DESIGN.md#appliance-integration-exercise)
-for relay, dimmer, fan and diffuser firmware, plus the TV command-model review.
-Classify real blockers before extending the kernel, then prune redundant machinery.
-Keep broadcast state events separate from directed circuit continuations. Mathematical
-surface metadata serves synthesis/authoring; the kernel uses operational bindings.
-After those integrations, define the native artifact/ABI for LLVM lowering on C6 and
-nRF52840. The retained
-software engine has host checks, release builds and selected two-board evidence:
-local resume without head admission, HIGH/LOW propagation, argument changes,
-stale/duplicate acceptance, removal and reboot reconstruction. The physical runs
-used software-backed appliance values. They do not establish a hardware circuit
-backend or general RF/latency guarantees. Detailed evidence belongs in the
-[program component](../src/kernel/program/README.md#maintained-checks).
+The kernel implementation now includes authoritative RAM/MMIO state, immediate
+bounded native operations, port-owned input edges, IRQ command dispatch, prioritized
+deferred work/timers, and automatic nonvolatile settings through the existing store.
+Host properties and both MCU release builds are checked; consumer firmware is untouched.
+The [component guide](../src/kernel/appliance/README.md) owns the API and limitations.
+
+**Next: appliance integration.**
+Selected GPIO loopback, reciprocal native commands, deferred publication, compact
+control and settings restoration after application replacement and full power loss
+passed on both ports. Restoration replayed no native calls and preserved saved
+program records. A complete OTA cycle was not repeated. The IRQ path preserves older
+buffered-message order; callbacks must remain bounded. Do not claim a hard latency
+bound or physical relay behavior from host tests or build success. Flash stalls remain
+a hardware constraint, even though background storage yields between bounded steps.
+
+After kernel readiness, integrate relay/dimmer and fan/diffuser using the
+[consumer exercise](PROGRAM_DESIGN.md#appliance-integration-exercise), then prune
+unused machinery. FreeRTOS remains a replaceable implementation substrate; no
+scheduler replacement is required by this work. LLVM/native lowering follows
+this boundary work. Broadcast appliance deltas and addressed circuit signals
+retain their distinct responsibilities.
 
 Execution reuses one 4 KiB arena for retained values and working extents, with
 explicit metadata bounds and declaration-based admission. Local compaction keeps
 released byte ranges reusable. [The component notes](../src/kernel/program/README.md#storage-and-capacity)
-own the exact limits and wire layout. LPD v1/LPG v4 and protected appliance/time
-configuration remain unchanged; execution tags 10–13 are retired in favor of
+own the exact limits and wire layout. LPD v1 remains unchanged; LPG v5 adds typed settings alongside protected program/time
+configuration; execution tags 10–13 are retired in favor of
 addressed signal tag 30. No deployed-automation compatibility runtime exists.
 
 LVT v8 carries IR availability; LSF v4 carries optional models and an appliance-name

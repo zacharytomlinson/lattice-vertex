@@ -107,6 +107,7 @@ pub type Operation<Appliance> = ir::Operation<'static, 'static, Read<Appliance>>
 /// The handle stores its IR attribute and kernel-maintained history linkage.
 /// It neither owns nor duplicates the appliance's observed value.
 pub struct StateHandle<Appliance: 'static> {
+    pub(crate) persistent: bool,
     definition: ir::Attribute<Read<Appliance>>,
     #[cfg(feature = "use-mutexes")]
     pub(crate) maintained:
@@ -155,6 +156,7 @@ impl<Appliance: 'static> StateHandle<Appliance> {
         access: crate::kernel::state::Access<Appliance>,
     ) -> Self {
         Self {
+            persistent: false,
             definition: ir::Attribute {
                 ty,
                 location: Read {
@@ -169,6 +171,33 @@ impl<Appliance: 'static> StateHandle<Appliance> {
         }
     }
 
+    /// Retain this setting across reboots using the kernel's protected store.
+    /// Writes remain immediate; flash commitment is deferred and may coalesce.
+    /// Requires `kernel::start_with_storage` or `start_with_updates`.
+    pub const fn nonvolatile(mut self) -> Self {
+        let access = match &self.definition.location.source {
+            Reader::Native(access) => access,
+            #[cfg(feature = "use-mutexes")]
+            Reader::Retained(_) => panic!("native setting required"),
+        };
+        assert!(
+            access.writable(),
+            "nonvolatile settings require writable state"
+        );
+        self.persistent = true;
+        self
+    }
+    #[cfg(feature = "use-mutexes")]
+    pub(crate) fn restore(
+        &self,
+        appliance: &Appliance,
+        value: Option<Value>,
+    ) -> Result<(), crate::kernel::StateChangeError> {
+        let Reader::Native(access) = &self.definition.location.source else {
+            unreachable!()
+        };
+        access.restore(appliance, value)
+    }
     /// Durable reference used by state reads, deltas and installed bindings.
     pub const fn reference(&self) -> u64 {
         self.definition.location.reference()
@@ -194,7 +223,7 @@ impl<Appliance: 'static> StateHandle<Appliance> {
         let Reader::Native(access) = &self.definition.location.source else {
             unreachable!()
         };
-        access.connect(appliance, events, index);
+        access.connect(appliance, events, index, self.persistent);
     }
 
     pub(crate) fn record_change(&self, appliance: &Appliance, value: Option<Value>) {
@@ -228,15 +257,15 @@ pub trait StateTransformer {
     type Error;
 
     /// Perform the finite hardware operation once, enforcing native limits.
-    /// The kernel supplies its task; getters can run concurrently. Protect only
-    /// actual shared peripheral access inside the adapter, not the whole call.
+    /// Runs at the immediate mutation boundary, including kernel-callable IRQs.
+    /// It must be bounded and nonblocking. Schedule subsequent work with the
+    /// kernel deferred-work and timer primitives; never wait inside this hook.
     /// Success does not manufacture observations or imply physical convergence.
     ///
     /// # Errors
     /// Returns the appliance's own invocation error.
     fn invoke(
-        context: &crate::sync::TaskContext,
-        appliance: &Self::Appliance,
+        appliance: &'static Self::Appliance,
         arguments: Self::Arguments,
     ) -> Result<(), Self::Error>;
 }
@@ -248,16 +277,14 @@ pub enum InvokeError<Error> {
     Busy,
     /// The supplied scalar values do not match the operation's signature.
     Arguments(ArgumentError),
+    /// A kernel-owned state operation rejected an unavailable/out-of-range value.
+    State(crate::kernel::StateChangeError),
     /// The appliance returned its own error.
     Appliance(Error),
 }
 
-type Invoke<Appliance, Error> = unsafe fn(
-    *const (),
-    &crate::sync::TaskContext,
-    &Appliance,
-    &[Value],
-) -> Result<(), InvokeError<Error>>;
+type Invoke<Appliance, Error> =
+    unsafe fn(*const (), &'static Appliance, &[Value]) -> Result<(), InvokeError<Error>>;
 
 /// A declared native callable with a signature, optional model and invocation adapter.
 /// Authored models remain borrowed. Sharing a model does not merge native callables.
@@ -290,7 +317,7 @@ impl<Appliance: 'static, Error> TransformerHandle<Appliance, Error> {
     /// supplies its signature; no marker type, forwarding trait or IR is required.
     pub const fn from_fn<Args: Arguments>(
         name: &str,
-        function: fn(&Appliance, &crate::sync::TaskContext, Args) -> Result<(), Error>,
+        function: fn(&'static Appliance, Args) -> Result<(), Error>,
     ) -> Self {
         Self {
             reference: binding_reference(2, name, 0),
@@ -298,6 +325,30 @@ impl<Appliance: 'static, Error> TransformerHandle<Appliance, Error> {
             model: None,
             function: function as *const (),
             invoke: invoke_function::<Appliance, Args, Error>,
+        }
+    }
+    /// Bind a one-argument operation directly to authoritative RAM or a peripheral
+    /// field. The kernel performs the typed write and change registration.
+    pub const fn setter<T: Scalar>(
+        name: &str,
+        field: fn(&Appliance) -> &crate::kernel::State<T>,
+    ) -> Self {
+        Self {
+            reference: binding_reference(2, name, 0),
+            arguments: T::TYPES,
+            model: None,
+            function: field as *const (),
+            invoke: set_state::<Appliance, T, Error>,
+        }
+    }
+    /// Bind a zero-argument operation to an authoritative Boolean output.
+    pub const fn toggle(name: &str, field: fn(&Appliance) -> &crate::kernel::State<bool>) -> Self {
+        Self {
+            reference: binding_reference(2, name, 0),
+            arguments: &[],
+            model: None,
+            function: field as *const (),
+            invoke: toggle_state::<Appliance, Error>,
         }
     }
     /// Attach an explicit authored mathematical model. Signature agreement is a
@@ -337,39 +388,60 @@ impl<Appliance: 'static, Error> TransformerHandle<Appliance, Error> {
     /// Rejects malformed arguments before dispatch or propagates the appliance error.
     pub fn invoke(
         &self,
-        context: &crate::sync::TaskContext,
-        appliance: &Appliance,
+        appliance: &'static Appliance,
         arguments: &[Value],
     ) -> Result<(), InvokeError<Error>> {
         // Constructors pair each function pointer with its exact typed adapter.
-        unsafe { (self.invoke)(self.function, context, appliance, arguments) }
+        unsafe { (self.invoke)(self.function, appliance, arguments) }
     }
 }
 
 unsafe fn invoke_transformer<T: StateTransformer>(
     _: *const (),
-    context: &crate::sync::TaskContext,
-    appliance: &T::Appliance,
+    appliance: &'static T::Appliance,
     arguments: &[Value],
 ) -> Result<(), InvokeError<T::Error>> {
     value::check(T::Arguments::TYPES, arguments).map_err(InvokeError::Arguments)?;
     let arguments = T::Arguments::decode(arguments).map_err(InvokeError::Arguments)?;
-    T::invoke(context, appliance, arguments).map_err(InvokeError::Appliance)
+    T::invoke(appliance, arguments).map_err(InvokeError::Appliance)
 }
 
-unsafe fn invoke_function<A, Args: Arguments, E>(
+unsafe fn invoke_function<A: 'static, Args: Arguments, E>(
     function: *const (),
-    context: &crate::sync::TaskContext,
-    appliance: &A,
+    appliance: &'static A,
     values: &[Value],
 ) -> Result<(), InvokeError<E>> {
     value::check(Args::TYPES, values).map_err(InvokeError::Arguments)?;
     let arguments = Args::decode(values).map_err(InvokeError::Arguments)?;
     // The private pointer only originates in from_fn::<Args> and is restored to
     // that same signature. Noncapturing methods/closures require no heap storage.
-    let function: fn(&A, &crate::sync::TaskContext, Args) -> Result<(), E> =
-        unsafe { core::mem::transmute(function) };
-    function(appliance, context, arguments).map_err(InvokeError::Appliance)
+    let function: fn(&'static A, Args) -> Result<(), E> = unsafe { core::mem::transmute(function) };
+    function(appliance, arguments).map_err(InvokeError::Appliance)
+}
+
+unsafe fn set_state<A: 'static, T: Scalar, E>(
+    field: *const (),
+    appliance: &'static A,
+    values: &[Value],
+) -> Result<(), InvokeError<E>> {
+    let value = T::decode(values).map_err(InvokeError::Arguments)?;
+    let field: fn(&A) -> &crate::kernel::State<T> = unsafe { core::mem::transmute(field) };
+    field(appliance)
+        .set(value)
+        .map(|_| ())
+        .map_err(InvokeError::State)
+}
+unsafe fn toggle_state<A: 'static, E>(
+    field: *const (),
+    appliance: &'static A,
+    values: &[Value],
+) -> Result<(), InvokeError<E>> {
+    <()>::decode(values).map_err(InvokeError::Arguments)?;
+    let field: fn(&A) -> &crate::kernel::State<bool> = unsafe { core::mem::transmute(field) };
+    field(appliance)
+        .toggle()
+        .map(|_| ())
+        .map_err(InvokeError::State)
 }
 
 const fn same_signature(left: &[Type], right: &[Type]) -> bool {
@@ -547,23 +619,18 @@ mod tests {
             type Appliance = Cell<usize>;
             type Arguments = Permissive;
             type Error = ();
-            fn invoke(
-                _: &crate::sync::TaskContext,
-                calls: &Cell<usize>,
-                _: Permissive,
-            ) -> Result<(), ()> {
+            fn invoke(calls: &'static Cell<usize>, _: Permissive) -> Result<(), ()> {
                 calls.set(calls.get() + 1);
                 Ok(())
             }
         }
         let declared = TransformerHandle::new::<Behavior>("behavior");
         let direct =
-            TransformerHandle::from_fn("method", |calls: &Cell<usize>, _, _: Permissive| {
+            TransformerHandle::from_fn("method", |calls: &'static Cell<usize>, _: Permissive| {
                 calls.set(calls.get() + 1);
                 Ok(())
             });
         // No blocking, scheduler operation or hardware access occurs in these hooks.
-        let context = unsafe { crate::sync::TaskContext::assume() };
         let valid = [true.into_value(), 128_u8.into_value()];
         for callable in [&declared, &direct] {
             for (arguments, admitted) in [
@@ -575,8 +642,8 @@ mod tests {
                 (&[valid[0], 127_i8.into_value()][..], false),
                 (&valid[..], true),
             ] {
-                let calls = Cell::new(0);
-                let result = callable.invoke(&context, &calls, arguments);
+                let calls = std::boxed::Box::leak(std::boxed::Box::new(Cell::new(0)));
+                let result = callable.invoke(calls, arguments);
                 assert_eq!(result.is_ok(), admitted);
                 assert_eq!(calls.get(), usize::from(admitted));
                 if !admitted {
@@ -627,8 +694,11 @@ mod tests {
         ];
         for (model, accepted) in &CASES {
             let result = std::panic::catch_unwind(|| {
-                TransformerHandle::from_fn("method", |_: &(), _, _: (bool, u8)| Ok::<_, ()>(()))
-                    .with_model(model)
+                TransformerHandle::from_fn(
+                    "method",
+                    |_: &'static (), _: (bool, u8)| Ok::<_, ()>(()),
+                )
+                .with_model(model)
             });
             assert_eq!(result.is_ok(), *accepted);
         }

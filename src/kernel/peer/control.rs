@@ -1,10 +1,9 @@
-//! Bounded native setpoint sessions. One latest pending target per session;
-//! running native calls remain owned by the existing RTOS call tasks.
+//! Bound setpoint sessions: accept newer targets once, mutate immediately, and
+//! retain addressed feedback for deferred delivery.
 use crate::kernel::radio::channel::{Channel, Latest, Received, Temporal, Unique, Update};
 use crate::{
     ir::{Type, Value},
-    kernel::appliance::{execution, Native},
-    sync::TaskContext,
+    kernel::appliance::Native,
 };
 #[cfg(feature = "host-link")]
 use lattice_peer_wire::control::{Argument, Feedback, Target};
@@ -19,14 +18,14 @@ const IDLE_MS: u32 = 30_000;
 #[derive(Clone, Copy)]
 struct Session {
     caller: u64,
+    previous: u64,
+    acquired: bool,
     nonce: u64,
     transformer: u64,
     attribute: u64,
     input: Type,
     touched: u32,
     target: Targets,
-    pending: Option<(u32, Value)>,
-    running: Option<(u32, execution::Ticket)>,
     completed: u32,
     result: InvokeStatus,
     state: StateReadResult,
@@ -44,7 +43,7 @@ impl Session {
             received: self.target.current().map_or(0, |t| t.0),
             completed: self.completed,
             result: self.result,
-            finished: self.finishing && self.pending.is_none() && self.running.is_none(),
+            finished: self.finishing,
             state: self.state,
         }
     }
@@ -235,7 +234,6 @@ impl Control {
         request: Request,
         epoch: u64,
         native: &'static dyn Native,
-        context: &TaskContext,
         now: u32,
         out: &'a mut [u8; DATA_BYTES],
     ) -> Reply<'a> {
@@ -309,17 +307,17 @@ impl Control {
                     slot.generation += 1;
                     slot.session = Some(Session {
                         caller,
+                        previous: 0,
+                        acquired: false,
                         nonce,
                         transformer,
                         attribute: state,
                         input,
                         touched: now,
                         target: Targets::new(Latest::new()),
-                        pending: None,
-                        running: None,
                         completed: 0,
                         result: InvokeStatus::Busy,
-                        state: native.read(context, state),
+                        state: native.read(state),
                         finishing: false,
                         released: false,
                         revision: 1,
@@ -375,14 +373,9 @@ impl Control {
                     }
                     s.target.receive(&update).expect("validated target");
                     s.changed();
-                    if s.running
-                        .is_some_and(|(_, ticket)| execution::replace_target(ticket, value))
-                    {
-                        s.running.as_mut().unwrap().0 = sequence;
-                        s.pending = None;
-                    } else {
-                        s.pending = s.target.current();
-                    }
+                    s.result = native.invoke(s.transformer, &[value]);
+                    s.completed = sequence;
+                    s.state = StateReadResult::Busy;
                 }
                 // Old retransmissions can report current progress but never restore old intent.
                 Status::Accepted
@@ -405,18 +398,7 @@ impl Control {
                 if nonce != s.nonce {
                     return Reply::status(Status::Conflict);
                 }
-                s.released = true;
-
-                s.waiting = None;
-                if !s.finishing {
-                    s.pending = None;
-                    if s.running.is_some_and(|(_, t)| execution::cancel_target(t)) {
-                        s.running = None;
-                    }
-                }
-                if s.running.is_none() && s.pending.is_none() {
-                    slot.session = None;
-                }
+                slot.session = None;
                 return Reply::status(Status::Ok);
             }
             Request::Feedback { .. } => unreachable!(),
@@ -430,7 +412,7 @@ impl Control {
         }
         .reply(status, out)
     }
-    pub fn poll(&mut self, native: &'static dyn Native, context: &TaskContext, now: u32) {
+    pub fn poll(&mut self, native: &'static dyn Native, now: u32) {
         #[cfg(feature = "host-link")]
         for l in &mut self.listeners {
             if let Some(old) = *l {
@@ -451,50 +433,11 @@ impl Control {
             let Some(s) = &mut slot.session else {
                 continue;
             };
-            if let Some((sequence, ticket)) = s.running {
-                if let Some(result) = execution::take_result(ticket) {
-                    s.running = None;
-                    s.completed = sequence;
-                    s.result = result;
-                    if s.finishing && s.pending.is_none() {
-                        s.touched = now;
-                    }
-                    s.changed();
-                }
-            }
-            if now.wrapping_sub(s.touched) >= IDLE_MS {
-                if !s.finishing {
-                    s.pending = None;
-                    s.released = true;
-                    if s.running.is_some_and(|(_, t)| execution::cancel_target(t)) {
-                        s.running = None;
-                    }
-                } else if s.progress().finished {
-                    s.released = true;
-                }
-            }
-            if s.released && s.running.is_none() && s.pending.is_none() {
+            if s.released || now.wrapping_sub(s.touched) >= IDLE_MS {
                 slot.session = None;
                 continue;
             }
-            if s.running.is_none() {
-                if let Some((sequence, value)) = s.pending {
-                    match execution::submit_target(native, context, s.transformer, value) {
-                        Ok(ticket) => {
-                            s.pending = None;
-                            s.running = Some((sequence, ticket));
-                        }
-                        Err(InvokeStatus::Busy) => {}
-                        Err(e) => {
-                            s.pending = None;
-                            s.completed = sequence;
-                            s.result = e;
-                            s.changed();
-                        }
-                    }
-                }
-            }
-            let state = native.read(context, s.attribute);
+            let state = native.read(s.attribute);
             if !matches!(state, StateReadResult::Busy) && s.state != state {
                 s.state = state;
                 s.changed();
@@ -514,7 +457,7 @@ impl Control {
         self.slots
             .iter()
             .filter_map(|s| s.session)
-            .any(|s| s.running.is_some() || s.pending.is_some())
+            .any(|s| s.revision != s.confirmed)
     }
     fn feedback_due(s: Session, now: u32) -> bool {
         !s.released
@@ -693,13 +636,87 @@ impl Control {
         {
             s.waiting = None;
             s.released = true;
-            if !s.finishing {
-                s.pending = None;
-                if s.running.is_some_and(|(_, t)| execution::cancel_target(t)) {
-                    s.running = None;
-                }
-            }
         }
+    }
+    /// The routing owner supplies the established last hop after Open. This is
+    /// the receiver's admission binding, not a second route search/table.
+    pub(super) fn bind_hop(&mut self, caller: u64, nonce: u64, previous: u64) {
+        if let Some(s) = self
+            .slots
+            .iter_mut()
+            .filter_map(|s| s.session.as_mut())
+            .find(|s| s.caller == caller && s.nonce == nonce && !s.released)
+        {
+            s.previous = previous;
+        }
+    }
+    pub(super) fn receive_immediate(
+        &mut self,
+        previous: u64,
+        packet: Stream,
+        epoch: u64,
+        native: &'static dyn Native,
+        now: u32,
+    ) -> bool {
+        let Stream::Target {
+            stream,
+            sequence,
+            argument,
+        } = packet
+        else {
+            return false;
+        };
+        let Some(i) = self.slots.iter().position(|slot| {
+            slot.session.is_some_and(|s| {
+                s.previous != 0
+                    && s.previous == previous
+                    && s.nonce == stream
+                    && !s.released
+                    && now.wrapping_sub(s.touched) < IDLE_MS
+            })
+        }) else {
+            return false;
+        };
+        let session = self.slots[i].session.unwrap();
+        if sequence == 0 || argument.value(session.input).is_none() {
+            return false;
+        }
+        if self
+            .receive_stream(session.caller, packet, epoch, native, now)
+            .is_some()
+        {
+            return false;
+        }
+        self.slots[i].session.as_mut().unwrap().acquired = true;
+        true
+    }
+    pub(super) fn active(&self) -> bool {
+        if self
+            .slots
+            .iter()
+            .any(|s| s.session.is_some_and(|s| !s.released))
+        {
+            return true;
+        }
+        #[cfg(feature = "host-link")]
+        if self.listeners.iter().any(Option::is_some) {
+            return true;
+        }
+        false
+    }
+    pub(super) fn acquired(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|s| s.session.is_some_and(|s| s.acquired))
+    }
+    pub(super) fn take_acquired(&mut self) -> Option<(u64, u64, u32)> {
+        let s = self
+            .slots
+            .iter_mut()
+            .filter_map(|s| s.session.as_mut())
+            .find(|s| s.acquired)?;
+        s.acquired = false;
+        Some((s.nonce, s.previous, s.touched))
     }
     pub fn receive_stream(
         &mut self,
@@ -707,7 +724,6 @@ impl Control {
         packet: Stream,
         epoch: u64,
         native: &'static dyn Native,
-        context: &TaskContext,
         now: u32,
     ) -> Option<Stream> {
         let id = packet.id();
@@ -741,7 +757,6 @@ impl Control {
                         },
                         epoch,
                         native,
-                        context,
                         now,
                         &mut out,
                     )
@@ -841,16 +856,13 @@ impl Control {
     }
 }
 
-#[cfg(any(feature = "port-nrf52840", feature = "port-esp32c6"))]
-pub(super) fn take() -> &'static mut Control {
-    use core::sync::atomic::{AtomicBool, Ordering};
-    static TAKEN: AtomicBool = AtomicBool::new(false);
-    static mut CONTROL: Control = Control::new();
-    assert!(
-        !TAKEN.swap(true, Ordering::AcqRel),
-        "control service already owned"
-    );
-    unsafe { &mut *core::ptr::addr_of_mut!(CONTROL) }
+static mut CONTROL: Control = Control::new();
+pub(super) fn access<R>(f: impl FnOnce(&mut Control) -> R) -> R {
+    crate::kernel::state::atomic(|| f(unsafe { &mut *core::ptr::addr_of_mut!(CONTROL) }))
+}
+#[cfg(test)]
+pub(super) fn reset() {
+    access(|control| *control = Control::new());
 }
 #[cfg(all(test, feature = "port-test"))]
 mod tests;

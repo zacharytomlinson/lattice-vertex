@@ -497,7 +497,7 @@ mod tests {
         type Arguments = ();
         type Error = ();
 
-        fn invoke(_: &crate::sync::TaskContext, _: &Switch, _: ()) -> Result<(), ()> {
+        fn invoke(_: &'static Switch, _: ()) -> Result<(), ()> {
             panic!("exposure must not invoke hardware")
         }
     }

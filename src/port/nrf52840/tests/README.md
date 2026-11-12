@@ -41,7 +41,7 @@ newest-minus-previous result before startup. All seven scalar states appear in
 the ordinary surface and state-read path. The history starts empty; two level
 changes make the difference available. Retained-state behavior has host/build
 checks; earlier hardware runs established the native control/read/delta path.
-This revision builds with kernel-owned acquisition/native-call tasks; their hardware
+The kernel uses immediate mutations and bounded deferred work; their hardware
 check remains outstanding. The fixture verifies native dispatch and registered state, not physical dimmer
 output, RF range, or delivery reliability. Detailed run evidence is in the lab.
 

@@ -154,6 +154,7 @@ pub(crate) fn evicted() -> u32 {
 
 #[cfg(test)]
 pub(crate) fn reset() {
+    super::work::reset();
     access(|out| *out = Outgoing::new());
     super::program::activation::reset();
 }
@@ -161,10 +162,7 @@ pub(crate) fn reset() {
 #[cfg(all(test, feature = "port-test"))]
 mod tests {
     use super::*;
-    use crate::{
-        kernel::peer::frame::{InvokeStatus, StateReadResult},
-        sync::TaskContext,
-    };
+    use crate::kernel::peer::frame::{InvokeStatus, StateReadResult};
     static INSTANCE: u8 = 0;
     struct Owner;
     impl Native for Owner {
@@ -174,10 +172,10 @@ mod tests {
         fn owns(&self, instance: *const (), attribute: u64) -> bool {
             instance == core::ptr::from_ref(&INSTANCE).cast() && attribute == 1
         }
-        fn read(&self, _: &TaskContext, _: u64) -> StateReadResult {
+        fn read(&self, _: u64) -> StateReadResult {
             unreachable!()
         }
-        fn invoke(&self, _: &TaskContext, _: u64, _: &[Value]) -> InvokeStatus {
+        fn invoke(&self, _: u64, _: &[Value]) -> InvokeStatus {
             unreachable!()
         }
     }

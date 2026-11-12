@@ -17,7 +17,7 @@ admission enables the circuit. Incoming activation starts LOW. Only enabled head
 originate initial evaluation; other entries need an incoming HIGH. Prior activation
 and carried values are never restored after reboot. Authored mutations keep their
 meaning: LOW closes a connection; it does not invent a resting mutation. Native
-calls execute in the existing finite RTOS tasks. Automation-authored history is
+calls execute as bounded immediate operations; subsequent device work is scheduled separately. Automation-authored history is
 still unsupported.
 
 ## Ownership and publication
@@ -75,8 +75,10 @@ not DAG successors, remote addresses, or caller-supplied pointers.
 Failed validation writes no flash and publishes no links. A flash failure can
 leave the commit outcome uncertain; the service stops further writes until
 restart establishes which copy committed. Incompatible definitions remain saved
-and readable, but are not attached to native states. Existing native reads/calls
-remain separate from program installation.
+and readable, but are not attached to native states. Their Compatibility/Binding
+status is separate from valid configuration storage: settings may still restore and
+commit without rewriting those definitions. Existing native reads/calls remain
+separate from program installation.
 
 ## Definition format: LPD v1
 
@@ -123,7 +125,7 @@ The [time component](../time/README.md) owns its clock/deadline semantics.
 
 The invoke record describes continuation on the returned native result. It does
 not infer physical completion or encode an acceptance-only continuation. A
-physical completion dependency belongs to an observed state. The existing native task returns its result before that evaluation follows either edge;
+physical completion dependency belongs to an observed state. The bounded native operation returns before that evaluation follows either edge;
 other evaluations, state-event processing and radio service can continue meanwhile.
 
 Lists start with their `u8` count. Operands are a tag followed by their data:
@@ -154,7 +156,7 @@ capacity separately. Firmware callbacks cannot substitute for missing record kin
 
 ## Persistent image
 
-The committed payload starts with `LPG`, version byte **4**. Every extent begins
+The committed payload starts with `LPG`, version byte **5**. Every extent begins
 with length `u16`, flags `u8`, kind `u8`. A free extent (kind 4) has only this
 four-byte header; occupied extents retain the existing 24-byte prefix: generation
 `u32`, installing caller `u64`, transfer nonce `u32`, admission revision `u32`.
@@ -169,6 +171,13 @@ initial-evaluation (bit 1) and staged-install (bit 3) flags are never serialized
 | 2 connection | Reference to a computation plus this connection set's source/head/link records |
 | 3 body | Original LPD template retained after its first connection was removed; never active itself |
 | 4 free | No occupied prefix or executable contents |
+| 5 setting | Durable state binding, type and optional last committed scalar; private or exposed |
+
+A setting record is 36 bytes. Its first four bytes use the extent header; bytes
+4–11 carry the durable binding, byte 12 indicates availability, bytes 13–23 are zero,
+and bytes 24 onward use the shared typed-scalar encoding (type only when unavailable).
+Unused bytes are zero. Settings are not fragments; normal definition traversal skips
+them. The existing committed-copy mechanism owns their durability.
 
 Matching compares the surface fingerprint, carried/scratch layout, and ordered
 operation payloads, including types, constants and native references. Connections,
@@ -181,7 +190,7 @@ The body reference always points directly to kind 0 or 3, never another connecti
 The evaluation view combines those links with the shared operands; it cannot select
 a different connection's destination. Virtual LPD offsets remain exactly as authored.
 
-LPG v1/v2/v3 inline definitions remain readable. The startup checkpoint upgrades
+LPG v1/v2/v3/v4 inline definitions remain readable. The startup checkpoint upgrades
 the header without relocating live definitions or changing generations. V1 starts
 disabled; later admission state is preserved. Removing one connection keeps the
 body while another still references it. Removing the last frees it. Adjacent free
@@ -259,7 +268,7 @@ activations and retained incoming contexts. Any previously selected downstream
 output is withdrawn through an addressed LOW update. Pending source cursors advance to surviving
 siblings before the old storage can be reused. Ready native calls are canceled;
 already-running native calls finish with their continuation detached. Their
-arguments already belong to the native task, so they retain no program-image borrow.
+the bounded operation has already returned before another graph command is handled.
 Other connection sets, native states/functions and commissioned time remain intact.
 
 The reply echoes offset/generation. Persisting means local removal took effect;
@@ -291,7 +300,7 @@ tablet nor a compiler participates in ongoing evaluation.
 
 An Entry is definition offset `u16`, generation `u32`, record offset `u16`.
 The source owner comes from the addressed envelope. Old execution tags 10–13
-(reserve/data/commit/release visit) are rejected. LPD v1 and persistent LPG v4 have
+(reserve/data/commit/release visit) are rejected. LPD v1 and persistent LPG v5 have
 not changed; there is no second logic language or legacy execution runtime.
 
 Admission remains revision-checked and durable. Enablement schedules the head
@@ -306,7 +315,7 @@ remote readiness.
 `execution.rs` owns input bindings, local evaluation work, selected outputs and
 native-call argument records. `evaluation.rs` retains the existing declared-width
 arithmetic and typed value access. `runtime.rs` connects this engine to the peer,
-source notifications, clock deadlines, storage and native task completions.
+source notifications, clock deadlines, storage and immediate native results.
 
 Incoming bindings are scoped by source owner/source Entry/target Entry. Each uses
 Unique + Temporal acceptance within its sender incarnation. Equal or older updates
@@ -325,9 +334,9 @@ This does not broadcast an incoming evaluation through unrelated connection pair
 Changed selected outputs propagate, including LOW. A branch change publishes its
 new selected HIGH and withdraws the former output. Sequence admission rejects a
 late update on the same connection. Native calls run on an activation edge or a
-changed argument tuple; unchanged active arguments reuse the pending/completed
-call result. Already-running calls finish. An older completion cannot overwrite a
-newer registered local output, and LOW does not itself invoke an inferred action.
+changed argument tuple; unchanged active arguments reuse the completed result.
+A bounded call finishes in the local step before its success/failure edge is followed.
+LOW does not itself invoke an inferred action or undo a completed mutation.
 Existing authored success/failure and true/false links remain authoritative.
 
 Qualified source notifications remain separate from the outward delta ring. The
@@ -345,7 +354,7 @@ records. Defaults are **4096 bytes, 5 work slots, 32 arguments, 8 components,
 available for incoming/local continuation progress. Metadata is additional fixed
 storage; 4096 is the shared value arena, not total executor RAM. The current
 release builds allocate 6,736 bytes for the complete executor on either MCU,
-excluding resident definitions, the source queue and native-task storage.
+excluding resident definitions, the source queue and deferred-work storage.
 
 Retained inputs, output payloads, native argument records and temporary carried/
 scratch data share that one arena. Extents use declared lengths, not 512 bytes per
@@ -370,7 +379,7 @@ The sender retains each immutable update until the owner accepts it. Requests us
 the existing two-second reply deadline and 100–1600 ms capped backoff. Busy leaves
 ownership with the sender. A lost reply produces an idempotent retry, not another
 native call. One outgoing radio exchange runs at a time; other local evaluations
-and native tasks may overlap. Same-owner continuations use this acceptance path
+and deferred device work may overlap. Same-owner continuations use this acceptance path
 without RF or a session handshake.
 
 Retained activation alone does not schedule wakeups. Runnable local work, partial
@@ -392,7 +401,7 @@ reconstruction, shared-computation ownership, removal, generation reuse and flas
 interruption. Execution checks cover initial LOW, head-only startup, local resume
 without upstream traffic, independent connection pairs, branch withdrawal, carried
 argument changes, stale/duplicate updates, indexed reception, lost requests/replies,
-native-call completion after LOW, local removal and arena alias preservation.
+completed-call ownership across LOW, local removal and arena alias preservation.
 
 The retained-input engine has host/property validation and release library builds
 for both MCU targets. A C6/nRF52840 bench run installed the same two-owner condition

@@ -184,9 +184,9 @@ pub(crate) fn monotonic_ms() -> u64 {
 }
 fn extended_ticks() -> u64 {
     let mut time = crate::kernel::tasks::TimeOut_t::new();
-    unsafe {
-        crate::kernel::tasks::vTaskSetTimeOutState(&mut time);
-    }
+    super::state::atomic(|| unsafe {
+        crate::kernel::tasks::vTaskInternalSetTimeOutState(&mut time);
+    });
     if crate::types::TickType_t::BITS == 32 {
         ((time.xOverflowCount as u32 as u64) << 32) | (time.xTimeOnEntering as u64)
     } else {

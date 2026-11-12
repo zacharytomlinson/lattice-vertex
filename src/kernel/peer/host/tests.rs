@@ -25,10 +25,10 @@ impl Native for NativeResult {
     fn owns(&self, _: *const (), _: u64) -> bool {
         false
     }
-    fn read(&self, _: &TaskContext, _: u64) -> StateReadResult {
+    fn read(&self, _: u64) -> StateReadResult {
         self.state
     }
-    fn invoke(&self, _: &TaskContext, _: u64, _: &[Value]) -> InvokeStatus {
+    fn invoke(&self, _: u64, _: &[Value]) -> InvokeStatus {
         self.calls.fetch_add(1, Relaxed);
         self.status
     }
@@ -40,7 +40,8 @@ const NATIVE: NativeResult = NativeResult {
 };
 static DEFAULT_NATIVE: NativeResult = NATIVE;
 fn reset() -> TaskContext {
-    crate::kernel::appliance::execution::reset();
+    super::super::invocation::reset();
+    super::super::control::reset();
     crate::port::test_port_reset();
     access(|m| *m = Mailbox::new());
     unsafe { TaskContext::assume() }
@@ -50,8 +51,6 @@ fn poll<'a>(host: &'a mut Host, node: &mut Forwarder, now: u32) -> Option<Messag
         node,
         &Description::new(&crate::surface::EMPTY).unwrap(),
         &DEFAULT_NATIVE,
-        &mut Invocations::new(),
-        &mut crate::kernel::peer::control::Control::new(),
         &unsafe { TaskContext::assume() },
         now,
     )
@@ -265,7 +264,7 @@ fn request_termination() {
         let mut node = Forwarder::new(1, NET);
         let description = Description::new(&crate::surface::EMPTY).unwrap();
         let native: &'static NativeResult = std::boxed::Box::leak(std::boxed::Box::new(NATIVE));
-        let mut calls = Invocations::new();
+
         let request = Packet::Invoke {
             token: 42,
             owner: 1,
@@ -274,48 +273,31 @@ fn request_termination() {
         };
         submit(&context, request).unwrap();
         assert!(host
-            .poll(
-                &mut node,
-                &description,
-                native,
-                &mut calls,
-                &mut crate::kernel::peer::control::Control::new(),
-                &context,
-                0
-            )
+            .poll(&mut node, &description, native, &context, 0)
             .is_none());
-        assert_eq!(native.calls.load(Relaxed), 0);
+        assert_eq!(native.calls.load(Relaxed), 1);
         if disconnected {
             disconnect(&context);
         }
-        host.poll(
-            &mut node,
-            &description,
-            native,
-            &mut calls,
-            &mut crate::kernel::peer::control::Control::new(),
-            &context,
-            READ_TIMEOUT_MS,
-        );
+        host.poll(&mut node, &description, native, &context, READ_TIMEOUT_MS);
         assert_eq!(
             receive(&context),
             if disconnected {
                 None
             } else {
-                Some(Packet::Error {
+                Some(Packet::Invoked {
                     token: 42,
-                    failure: Failure::Timeout,
+                    owner: 1,
+                    transformer: 11,
+                    status: InvokeStatus::Invoked,
                 })
             }
         );
-        crate::kernel::appliance::execution::run_ready(&context);
-        assert!(calls.take_completion().is_some());
+
         host.poll(
             &mut node,
             &description,
             native,
-            &mut calls,
-            &mut crate::kernel::peer::control::Control::new(),
             &context,
             READ_TIMEOUT_MS + 1,
         );
@@ -327,8 +309,6 @@ fn request_termination() {
             &mut node,
             &description,
             native,
-            &mut calls,
-            &mut crate::kernel::peer::control::Control::new(),
             &context,
             READ_TIMEOUT_MS + 2,
         );
@@ -378,15 +358,7 @@ fn state_results() {
                 },
             )
             .unwrap();
-            let out = host.poll(
-                &mut node,
-                &description,
-                native,
-                &mut Invocations::new(),
-                &mut crate::kernel::peer::control::Control::new(),
-                &context,
-                0,
-            );
+            let out = host.poll(&mut node, &description, native, &context, 0);
             assert_eq!(out.is_some(), owner != 1);
             if let Some(out) = out {
                 let Content::ReadState { read, .. } = out.content else {
@@ -450,16 +422,8 @@ fn call_results() {
                 },
             )
             .unwrap();
-            let mut calls = Invocations::new();
-            let out = host.poll(
-                &mut node,
-                &description,
-                native,
-                &mut calls,
-                &mut crate::kernel::peer::control::Control::new(),
-                &context,
-                0,
-            );
+
+            let out = host.poll(&mut node, &description, native, &context, 0);
             assert_eq!(out.is_some(), owner != 1);
             if let Some(out) = out {
                 let Content::Invoke { call, .. } = out.content else {
@@ -482,21 +446,10 @@ fn call_results() {
                 );
             }
             if owner == 1 {
-                assert_eq!(native.calls.load(Relaxed), 0);
-                assert_eq!(receive(&context), None);
-                crate::kernel::appliance::execution::run_ready(&context);
-                assert!(calls.take_completion().is_some());
+                assert_eq!(native.calls.load(Relaxed), 1);
             }
             assert!(host
-                .poll(
-                    &mut node,
-                    &description,
-                    native,
-                    &mut calls,
-                    &mut crate::kernel::peer::control::Control::new(),
-                    &context,
-                    READ_TIMEOUT_MS
-                )
+                .poll(&mut node, &description, native, &context, READ_TIMEOUT_MS)
                 .is_none());
             assert_eq!(
                 receive(&context),

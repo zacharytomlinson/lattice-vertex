@@ -122,6 +122,44 @@ implemented appliance hooks remain open. An overridable default trait method alo
 does not enforce the wrapper. Ordinary static dispatch suffices; reflection,
 source rewriting and extensive macros are not requirements.
 
+Each exposed value has one authoritative location: a peripheral register or a
+kernel-owned typed RAM location. A software setting is real state, not a mirror
+that requires a continuing task. Register/field metadata and queued event payloads
+are distinct from that authoritative value.
+
+A qualified local IRQ or validated addressed command performs its bounded mutation
+in the handling context. It does not wait for a worker, transmission, persistence
+or a free bookkeeping slot. The kernel owns atomic read/set/clear/toggle behavior,
+change capture and subsequent publication. No task-context capability may be
+fabricated in an IRQ to bypass the existing interface. Only bounded, nonblocking
+operations belong on the immediate path. Hardware adapters supply actual access
+mechanisms; firmware supplies device limits and relationships.
+
+Deferred work consists of bounded invocations, not an entire update stream or a
+long-lived appliance controller. Select the most urgent ready invocation, preserve
+FIFO order within its priority, execute its bounded step, then reconsider priorities.
+A timer retains a deadline and schedules an invocation; cancellation invalidates
+both armed deadlines and queued invocations. A diffuser can retain an intensity
+setting, react to fan-on with its first cycle step, react to fan-off by immediately
+clearing output/canceling cycle work, and calculate each later interval from the
+current settings. No sleeping appliance thread is implied. Immediate interlocks
+must remain effective against stale deferred work.
+
+Retention is independent of execution urgency. A volatile value has only its live
+representation. A nonvolatile value changes immediately and automatically schedules
+background commitment through the kernel's exclusive protected-storage owner.
+Repeated writes may coalesce for persistence only; actual state-change events are
+not thereby coalesced. Restore the last committed settings before enabling their
+dependent behavior. Deferred durability can lose uncommitted updates on power loss;
+it does not require a firmware rebuild or a direct UICR write for each mutation.
+
+Queue/burst bounds are kernel obligations. An unexpected capture overflow is a
+kernel fault, not an instruction for firmware to retry a physical action that has
+already happened. Best-effort maintenance must not consume all capacity required
+by foreground events. Numerical response-time guarantees still require explicit
+execution/interference bounds and compatible flash operations; a low-priority
+label does not make an interrupt-masked erase preemptible.
+
 The hardware/state binding supplies the value location and relevant change facility.
 The kernel wires the event into its handling path. A qualified change is already a
 change; general getter polling and comparison are not the intended detection model.
@@ -666,8 +704,8 @@ and input-to-observed-state latency; radio airtime, contention, retries and fini
 execution still contribute. A hard latency bound requires those costs to be bounded.
 
 A live scalar stream represents the user's current intended target. Obsolete intermediate
-slider positions may be replaced at both sender and receiver while still pending; native
-preparation may be retargeted until the hardware function starts. This explicitly differs
+slider positions may be replaced while still pending, before the hardware function
+starts. An immediately dispatched target has no queued preparation to retarget. This explicitly differs
 from admitting a discrete program/native operation: accepting a stream sample records
 current intent and does not promise to invoke every intermediate value. A running native
 call is not preempted. Every actual acquired appliance change retains its normal delta

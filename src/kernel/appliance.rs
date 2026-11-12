@@ -1,7 +1,6 @@
 //! Appliance bindings, captured state changes and native dispatch.
 
 pub(crate) mod changes;
-pub(crate) mod execution;
 
 use super::{
     peer::frame::{InvokeStatus, StateReadResult},
@@ -43,11 +42,12 @@ pub enum InstallError {
 
 /// Static storage for an appliance's native state and mathematical surface.
 /// Initialize once before scheduler startup, then pass it to `kernel::start`.
-/// The kernel binds typed change inputs and invokes native functions in its tasks.
+/// The kernel binds typed changes and invokes bounded native operations immediately.
 /// Firmware owns device behavior; integration requires no report loop.
 pub struct Appliance<A: 'static, E: 'static> {
     name: Option<&'static str>,
     surface: &'static Surface<'static, A, E>,
+    settings: &'static [&'static crate::surface::StateHandle<A>],
     control: UnsafeCell<StaticQueue_t>,
     native: UnsafeCell<MaybeUninit<A>>,
     maintenance: UnsafeCell<MaybeUninit<Mutex<()>>>,
@@ -73,6 +73,7 @@ impl<A: Send + Sync, E> Appliance<A, E> {
         Self {
             name: None,
             surface,
+            settings: &[],
             control: UnsafeCell::new(StaticQueue_t::new()),
             native: UnsafeCell::new(MaybeUninit::uninit()),
             maintenance: UnsafeCell::new(MaybeUninit::uninit()),
@@ -83,6 +84,53 @@ impl<A: Send + Sync, E> Appliance<A, E> {
         }
     }
 
+    /// Declare private nonvolatile settings without exposing them over the network.
+    /// Exposed settings belong in the normal surface and need no second declaration.
+    pub const fn with_settings(
+        mut self,
+        settings: &'static [&'static crate::surface::StateHandle<A>],
+    ) -> Self {
+        assert!(
+            settings.len() <= crate::configLATTICE_NATIVE_STATES,
+            "setting capacity"
+        );
+        let mut i = 0;
+        while i < settings.len() {
+            assert!(
+                settings[i].persistent,
+                "private setting must be nonvolatile"
+            );
+            let mut j = 0;
+            while j < i {
+                assert!(
+                    settings[i].reference() != settings[j].reference(),
+                    "duplicate setting"
+                );
+                j += 1;
+            }
+            j = 0;
+            while j < self.surface.states.len() {
+                assert!(
+                    settings[i].reference() != self.surface.states[j].reference(),
+                    "setting already exposed"
+                );
+                j += 1;
+            }
+            i += 1;
+        }
+        self.settings = settings;
+        self
+    }
+    fn persistent_states(
+        &self,
+    ) -> impl Iterator<Item = &'static crate::surface::StateHandle<A>> + '_ {
+        self.surface
+            .states
+            .iter()
+            .chain(self.settings.iter())
+            .copied()
+            .filter(|s| s.persistent)
+    }
     /// Attach an appliance name in the ordinary static declaration.
     /// The name is separate from durable state/operation bindings and the
     /// encoded surface identity. No registration or special linker section is used.
@@ -133,14 +181,17 @@ impl<A: Send + Sync, E> Appliance<A, E> {
             (*self.maintenance.get()).write(maintenance);
         }
         self.ready.store(2, Ordering::Release);
-        self.events.initialize(context);
+        self.events.initialize(context, self);
         for (index, state) in self.surface.states.iter().enumerate() {
             state.bind(self.native(), &self.events, index as u16);
+        }
+        for setting in self.settings {
+            setting.bind(self.native(), &self.events, u16::MAX);
         }
         self.native()
     }
 
-    fn native(&self) -> &A {
+    fn native(&self) -> &'static A {
         assert!(
             self.ready.load(Ordering::Acquire) & 2 != 0,
             "initialize appliance before use"
@@ -154,29 +205,14 @@ impl<A: Send + Sync, E> Appliance<A, E> {
         self.native()
     }
 
-    /// Invoke a typed appliance operation locally through the same kernel-owned
-    /// update guard used for remote operations. Changes originate in the state/
+    /// Invoke a bounded, nonblocking operation at the same atomic mutation
+    /// boundary used for remote commands. Changes originate in the state/
     /// event primitives used by the operation, not from sampling around this call.
     pub fn call<R>(
-        &self,
-        context: &TaskContext,
-        operation: impl FnOnce(&A) -> Result<R, E>,
+        &'static self,
+        operation: impl FnOnce(&'static A) -> Result<R, E>,
     ) -> Result<R, InvokeError<E>> {
-        self.operation(context, |device| {
-            operation(device).map_err(InvokeError::Appliance)
-        })
-    }
-
-    fn operation<R>(
-        &self,
-        context: &TaskContext,
-        run: impl FnOnce(&A) -> Result<R, InvokeError<E>>,
-    ) -> Result<R, InvokeError<E>> {
-        crate::sync::assert_task_context("appliance operation");
-        #[cfg(feature = "firmware-update")]
-        let _hold = super::update::hold_updates(context).map_err(|_| InvokeError::Busy)?;
-        let _ = context;
-        run(self.native())
+        super::state::atomic(|| operation(self.native()).map_err(InvokeError::Appliance))
     }
 
     fn maintenance(&self) -> &Mutex<()> {
@@ -197,29 +233,25 @@ impl<A: Send + Sync, E> Appliance<A, E> {
         access(self.native())
     }
 
-    fn process_changes(&self, context: &TaskContext) {
-        // One consumer handles captured values in FIFO order. The mutex only
-        // protects derived-state maintenance/read consistency, never hardware I/O.
-        while self.events.pending(context) {
-            let guard = self.maintenance().try_lock(context).or_else(|| {
-                (tasks::xTaskGetSchedulerState() == tasks::taskSCHEDULER_RUNNING)
-                    .then(|| self.maintenance().lock(context))
-                    .flatten()
-            });
-            let Some(guard) = guard else {
-                return;
-            };
-            let Some(change) = self.events.take(context) else {
-                break;
-            };
-            let state = self.surface.states[change.index as usize];
-            let batch = super::change::batch();
-            state.record_change(self.native(), change.value());
-            super::history::maintain(state, self.native(), change.value());
-            // Publication may immediately wake the higher-priority peer. Release
-            // maintenance first so that wake cannot strand a Busy evaluation.
-            drop(guard);
-            drop(batch);
+    fn process_capture(&self, context: &TaskContext, captured: changes::Captured) {
+        // Readers never block while owning this mutex. A deferred invocation must
+        // not become an unbounded wait behind a hardware reader.
+        let guard = self
+            .maintenance()
+            .try_lock(context)
+            .expect("state reader exceeded its atomic scope");
+        let state = self.surface.states[captured.index as usize];
+        let batch = super::change::batch();
+        state.record_change(self.native(), captured.value());
+        super::history::maintain(state, self.native(), captured.value());
+        self.events.completed();
+        drop(guard);
+        drop(batch);
+    }
+    #[cfg(test)]
+    pub(crate) fn process_changes(&self, context: &TaskContext) {
+        while let Some(captured) = super::work::take_capture(self) {
+            self.process_capture(context, captured);
         }
     }
     /// Number of source changes rejected by bounded local event storage.
@@ -372,11 +404,10 @@ impl<A: Send + Sync + 'static, E: 'static> crate::ir::Surface for Appliance<A, E
 pub(crate) trait Native: Sync {
     fn ready(&self) -> bool;
     fn seal(&self) {}
-    fn process_changes(&self, _context: &TaskContext) {}
-    fn wait_changes(&self, _context: &TaskContext) {}
+    fn process_capture(&self, _context: &TaskContext, _captured: changes::Captured) {}
     fn owns(&self, instance: *const (), attribute: u64) -> bool;
-    fn read(&self, context: &TaskContext, attribute: u64) -> StateReadResult;
-    fn invoke(&self, context: &TaskContext, transformer: u64, arguments: &[Value]) -> InvokeStatus;
+    fn read(&self, attribute: u64) -> StateReadResult;
+    fn invoke(&self, transformer: u64, arguments: &[Value]) -> InvokeStatus;
     fn state_binding(
         &self,
         _reference: u64,
@@ -386,10 +417,38 @@ pub(crate) trait Native: Sync {
     fn transformer_signature(&self, _reference: u64) -> Option<&[crate::ir::Type]> {
         None
     }
+    fn settings(&self, _visit: &mut dyn FnMut(u64, crate::ir::Type, Option<Value>)) {}
+    fn restore_setting(
+        &self,
+        _key: u64,
+        _ty: crate::ir::Type,
+        _value: Option<Value>,
+    ) -> Result<(), crate::kernel::StateChangeError> {
+        Ok(())
+    }
     fn clear_dependencies(&self) {}
 }
 
 impl<A: Send + Sync, E> Native for Appliance<A, E> {
+    fn settings(&self, visit: &mut dyn FnMut(u64, crate::ir::Type, Option<Value>)) {
+        for s in self.persistent_states() {
+            visit(s.reference(), s.definition().ty, s.read(self.native()));
+        }
+    }
+    fn restore_setting(
+        &self,
+        key: u64,
+        ty: crate::ir::Type,
+        value: Option<Value>,
+    ) -> Result<(), crate::kernel::StateChangeError> {
+        let Some(s) = self.persistent_states().find(|s| s.reference() == key) else {
+            return Ok(());
+        };
+        if s.definition().ty != ty {
+            return Err(crate::kernel::StateChangeError::OutOfRange);
+        }
+        s.restore(self.native(), value)
+    }
     fn state_binding(
         &self,
         reference: u64,
@@ -425,23 +484,17 @@ impl<A: Send + Sync, E> Native for Appliance<A, E> {
                 .state_definitions()
                 .any(|s| s.location.reference() == attribute)
     }
-    fn process_changes(&self, context: &TaskContext) {
-        Appliance::process_changes(self, context);
+    fn process_capture(&self, context: &TaskContext, captured: changes::Captured) {
+        Appliance::process_capture(self, context, captured);
     }
-    fn wait_changes(&self, context: &TaskContext) {
-        self.events.wait(context);
-    }
-    fn read(&self, context: &TaskContext, attribute: u64) -> StateReadResult {
+    fn read(&self, attribute: u64) -> StateReadResult {
         if !self.ready() {
             return StateReadResult::Busy;
         }
-        let Some(_guard) = self.maintenance().try_lock(context) else {
-            return StateReadResult::Busy;
-        };
         super::state::atomic(|| {
             // Never return a new primitive value with a pre-transition sequence.
             // The event consumer publishes every queued transition first.
-            if self.events.pending(context) {
+            if self.events.pending() {
                 return StateReadResult::Busy;
             }
             let value = if let Some(state) = self
@@ -467,7 +520,10 @@ impl<A: Send + Sync, E> Native for Appliance<A, E> {
         })
     }
 
-    fn invoke(&self, context: &TaskContext, transformer: u64, arguments: &[Value]) -> InvokeStatus {
+    fn invoke(&self, transformer: u64, arguments: &[Value]) -> InvokeStatus {
+        if !self.ready() {
+            return InvokeStatus::Busy;
+        }
         let Some(handle) = self
             .surface
             .transformers
@@ -476,13 +532,14 @@ impl<A: Send + Sync, E> Native for Appliance<A, E> {
         else {
             return InvokeStatus::UnknownTransformer;
         };
-        let result = match self.operation(context, |a| handle.invoke(context, a, arguments)) {
+        match super::state::atomic(|| handle.invoke(self.native(), arguments)) {
             Ok(()) => InvokeStatus::Invoked,
             Err(InvokeError::Busy) => InvokeStatus::Busy,
             Err(InvokeError::Arguments(_)) => InvokeStatus::Arguments,
-            Err(InvokeError::Appliance(_)) => InvokeStatus::ApplianceError,
-        };
-        result
+            Err(InvokeError::State(_)) | Err(InvokeError::Appliance(_)) => {
+                InvokeStatus::ApplianceError
+            }
+        }
     }
 }
 

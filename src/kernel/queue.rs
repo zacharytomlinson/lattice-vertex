@@ -1237,6 +1237,8 @@ pub unsafe fn xQueuePeek(
 /// # Safety
 ///
 /// The caller must be in an interrupt priority permitted to call FreeRTOS.
+/// Kernel code may also call from a masked task atomic region with scheduling
+/// stopped or suspended, deferring requested switches until that region ends.
 /// `xQueue` must remain live for the call. For nonzero item size, `pvBuffer`
 /// must be writable for one complete item. If non-null,
 /// `pxHigherPriorityTaskWoken` must be aligned and writable for a
@@ -2104,9 +2106,11 @@ pub unsafe fn xQueueSendFromISR(
 ///
 /// # Safety
 ///
-/// The caller must execute at an interrupt priority permitted to call
-/// FreeRTOS. `xQueue` must remain live for the call. For nonzero item size,
-/// `pvItemToQueue` must be non-null and readable for one complete item. If
+/// The caller must execute at an interrupt priority permitted to call FreeRTOS.
+/// Kernel code may instead use a masked task atomic region with scheduling stopped
+/// or suspended and defer requested switches until the region ends.
+/// `xQueue` must remain live. For nonzero item size, `pvItemToQueue` must be
+/// non-null and readable for one complete item. If
 /// non-null, `pxHigherPriorityTaskWoken` must be aligned and writable for a
 /// [`BaseType_t`], normally initialized to `pdFALSE`. `xCopyPosition` must be
 /// a supported queue position, and overwrite requires a one-slot queue.
@@ -2221,6 +2225,8 @@ pub unsafe fn xQueueGenericSendFromISR(
 ///
 /// The caller must execute at an interrupt priority permitted to call
 /// FreeRTOS. `xQueue` must be a live non-mutex semaphore with zero item size.
+/// Kernel code may instead use a masked task atomic region with scheduling stopped
+/// or suspended and defer requested switches until the region ends.
 /// If non-null, `pxHigherPriorityTaskWoken` must be aligned and writable for a
 /// [`BaseType_t`], normally initialized to `pdFALSE`.
 pub unsafe fn xQueueGiveFromISR(

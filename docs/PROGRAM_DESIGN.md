@@ -97,10 +97,10 @@ or resting actions from existing false-stop paths.
 
 ## Appliance integration exercise
 
-Exercise the initial primitive interface through complete firmware for the four
-representative appliances below before treating it as settled. It is implemented in
-[the appliance component](../src/kernel/appliance/README.md); these requirements
-still need validation through complete appliance implementations. Mathematical
+Implement and validate the revised kernel primitives first. The published interface
+in [the appliance component](../src/kernel/appliance/README.md) is the starting
+point, not a completed immediate-mutation contract. Only after kernel readiness
+should the four representative appliances below consume it. Mathematical
 surface descriptions serve FSPS/authoring; they do not make the kernel responsible
 for appliance calibration, scalar limits or control algorithms. Reuse the declared
 state/operation bindings when attaching that metadata, rather than adding a second
@@ -114,10 +114,10 @@ registry or imposing a mathematical interpreter on firmware operation.
 | Firmware-originated state transitions | Commands, controller phases and software-maintained models | Normal state/operation primitives automatically register changes; no separate Lattice publish call |
 | One operation affecting several states | Fan speed also changes power; dimmer behavior may couple power and brightness | Firmware defines the relationship; kernel must not impose a universal scalar-to-power rule |
 | Finite native operations and completion/failure | Relay writes, dimmer configuration, radio/TV commands | Appliance hook performs the operation inside a kernel-owned wrapper; request acceptance is not itself a state transition |
-| Ongoing controller tasks and rearmable deadlines | Diffuser duty cycling, ramping or appliance-specific timing | Firmware owns the algorithm; existing kernel execution primitives support waiting and resumption |
+| Bounded controller invocations and rearmable deadlines | Diffuser duty cycling, ramping or appliance-specific timing | Firmware owns the algorithm; kernel timers invoke finite steps without a sleeping controller task |
 | Appliance I/O independent of Lattice transport | Fan OOK radio, serial/bus hardware, TV protocol | Firmware/driver owns appliance communication; the kernel owns graph-network communication |
 | Shared-resource access and event handoff | ISR/task interactions and concurrent native calls/controller activity | Reuse kernel synchronization and bounded queues; state capture must not depend on later resampling |
-| Application settings and selected state persistence when needed | Calibration, retained fan/TV model and controller configuration | Firmware chooses what to retain and restore; reuse the existing storage owner and preserve OTA boundaries |
+| Volatile/nonvolatile state policy | Calibration, learned estimates and controller settings | Declare retention; the kernel commits and restores data through its existing flash owner, independently of mutation urgency |
 | Declared math metadata alongside operational bindings | FSPS needs bounds, effects and invariants | Appliance defines semantics; authoring/synthesis consumes them; kernel keeps transport/type/resource checks distinct from device policy |
 
 The four implementation cases are:
@@ -133,10 +133,9 @@ Use the TV command model as an additional interface review case for software sta
 asynchronous replies and imperfect observability. This is not a requirement to add
 new TV hardware or implement a TV driver as part of the first four integrations.
 
-Start with complete firmware-facing sketches for all four so that a convenient
-relay-only interface does not constrain the others. Then implement the shared
-primitives through real appliance firmware, beginning with relay/dimmer and proceeding
-through fan/diffuser. Keep device logic with its appliance owner; generic kernel tests
+Use all four requirements to judge the kernel interface. Implement the common
+primitives in the kernel and qualify both ports before touching consumer firmware.
+Then integrate relay/dimmer, followed by fan/diffuser. Keep device logic with its appliance owner; generic kernel tests
 must not depend on those repositories. Board-specific proof waits for actual bindings
 and hardware; a software stand-in does not establish physical integration.
 
@@ -301,7 +300,7 @@ not proof of a CPU-free Lattice node.
 | 1. Consolidate channel policies (implemented) | Define codec/storage bindings and implement shared Unique, Temporal and Complete admission in actual consumers. State updates reject duplicates/older arrivals; complete transfers collect every piece. | Existing radio/peer/program/update owners. No unused generic harness or duplicated payload storage. |
 | 2. Retain activation/value context (implemented) | Bind and budget the retained inputs needed to start evaluation at the affected local fragment. Preserve the existing operators, branches and mutations. | Existing program/image/validation and source/time owners. No backward activation requirement or new logic model. |
 | 3. Validate propagation on both ports (selected bench check passed) | Exercise local and upstream changes, both activation directions, argument changes, duplicate/late arrivals, reconstruction and pair isolation. | Compact component properties plus maintained hardware fixtures. Report latency and CPU work without claiming hardware realization. |
-| 4. Establish the firmware primitive boundary (initial API implemented) | Complete the appliance integration exercise above, address demonstrated blockers and prune redundant kernel machinery. | Existing surface/appliance and RTOS owners; real firmware implementations with automatic event integration. |
+| 4. Revise the kernel primitive boundary (in progress) | Implement authoritative state, immediate mutation, bounded work/timers and retention; validate both ports before consumer integration. | Existing state/surface/appliance, radio, storage and port owners. No firmware substitutes for missing kernel behavior. |
 | 5. Replace local interpretation | Lower IR through LLVM to native code for both targets, using the agreed typed input/output and native-call ABI. | Compiler and existing loader/port owners. Same evaluation meaning, correct target execution and no per-delta opcode dispatch. |
 
 Steps can share implementation work, but a packet-only demonstration does not

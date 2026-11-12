@@ -9,7 +9,7 @@ use super::{
 use crate::{
     ir::Value,
     kernel::{
-        appliance::{execution as calls, Native},
+        appliance::Native,
         peer::frame::{InvokeStatus, StateReadResult},
         radio::channel::{Channel, Coverage, Latest, Received, Temporal, Unique, Update},
     },
@@ -107,7 +107,6 @@ struct Action {
     sequence: u32,
     active: bool,
     arguments: Extent,
-    ticket: Option<calls::Ticket>,
     result: InvokeStatus,
 }
 #[derive(Clone, Copy)]
@@ -137,11 +136,6 @@ enum Phase {
     },
     Evaluate,
     Follow(Link),
-    Calling {
-        ticket: calls::Ticket,
-        success: Link,
-        failure: Link,
-    },
     Sending(Sending),
 }
 #[derive(Clone, Copy)]
@@ -430,7 +424,6 @@ impl Execution {
                     sequence: 0,
                     active: false,
                     arguments: argument_space,
-                    ticket: None,
                     result: InvokeStatus::Invoked,
                 });
             }
@@ -608,9 +601,6 @@ impl Execution {
     }
     fn fail(&mut self, index: usize, status: Status) {
         if let Some(work) = self.work[index] {
-            if let Phase::Calling { ticket, .. } = work.phase {
-                calls::detach(ticket);
-            }
             self.fault(work.entry, status);
             self.release(index);
         }
@@ -621,9 +611,6 @@ impl Execution {
             let Some(work) = self.work[i].filter(|w| matches(w.root)) else {
                 continue;
             };
-            if let Phase::Calling { ticket, .. } = work.phase {
-                calls::detach(ticket);
-            }
             if let Phase::Sending(mut s) = work.phase {
                 for p in &mut s.messages {
                     if p.is_some_and(|p| p.active) {
@@ -817,7 +804,6 @@ impl Execution {
         &mut self,
         index: usize,
         native: &'static dyn Native,
-        context: &TaskContext,
         transformer: u64,
         args: &[Value],
         success: Link,
@@ -834,19 +820,13 @@ impl Execution {
             self.work[index].as_mut().unwrap().actions |= 1 << at;
             a.sequence = a.sequence.max(w.sequence);
             self.actions[at] = Some(a);
-            self.work[index].as_mut().unwrap().phase = match a.ticket {
-                Some(ticket) => Phase::Calling {
-                    ticket,
-                    success,
-                    failure,
-                },
-                None => Phase::Follow(if a.result == InvokeStatus::Invoked {
+            self.work[index].as_mut().unwrap().phase =
+                Phase::Follow(if a.result == InvokeStatus::Invoked {
                     success
                 } else {
                     failure
-                }),
-            };
-            return Ok(a.ticket.is_none());
+                });
+            return Ok(true);
         }
         let length: usize = args
             .iter()
@@ -856,13 +836,7 @@ impl Execution {
             return Err(Status::Binding);
         }
         let saved = a.arguments;
-        let ticket = calls::submit_values(native, context, transformer, args).map_err(|e| {
-            if e == InvokeStatus::Busy {
-                Status::Busy
-            } else {
-                Status::Binding
-            }
-        })?;
+        let result = native.invoke(transformer, args);
         if w.sequence >= a.sequence {
             let mut cursor = saved.start as usize;
             for value in args {
@@ -874,18 +848,17 @@ impl Execution {
             a.active = true;
             a.sequence = w.sequence;
             a.arguments = saved;
-            a.ticket = Some(ticket);
-            a.result = InvokeStatus::Busy;
+            a.result = result;
             self.actions[at] = Some(a);
         }
         let w = self.work[index].as_mut().unwrap();
         w.actions |= 1 << at;
-        w.phase = Phase::Calling {
-            ticket,
-            success,
-            failure,
-        };
-        Ok(false)
+        w.phase = Phase::Follow(if result == InvokeStatus::Invoked {
+            success
+        } else {
+            failure
+        });
+        Ok(true)
     }
 
     fn step(
@@ -894,7 +867,7 @@ impl Execution {
         v: Evaluation,
         programs: &Configuration,
         native: &'static dyn Native,
-        context: &TaskContext,
+        _context: &TaskContext,
     ) -> Result<bool, Status> {
         if let Phase::Follow(link) = v.phase {
             return self.follow(index, link);
@@ -936,7 +909,7 @@ impl Execution {
                 output,
                 next,
             } => {
-                let value = match native.read(context, state) {
+                let value = match native.read(state) {
                     StateReadResult::Value { value: Some(v), .. } => v,
                     StateReadResult::Value { value: None, .. } => return Err(Status::Unavailable),
                     StateReadResult::Busy => return Err(Status::Busy),
@@ -1019,7 +992,6 @@ impl Execution {
                 return self.invoke(
                     index,
                     native,
-                    context,
                     transformer,
                     &args[..arguments.len()],
                     success,
@@ -1038,44 +1010,6 @@ impl Execution {
         context: &TaskContext,
     ) {
         for _ in 0..COUNT {
-            for i in 0..COUNT {
-                let Some(Evaluation {
-                    phase: Phase::Calling { ticket, .. },
-                    ..
-                }) = self.work[i]
-                else {
-                    continue;
-                };
-                let Some(result) = calls::take_result(ticket) else {
-                    continue;
-                };
-                for a in self
-                    .actions
-                    .iter_mut()
-                    .flatten()
-                    .filter(|a| a.ticket == Some(ticket))
-                {
-                    a.ticket = None;
-                    a.result = result;
-                }
-                for w in self.work.iter_mut().flatten() {
-                    if let Phase::Calling {
-                        ticket: waiting,
-                        success,
-                        failure,
-                    } = w.phase
-                    {
-                        if waiting == ticket {
-                            w.phase = Phase::Follow(if result == InvokeStatus::Invoked {
-                                success
-                            } else {
-                                failure
-                            });
-                            w.blocked = false;
-                        }
-                    }
-                }
-            }
             let ready = self
                 .work
                 .iter()
@@ -1772,7 +1706,6 @@ mod tests {
                 sequence: 0,
                 active: false,
                 arguments: Extent { start, length },
-                ticket: None,
                 result: InvokeStatus::Invoked,
             });
         }

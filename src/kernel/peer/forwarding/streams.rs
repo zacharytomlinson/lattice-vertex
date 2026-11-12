@@ -34,6 +34,20 @@ impl StreamPath {
 }
 const _: () = assert!(core::mem::size_of::<StreamPath>() * STREAMS <= 448);
 impl Forwarder {
+    pub(in crate::kernel::peer) fn bind_local_streams(&self, mut bind: impl FnMut(u64, u64, u64)) {
+        for p in &self.streams {
+            if p.id != 0 && p.read.owner == self.local && p.ticket.is_some() && !p.closing {
+                bind(p.read.reader, p.id, p.previous);
+            }
+        }
+    }
+    pub(in crate::kernel::peer) fn stream_acquired(&mut self, id: u64, previous: u64, now: u32) {
+        if let Some(p) = self.streams.iter_mut().find(|p| {
+            p.id == id && p.previous == previous && p.read.owner == self.local && !p.closing
+        }) {
+            p.touched = now;
+        }
+    }
     pub(super) fn expire_streams(&mut self, now: u32) {
         for p in &mut self.streams {
             if p.id != 0 && now.wrapping_sub(p.touched) >= IDLE_MS {

@@ -31,7 +31,7 @@
 pub(crate) mod appliance;
 #[cfg(feature = "use-mutexes")]
 pub use appliance::{Appliance, InstallError};
-pub use state::{State, StateChangeError, StateEvent};
+pub use state::{Edge, Interrupt, Pull, RegisterField, State, StateChangeError, StateEvent};
 #[cfg(feature = "use-mutexes")]
 pub(crate) mod change;
 pub mod event_groups;
@@ -56,6 +56,8 @@ pub mod stream_buffer;
 pub mod tasks;
 #[cfg(feature = "timers")]
 pub mod timers;
+#[cfg(feature = "use-mutexes")]
+pub mod work;
 
 /// Establish the kernel-owned radio task and start local execution.
 /// Hardware clocks/CPU-port initialization and the appliance binding must
@@ -83,7 +85,7 @@ pub fn start<A: Send + Sync + 'static, E: 'static>(
         .expect("surface exceeds description limits");
     program::runtime::initialize(appliance, description.identity());
     change::bind(appliance);
-    appliance::execution::start(&context, appliance);
+    work::start(&context);
     radio::start(&context, radio, description, appliance);
     crate::start_scheduler(context)
 }

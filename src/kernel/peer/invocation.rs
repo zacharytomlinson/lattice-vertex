@@ -1,18 +1,20 @@
 //! Owner-local admission and result replay. Running calls cannot be evicted.
 use super::frame::{Invocation, InvokeStatus, CALL_ARGUMENT_BYTES};
-use crate::{
-    kernel::appliance::{
-        execution::{self, Ticket},
-        Native,
-    },
-    sync::TaskContext,
-};
+use crate::{ir::Value, kernel::appliance::Native};
+use lattice_peer_wire::{scalar::decode_arguments, MAX_CALL_ARGUMENTS};
+fn invoke_bytes(native: &'static dyn Native, transformer: u64, arguments: &[u8]) -> InvokeStatus {
+    let mut values = [Value::boolean(false); MAX_CALL_ARGUMENTS];
+    match decode_arguments(arguments, &mut values) {
+        Some(values) => native.invoke(transformer, values),
+        None => InvokeStatus::Arguments,
+    }
+}
 
 const RECENT: usize = 8;
 #[derive(Clone, Copy)]
 enum ResultState {
     Empty,
-    Running(Ticket),
+    Running,
     Complete(InvokeStatus),
 }
 #[derive(Clone, Copy)]
@@ -22,6 +24,7 @@ struct InvocationRecord {
     length: u8,
     result: ResultState,
     previous: [u64; 2],
+    pending: bool,
 }
 impl InvocationRecord {
     const EMPTY: Self = Self {
@@ -35,6 +38,7 @@ impl InvocationRecord {
         length: 0,
         result: ResultState::Empty,
         previous: [0; 2],
+        pending: false,
     };
 }
 pub(super) struct Completion {
@@ -57,7 +61,6 @@ impl Invocations {
     pub(super) fn submit(
         &mut self,
         native: &'static dyn Native,
-        context: &TaskContext,
         call: Invocation,
         arguments: &[u8],
     ) -> Option<InvokeStatus> {
@@ -77,16 +80,12 @@ impl Invocations {
         if arguments.len() > CALL_ARGUMENT_BYTES {
             return Some(InvokeStatus::Arguments);
         }
-        let Some(index) = (0..RECENT)
-            .map(|n| (self.next + n) % RECENT)
-            .find(|&i| !matches!(self.records[i].result, ResultState::Running(_)))
-        else {
+        let Some(index) = (0..RECENT).map(|n| (self.next + n) % RECENT).find(|&i| {
+            !self.records[i].pending && !matches!(self.records[i].result, ResultState::Running)
+        }) else {
             return Some(InvokeStatus::Busy);
         };
-        let result = match execution::submit(native, context, call.transformer, arguments) {
-            Ok(ticket) => ResultState::Running(ticket),
-            Err(error) => ResultState::Complete(error),
-        };
+        let result = ResultState::Running;
         let mut record = InvocationRecord {
             call,
             length: arguments.len() as u8,
@@ -96,19 +95,16 @@ impl Invocations {
         record.arguments[..arguments.len()].copy_from_slice(arguments);
         self.records[index] = record;
         self.next = (index + 1) % RECENT;
-        match result {
-            ResultState::Complete(result) => Some(result),
-            _ => None,
-        }
+        let status = invoke_bytes(native, call.transformer, arguments);
+        self.records[index].result = ResultState::Complete(status);
+        Some(status)
     }
+
     pub(super) fn return_via(&mut self, call: Invocation, previous: u64) {
-        let Some(record) = self
-            .records
-            .iter_mut()
-            .find(|r| r.call == call && matches!(r.result, ResultState::Running(_)))
-        else {
+        let Some(record) = self.records.iter_mut().find(|r| r.call == call) else {
             return;
         };
+        record.pending = true;
         if !record.previous.contains(&previous) {
             if let Some(slot) = record.previous.iter_mut().find(|p| **p == 0) {
                 *slot = previous;
@@ -128,15 +124,20 @@ impl Invocations {
             }
         })
     }
+    pub(super) fn pending(&self) -> bool {
+        self.records.iter().any(|r| r.pending)
+    }
     pub(super) fn take_completion(&mut self) -> Option<Completion> {
         for record in &mut self.records {
-            if let ResultState::Running(ticket) = record.result {
-                if let Some(status) = execution::take_result(ticket) {
-                    record.result = ResultState::Complete(status);
+            if record.pending {
+                if let ResultState::Complete(status) = record.result {
+                    let previous = record.previous;
+                    record.previous = [0; 2];
+                    record.pending = false;
                     return Some(Completion {
                         call: record.call,
                         status,
-                        previous: record.previous,
+                        previous,
                     });
                 }
             }
@@ -144,5 +145,16 @@ impl Invocations {
         None
     }
 }
+// One owner shared by the radio ISR and peer task. No task holds a borrow across
+// an interrupt; native callbacks cannot access this private ledger.
+static mut INVOCATIONS: Invocations = Invocations::new();
+pub(super) fn access<R>(f: impl FnOnce(&mut Invocations) -> R) -> R {
+    crate::kernel::state::atomic(|| f(unsafe { &mut *core::ptr::addr_of_mut!(INVOCATIONS) }))
+}
+#[cfg(test)]
+pub(super) fn reset() {
+    access(|calls| *calls = Invocations::new());
+}
+
 #[cfg(all(test, feature = "port-test"))]
 mod tests;

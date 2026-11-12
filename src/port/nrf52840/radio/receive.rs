@@ -1,12 +1,13 @@
 //! Raw reception and immediate 2006 ACK turnaround. Hardware TIFS schedules
-//! ACK TX; no task scheduling, CCA, allocator, or appliance callback intervenes.
+//! ACK TX completes before the bounded immediate command hook in the same IRQ
+//! path; task scheduling, CCA and allocation do not participate in turnaround.
 //! See nRF52840 Product Specification, RADIO interframe spacing and 802.15.4:
 //! https://docs.nordicsemi.com/r/bundle/ps_nrf52840/page/radio.html
 use super::hal::pac::{radio::vals::State, RADIO};
-use crate::kernel::radio::{mac, Error, MAX_FRAME_SIZE};
+use crate::kernel::radio::{mac, Error, Reception, MAX_FRAME_SIZE};
 use core::{
     future::poll_fn,
-    sync::atomic::{compiler_fence, AtomicU8, Ordering},
+    sync::atomic::{compiler_fence, AtomicBool, AtomicU8, Ordering},
     task::Poll,
 };
 use embassy_sync::waitqueue::AtomicWaker;
@@ -17,11 +18,14 @@ const ACK_RAMP: u8 = 2;
 const ACK_TX: u8 = 3;
 const VALID: u8 = 4;
 const INVALID: u8 = 5;
+static HANDLED: AtomicBool = AtomicBool::new(false);
 static PHASE: AtomicU8 = AtomicU8::new(IDLE);
 static WAKER: AtomicWaker = AtomicWaker::new();
 // Written only while RADIO IRQ is masked and disabled. Read only by that IRQ.
 static mut PAN: u16 = 0;
 static mut LOCAL: u64 = 0;
+// Original RX DMA buffer remains owned by Receiver::receive until completion.
+static mut RECEIVED: (*const u8, usize) = (core::ptr::null(), 0);
 #[repr(C, align(4))]
 struct Ack([u8; 4]);
 static mut ACK: Ack = Ack([5, 2, 0, 0]);
@@ -37,7 +41,7 @@ impl Receiver {
         pan: u16,
         local: u64,
         out: &mut [u8; MAX_FRAME_SIZE],
-    ) -> Result<usize, Error> {
+    ) -> Result<Reception, Error> {
         let cancel = Cancel;
         let mut started = false;
         let result = poll_fn(|cx| {
@@ -45,6 +49,7 @@ impl Receiver {
             if !started {
                 cortex_m::interrupt::free(|_| unsafe {
                     stop();
+                    HANDLED.store(false, Ordering::Relaxed);
                     PAN = pan;
                     LOCAL = local;
                     RADIO.events_end().write_value(0);
@@ -76,6 +81,10 @@ impl Receiver {
         })
         .await;
         result?;
+        if HANDLED.swap(false, Ordering::AcqRel) {
+            drop(cancel);
+            return Ok(Reception::Handled);
+        }
         compiler_fence(Ordering::SeqCst);
         let size = self.0[0] as usize;
         if !(2..=127).contains(&size) {
@@ -84,7 +93,7 @@ impl Receiver {
         let length = size - 2;
         out[..length].copy_from_slice(&self.0[1..1 + length]);
         drop(cancel);
-        Ok(length)
+        Ok(Reception::Frame(length))
     }
 }
 
@@ -142,6 +151,7 @@ pub(super) unsafe fn interrupt() -> bool {
                 None
             };
             if let Some(sequence) = sequence {
+                RECEIVED = (data.add(1), size - 2);
                 ACK.0[3] = sequence;
                 RADIO
                     .packetptr()
@@ -157,6 +167,15 @@ pub(super) unsafe fn interrupt() -> bool {
                 }
             } else {
                 complete(valid);
+                if valid && (2..=127).contains(&size) {
+                    HANDLED.store(
+                        crate::kernel::radio::receive_immediate(core::slice::from_raw_parts(
+                            data.add(1),
+                            size - 2,
+                        )),
+                        Ordering::Release,
+                    );
+                }
             }
             true
         }
@@ -172,6 +191,12 @@ pub(super) unsafe fn interrupt() -> bool {
         ACK_TX if RADIO.events_phyend().read() != 0 => {
             RADIO.events_phyend().write_value(0);
             complete(true);
+            HANDLED.store(
+                crate::kernel::radio::receive_immediate(core::slice::from_raw_parts(
+                    RECEIVED.0, RECEIVED.1,
+                )),
+                Ordering::Release,
+            );
             true
         }
         IDLE => false,

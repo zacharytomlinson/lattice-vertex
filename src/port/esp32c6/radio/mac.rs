@@ -265,6 +265,10 @@ pub fn ieee802154_receive() -> i32 {
     0 // ESP-OK
 }
 
+pub fn queued_receive() -> bool {
+    STATE.with(|state| !state.rx_queue.is_empty())
+}
+
 pub fn ieee802154_poll() -> Option<RawReceived> {
     STATE.with(|state| state.rx_queue.pop_front())
 }
@@ -428,6 +432,15 @@ fn stop_rx_ack(state: &mut IeeeState) {
 }
 
 fn receive_done(state: &mut IeeeState) {
+    let item = RawReceived {
+        data: unsafe { RX_BUFFER.0 },
+        channel: freq_to_channel(freq()),
+    };
+    if state.rx_queue.is_empty() && crate::kernel::radio::receive_immediate(item.frame()) {
+        super::HANDLED.store(true, core::sync::atomic::Ordering::Release);
+        return;
+    }
+
     if state.rx_queue.is_full() {
         #[cfg(feature = "test-support")]
         crate::kernel::radio::testing::event(crate::kernel::radio::testing::Event::ReceiveEvicted);
@@ -445,10 +458,6 @@ fn receive_done(state: &mut IeeeState) {
             }
         }
     }
-    let item = RawReceived {
-        data: unsafe { RX_BUFFER.0 },
-        channel: freq_to_channel(freq()),
-    };
     let _ = state.rx_queue.push_back(item);
 }
 

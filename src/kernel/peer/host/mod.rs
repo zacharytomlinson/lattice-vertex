@@ -7,7 +7,6 @@ use super::{
     frame::{
         Content, Invocation, LinkRead, Message, ProgramRead, StateRead, SurfaceRead, UpdateRead,
     },
-    invocation::Invocations,
 };
 use crate::kernel::appliance::Native;
 use crate::kernel::radio::cost::TimePerByte;
@@ -327,14 +326,14 @@ impl Host {
         forwarder: &mut Forwarder,
         description: &Description,
         native: &'static dyn Native,
-        invocations: &mut Invocations,
-        control: &mut super::control::Control,
         context: &TaskContext,
         now: u32,
     ) -> Option<Message<'a>> {
         if let Some(p) = &self.pending {
             if let Operation::LocalCall(call) = p.operation {
-                if let Some(status) = invocations.result(call) {
+                if let Some(status) =
+                    super::invocation::access(|invocations| invocations.result(call))
+                {
                     let p = self.pending.take().unwrap();
                     deliver(
                         p.generation,
@@ -493,9 +492,9 @@ impl Host {
                 transformer,
             };
             if owner == local {
-                if let Some(status) =
-                    invocations.submit(native, context, call, arguments.as_slice())
-                {
+                if let Some(status) = super::invocation::access(|invocations| {
+                    invocations.submit(native, call, arguments.as_slice())
+                }) {
                     deliver(
                         generation,
                         Packet::Invoked {
@@ -543,7 +542,9 @@ impl Host {
             if let lattice_peer_wire::program::transfer::Request::Control(c) = operation {
                 use lattice_peer_wire::control::Request as C;
                 if let C::Open { epoch, nonce, .. } = c {
-                    if !control.watch(owner, nonce, epoch, generation, now) {
+                    if !super::control::access(|control| {
+                        control.watch(owner, nonce, epoch, generation, now)
+                    }) {
                         let mut bytes = [0; lattice_peer_wire::program::transfer::REPLY_BYTES];
                         let n = lattice_peer_wire::program::transfer::Reply::status(
                             lattice_peer_wire::program::transfer::Status::Busy,
@@ -561,24 +562,17 @@ impl Host {
                     }
                 }
                 if let C::Finish { ticket, .. } = c {
-                    control.sealing(owner, ticket, now);
+                    super::control::access(|control| control.sealing(owner, ticket, now));
                 }
                 if let C::Close { ticket, nonce } = c {
-                    control.unwatch(owner, nonce);
+                    super::control::access(|control| control.unwatch(owner, nonce));
                     forget_control(owner, ticket);
                 }
             }
             if owner == local {
                 let mut response = [0; lattice_peer_wire::program::transfer::REPLY_BYTES];
-                let n = super::receive_request(
-                    control,
-                    native,
-                    context,
-                    local,
-                    operation,
-                    now,
-                    &mut response,
-                );
+                let n =
+                    super::receive_request(native, context, local, operation, now, &mut response);
                 if let lattice_peer_wire::program::transfer::Request::Control(
                     lattice_peer_wire::control::Request::Open { nonce, .. },
                 ) = operation
@@ -587,7 +581,7 @@ impl Host {
                         lattice_peer_wire::program::transfer::Reply::decode(&response[..n])
                             .and_then(lattice_peer_wire::control::State::decode)
                     {
-                        control.opened(owner, nonce, state);
+                        super::control::access(|control| control.opened(owner, nonce, state));
                     }
                 }
                 deliver(
@@ -703,7 +697,7 @@ impl Host {
                     token,
                     owner,
                     attribute,
-                    result: native.read(context, attribute),
+                    result: native.read(attribute),
                 },
                 _ => Packet::Error {
                     token,

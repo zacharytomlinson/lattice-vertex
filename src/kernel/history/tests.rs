@@ -89,8 +89,7 @@ impl Fixture {
         self.owner.process_changes(&self.context);
     }
     fn read(&self, attr: &ir::Attribute<Read<Device>>) -> Option<Value> {
-        let StateReadResult::Value { value, .. } = self.owner.read(&self.context, reference(attr))
-        else {
+        let StateReadResult::Value { value, .. } = self.owner.read(reference(attr)) else {
             panic!("unreadable owned state")
         };
         value

@@ -403,6 +403,7 @@ pub(super) const CLOCK: u8 = 1;
 pub(super) const CONNECTION: u8 = 2;
 pub(super) const BODY: u8 = 3;
 pub(super) const FREE: u8 = 4;
+pub(super) const SETTING: u8 = 5;
 pub(super) const STAGING: u8 = 8;
 #[derive(Clone, Copy)]
 pub(super) struct Extent {
@@ -425,7 +426,7 @@ pub(super) fn extents(bytes: &[u8]) -> impl Iterator<Item = Result<Extent, Error
         let r = (|| {
             let h = bytes.get(at..at + 4).ok_or(Error::Encoding)?;
             let n = word(h, 0) as usize;
-            if n < 4 || at + n > bytes.len() || h[3] > FREE || h[2] & 0x34 != 0 {
+            if n < 4 || at + n > bytes.len() || h[3] > SETTING || h[2] & 0x34 != 0 {
                 return Err(Error::Encoding);
             }
             if h[3] == FREE {

@@ -15,6 +15,7 @@ static mut CHECKPOINT: bool = false;
 static mut FLASH_BLOCKED: bool = false;
 static mut MORE_LOCAL_WORK: bool = false;
 static mut TIME: crate::kernel::time::Time = crate::kernel::time::Time::new();
+static mut FLASH_NEXT: u32 = 0;
 static mut PROFILE_REVISION: u32 = 0;
 struct Synchronization {
     waiting: Option<(u16, u64, u32, u64)>,
@@ -162,7 +163,59 @@ pub(crate) fn pending() -> bool {
     }
 }
 pub(crate) fn reconstructed() -> bool {
-    unsafe { RESTORED && (&*core::ptr::addr_of!(CONFIGURATION)).state == Status::Ok }
+    unsafe { RESTORED && (&*core::ptr::addr_of!(CONFIGURATION)).configuration_ready() }
+}
+pub(crate) fn restore() {
+    unsafe {
+        if RESTORED {
+            return;
+        }
+        let Some(native) = NATIVE else {
+            return;
+        };
+        let mut has_settings = false;
+        native.settings(&mut |_, _, _| has_settings = true);
+        #[cfg(not(any(feature = "nrf52840-update", feature = "esp32c6-update")))]
+        assert!(
+            !has_settings,
+            "nonvolatile settings require protected storage"
+        );
+        #[cfg(any(feature = "nrf52840-update", feature = "esp32c6-update"))]
+        {
+            let programs = &mut *core::ptr::addr_of_mut!(CONFIGURATION);
+            let loaded =
+                crate::kernel::storage::with_storage(|storage| match storage.configuration() {
+                    Ok(mut region) => {
+                        programs.restore(&mut region, native, &*core::ptr::addr_of!(SURFACE))
+                    }
+                    Err(_) => Err(Status::Storage),
+                });
+            if has_settings {
+                // Restore by durable identity before enabling any hardware input.
+                // Unknown old keys may be retained for later compatible firmware.
+                assert!(
+                    loaded.is_some(),
+                    "nonvolatile settings require protected storage"
+                );
+                assert!(
+                    programs.configuration_ready(),
+                    "nonvolatile settings failed reconstruction"
+                );
+            }
+            if programs.configuration_ready() {
+                if has_settings {
+                    crate::kernel::storage::take_settings();
+                    programs
+                        .checkpoint_settings(native)
+                        .expect("nonvolatile setting capacity");
+                    CHECKPOINT = true;
+                } else {
+                    CHECKPOINT = programs.checkpoint(None).is_ok();
+                }
+            }
+        }
+        RESTORED = true;
+    }
 }
 #[inline(never)]
 pub(crate) fn poll() {
@@ -177,19 +230,33 @@ pub(crate) fn poll() {
         };
         let programs = &mut *core::ptr::addr_of_mut!(CONFIGURATION);
         programs.expire(milliseconds());
-        if FLASH_BLOCKED {
+        if FLASH_BLOCKED
+            || crate::kernel::peer::interactive()
+            || milliseconds().wrapping_sub(FLASH_NEXT) >= 1 << 31
+        {
             return;
         }
-        if !RESTORED {
-            crate::kernel::storage::with_storage(|storage| match storage.configuration() {
-                Ok(mut region) => {
-                    let _ = programs.restore(&mut region, native, &*core::ptr::addr_of!(SURFACE));
+        if crate::kernel::work::foreground_pending() {
+            FLASH_BLOCKED = true; // completion wakes this owner; do not spin above the work task
+            return;
+        }
+        #[cfg(feature = "host-link")]
+        if crate::kernel::peer::host::pending() {
+            return;
+        }
+        if !programs.pending_write()
+            && programs.pending.is_none()
+            && crate::kernel::storage::settings_wait_ms(milliseconds()) == Some(0)
+        {
+            let writable = crate::kernel::storage::with_storage(|storage| {
+                storage.configuration().is_ok_and(|r| r.is_writable())
+            })
+            .unwrap_or(false);
+            if writable && crate::kernel::storage::take_quiet_settings(milliseconds()) {
+                if let Err(error) = programs.checkpoint_settings(native) {
+                    crate::kernel::storage::settings_changed();
+                    programs.state = error;
                 }
-                Err(_) => programs.state = Status::Storage,
-            });
-            RESTORED = true;
-            if programs.state == Status::Ok {
-                CHECKPOINT = programs.checkpoint(None).is_ok();
             }
         }
         if !programs.pending_write() {
@@ -207,13 +274,15 @@ pub(crate) fn poll() {
                 // execution remains gated on that commit, not confirmation alone.
                 if region.is_writable() {
                     let _ = programs.poll(&mut region, native);
+                    FLASH_NEXT = milliseconds()
+                        .wrapping_add(crate::kernel::radio::receive::receive_turn_ticks(1000));
                 } else {
                     FLASH_BLOCKED = true;
                 }
             }
             Err(_) => programs.state = Status::Storage,
         });
-        if CHECKPOINT && programs.checkpoint_pending.is_none() && programs.state == Status::Ok {
+        if CHECKPOINT && programs.checkpoint_pending.is_none() && programs.configuration_ready() {
             (&mut *core::ptr::addr_of_mut!(EXECUTION)).epoch = programs.epoch();
             CHECKPOINT = false;
         }
@@ -376,8 +445,25 @@ pub(crate) fn wait_ms(now: u32) -> Option<u64> {
         if MORE_LOCAL_WORK || (!RESTORED && (&*core::ptr::addr_of!(NATIVE)).is_some()) {
             include(0);
         }
-        if let Some(ms) = programs.wait_ms(now, !FLASH_BLOCKED) {
-            include(ms.into());
+        if !FLASH_BLOCKED
+            && !crate::kernel::peer::interactive()
+            && programs.configuration_ready()
+            && programs.pending.is_none()
+            && !programs.pending_write()
+        {
+            if let Some(ms) = crate::kernel::storage::settings_wait_ms(now) {
+                include(ms.into());
+            }
+        }
+        if let Some(ms) =
+            programs.wait_ms(now, !FLASH_BLOCKED && !crate::kernel::peer::interactive())
+        {
+            let pacing = if now.wrapping_sub(FLASH_NEXT) < 1 << 31 {
+                0
+            } else {
+                FLASH_NEXT.wrapping_sub(now)
+            };
+            include(ms.max(pacing).into());
         }
         if let Some(ms) = execution.wait_ms(now, sync.waiting.is_none()) {
             include(ms.into());

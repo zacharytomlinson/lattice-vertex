@@ -132,17 +132,29 @@ impl Radio {
         .await
     }
 
+    pub(crate) fn queued_receive() -> bool {
+        mac::queued_receive()
+    }
     pub(crate) fn receiving_frame() -> bool {
         registers::is_current_rx_frame()
     }
 
-    pub async fn receive(&mut self, out: &mut [u8; MAX_FRAME_SIZE]) -> Result<usize, Error> {
+    pub async fn receive(
+        &mut self,
+        out: &mut [u8; MAX_FRAME_SIZE],
+    ) -> Result<crate::kernel::radio::Reception, Error> {
         mac::ieee802154_receive();
         let raw = poll_fn(|cx| {
             RX_WAKER.register(cx.waker());
-            mac::ieee802154_poll().map_or(Poll::Pending, Poll::Ready)
+            if HANDLED.swap(false, core::sync::atomic::Ordering::AcqRel) {
+                return Poll::Ready(None);
+            }
+            mac::ieee802154_poll().map_or(Poll::Pending, |raw| Poll::Ready(Some(raw)))
         })
         .await;
+        let Some(raw) = raw else {
+            return Ok(crate::kernel::radio::Reception::Handled);
+        };
         let length = raw.data[0] as usize;
         if !(5..=127).contains(&length) {
             return Err(Error::InvalidFrame);
@@ -153,7 +165,7 @@ impl Radio {
         ));
         let length = length - 2; // Hardware FCS is replaced by the receive trailer.
         out[..length].copy_from_slice(&raw.data[1..1 + length]);
-        Ok(length)
+        Ok(crate::kernel::radio::Reception::Frame(length))
     }
 
     pub(crate) fn waiting_for_ack() -> bool {
@@ -203,3 +215,5 @@ impl Radio {
         Ok(())
     }
 }
+
+static HANDLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

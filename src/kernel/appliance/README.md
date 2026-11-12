@@ -49,9 +49,27 @@ A selector identifies the same state object throughout that appliance's lifetime
 Normal firmware uses `set`, `unavailable`, `replace` or `update`. Actual software
 transitions are registered automatically; assigning the current value does nothing.
 `State<bool>::toggle` returns the new Boolean value and rejects unknown state.
-`update` is a short, nonblocking atomic computation; it cannot perform I/O or
-reenter the same state. `get` returns `Option<T>` because unavailable is distinct
-from false or zero. This is authoritative storage, not a polled observation mirror.
+`State<T>` can own RAM or a `RegisterField`; both use the same read/set/clear/update
+operations, with Boolean toggle. `State::mapped` reads the peripheral directly and
+keeps no value mirror. `port::nrf52840::output` and `port::esp32c6::output` consume an
+owned GPIO pin and produce `State<bool>` backed by its output latch/SET/CLR aliases.
+True is electrical HIGH. The port initializes the pin once; it stays owned until reset.
+Custom MMIO adapters can use the unsafe `RegisterField` constructors, whose access,
+alignment and ownership contracts must be met. Out-of-range field writes reject
+without truncating; a mapped field cannot represent unavailable state.
+
+Mutation is synchronous and nonblocking, including in a kernel-callable IRQ. Capture
+occurs after the value changes. An unexpected capture overflow is a kernel fault;
+it does not return a rejected mutation for firmware to retry. Reentry also faults
+instead of spinning while interrupts are masked. Both ports provide `on_edge(pin,
+pull, edge, action)`: it consumes the pin, configures rising/falling/either-edge
+qualification and reserves the IRQ handler. The kernel acknowledges the event and
+runs the bounded nonblocking action; it never samples a previous input level.
+`Interrupt::enable/disable` controls that source; `level()` reads its actual GPIO
+level when an either-edge action needs it, without retaining a software mirror.
+Inputs are armed after restoration.
+The Nordic implementation owns GPIOTE; the C6 implementation owns the GPIO dispatcher.
+Do not also install a HAL dispatcher for that peripheral.
 
 Types are Boolean and signed/unsigned 8/16/32/64-bit integers. Firmware can encode
 finite selections and scaled fractions using those types. Meaningful ranges,
@@ -92,7 +110,7 @@ A normal firmware method can be registered directly:
 
 ```rust,ignore
 impl Relay {
-    fn set_power(&self, context: &TaskContext, on: bool) -> Result<(), Error> {
+    fn set_power(&'static self, on: bool) -> Result<(), Error> {
         // Perform the appliance-specific I/O and state transition.
     }
 }
@@ -108,11 +126,22 @@ from a behavioral trait can still use `StateTransformer` and
 Kernel-owned argument checking and invocation behavior cannot be overridden by a
 firmware default method.
 
-For local guarded work, `appliance.call(&context, |device| device.set_power(&context, on))`
-uses the same update exclusion as remote calls. `InvokeError::Busy` means the hook
-has not run. `Appliance::device()` gives continuing controllers access without
-holding an operation guard for their entire lifetime. The supplied `TaskContext`
-lets native methods use ordinary task/timer/synchronization facilities.
+For a direct field operation, use `TransformerHandle::setter("set-power", |r| &r.power)`
+or `TransformerHandle::toggle("toggle", |r| &r.power)`. These bind the kernel's typed
+write/toggle; firmware does not implement an extra callback for a register write.
+Custom methods and `appliance.call(|device| device.set_power(on))` run at the same
+atomic mutation boundary, including IRQ context. They receive no `TaskContext` and
+must be bounded and nonblocking. Use `work::defer` or `work::Timer` for subsequent
+steps. `Appliance::device()` provides the stable owner for those callbacks.
+
+CRC-valid, owner-addressed RF calls are validated/deduplicated before immediate
+dispatch. Compact targets also require the established last-hop/session binding.
+Their result/feedback remains in the existing peer owners for later transmission.
+Older unhandled receive data forms an ordering barrier: the immediate path cannot
+overtake it. Setup, forwarding and rejected packets remain peer-task work. MAC ACK
+turnaround remains a port responsibility; Nordic dispatches after ACK PHYEND in
+the same IRQ path. There is no RF transmission from the
+appliance callback. Native worker tasks and their stacks have been removed.
 
 A state transition is registered when its primitive runs, including changes after
 a setter returns or before a later error. Success alone creates no state delta.
@@ -125,9 +154,10 @@ appliance RF protocol and a dimmer's calibrated output mapping remain firmware c
 2. Declare the state fields and native methods, then construct the static `Surface`
    and `Appliance`. A basic firmware imports no IR definitions.
 3. Call `initialize` once. It places the device in stable storage and connects all
-   declared state/event sources. Use the returned device to enable HAL callbacks.
-4. Create any device controller tasks/timers using existing `sync::TaskHandle`,
-   queues, semaphores, event groups and `Timer` (the latter uses feature `timers`).
+   declared state/event sources. Declare board input actions with `port::on_edge`;
+   the kernel enables them after protected settings have been restored.
+4. Declare bounded controller steps using `work::defer` and `work::Timer`. Optional
+   appliance tasks may use the RTOS, but native command hooks must not block.
 5. Enter `kernel::start` or its storage/update variant. Firmware supplies no Lattice
    service loop, message construction, network policy or graph evaluator.
 
@@ -148,8 +178,7 @@ Use the board's actual bootloader/flash layout when linking. The port-owned
 layouts and upload mechanisms. Those fixtures' diagnostics are not firmware dependencies.
 `TaskContext::assume` is the unsafe board-entry boundary: construct it only in the
 initialized thread context, before the scheduler, as those entries do.
-Native methods receive an existing context; an IRQ uses `StateEvent::handle` and
-must not manufacture a task context.
+Native methods and IRQ hooks do not receive or manufacture a task context.
 
 `kernel::start` uses volatile program storage. Firmware that must retain installed
 automations and commissioning over reboot selects `esp32c6-update` or
@@ -179,26 +208,87 @@ mathematics from an explicit empty effect.
 
 ## Delivery, storage and scope
 
-Each appliance has a FIFO of `configLATTICE_STATE_CHANGES` captured transitions
-(default 32), at most 12 bytes per entry: at most 384 payload bytes plus RTOS control.
-The state task blocks when empty. It registers captured values and performs only
-explicitly installed native [history](../history.rs) maintenance. No heap, per-state
-task, default polling interval or second current-value array is required.
+`kernel::work` owns one fixed pool with separate capacity bounds: 32 captured state
+changes (`configLATTICE_STATE_CHANGES`) and 16 deferred/timed callbacks. General
+callbacks cannot consume capture capacity. One priority-2 dispatcher replaces the
+old state task. It selects Foreground, Normal, then Background work and preserves
+FIFO within each priority, reconsidering after every invocation. No heap or per-
+appliance thread is created for a callback. Native operations are immediate, without
+worker tasks or waiting-call tickets.
 
-Full storage returns `StateChangeError::Capacity` and increments
-`Appliance::state_change_overflow()`. Queued changes remain intact; a rejected
-software write leaves its value unchanged. Hardware cannot undo an event it already
-produced, so its binding must retain/recover it or report the loss. Acceptance in
-this local FIFO is not proof of RF delivery. Broadcast deltas and addressed circuit
-continuations keep their distinct existing roles.
+`work::defer(priority, owner, callback)` accepts a static owner and a bounded,
+nonblocking function. `work::Timer<A>` takes such an owner and a callback returning
+`Some(delay_ms)` to rearm or `None` to stop. Start replaces the timer's deadline;
+cancel invalidates armed/queued work and suppresses automatic rearm by an old
+invocation. Already-running Rust code finishes; callbacks remain interruptible.
+Hardware interlocks must be checked/applied in an atomic state operation. No
+TaskContext is supplied to callbacks. The dispatcher blocks on notifications or
+its earliest deadline when idle.
+
+Captures preserve values and FIFO order. The owner remains read-Busy through
+capture processing, including the interval after removal from the work queue.
+Publication follows metadata/history completion. Nonblocking `StateEvent` capture
+still reports its overflow counter; ordinary state mutation faults on that condition
+rather than allowing a replay of an already-performed operation. Numeric worst-case
+response guarantees and actual appliance actuation remain unvalidated. Selected
+GPIO IRQ and radio-command paths have been exercised on both ports.
+
+### Nonvolatile settings
+
+`StateHandle::new("stable-name", field).nonvolatile()` selects automatic persistence;
+ordinary bindings remain volatile. Exposed settings stay in the normal surface.
+Declare private settings with `Appliance::with_settings(&[&STARTUP_DELAY, &CYCLE_LENGTH])`;
+they are not enumerated or broadcast. Both use the same authoritative `State<T>`.
+Read-only external observations cannot be marked nonvolatile.
+
+`start_with_storage`/`start_with_updates` restores settings by durable name and type
+before arming kernel input IRQs. Missing settings retain their initialized defaults;
+a setting binding that cannot be reconstructed prevents startup. Incompatible saved
+programs remain retained and inactive; they do not prevent native controls or valid
+settings from operating. Program compatibility status remains inspectable. Restoration writes
+the field directly, without invoking a command or emitting a fabricated delta.
+
+Live writes are immediate. Dirty settings join the existing protected configuration
+snapshot after one second without another setting change, with only the latest
+values copied. Continuous adjustments postpone starting that snapshot. Changes during
+a snapshot remain dirty for a later commit. One erase page or 256-byte write advances
+per flash step; foreground work and queued host commands take precedence, and steps
+leave a receive turn between them. An open continuous-control session defers
+configuration and OTA staging until it closes or expires. This does not make flash stalls preemptible.
+Power loss restores the last complete snapshot. Uncommitted setting changes may be
+lost. Storage/capacity failure is visible in configuration status; no silent fallback
+to claimed durability is provided. Firmware must use stable names for compatible
+settings and change a name when repurposing its type/meaning.
+
+Stored settings consume 36 bytes each in the existing arena; no per-setting flash
+page or second flash owner is allocated. Retired settings remain readable for a
+compatible firmware return and consume capacity until a future reclamation policy.
+These records are configuration, not a historical ledger.
 
 An explicit peer/native read returns Busy while captured changes await registration
-or derived-state maintenance owns the read boundary. Firmware reads its own State
+during derived-state maintenance. Firmware reads its own State
 normally. Register access and kernel sequence publication remain separate from
 physical feedback accuracy and application persistence policy.
 
 Host checks cover automatic registration, typing, captured FIFO values, ISR handoff,
 capacity, native-only invocation, metadata availability and scheduler exclusion.
 Both maintained MCU images are build targets. The four production appliance
-implementations and physical IRQ/actuator validation remain the next integration
-exercise; this API is not a claim that those have been completed.
+implementations and electrical qualification on those appliances remain the next
+integration exercise; this API is not a claim that those have been completed.
+
+## Hardware qualification scope
+
+Selected C6/nRF52840 bench checks exercised register-backed output, GPIO loopback,
+bounded rearming timers, reciprocal native commands and compact continuous control.
+Both IRQ dispatch and ordered task-context handling were observed without native
+worker tasks. Saved values survived application replacement/restart and a full
+unplug/reconnect with zero replayed calls. Original saved program records were
+preserved; incompatible definitions remained inactive.
+
+This run exposed and corrected two policy boundaries: incompatible saved programs
+must not block otherwise valid settings/native startup, and background persistence
+must wait for quiet settings and an inactive manual-control session. Earlier RF
+exchanges timed out; a later reciprocal native run and both continuous-control runs
+completed after those changes. This is selected-run evidence, not a lossless-radio
+claim or a bound on flash-time interrupt latency. Full OTA transfer/activation was
+not repeated. The adapter, measurements and raw captures remain in the external lab.

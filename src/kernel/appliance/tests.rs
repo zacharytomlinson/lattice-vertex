@@ -21,7 +21,7 @@ impl Device {
             reads: [const { AtomicU32::new(0) }; 2],
         }
     }
-    fn set(&self, _: &TaskContext, value: bool) -> Result<(), ()> {
+    fn set(&self, value: bool) -> Result<(), ()> {
         if value {
             return Ok(());
         }
@@ -47,8 +47,8 @@ impl StateTransformer for Set {
     type Arguments = (bool,);
     type Error = ();
 
-    fn invoke(context: &TaskContext, a: &Device, (v,): (bool,)) -> Result<(), ()> {
-        a.set(context, v)
+    fn invoke(a: &'static Device, (v,): (bool,)) -> Result<(), ()> {
+        a.set(v)
     }
 }
 static SET: TransformerHandle<Device, ()> = TransformerHandle::new::<Set>("set");
@@ -156,14 +156,14 @@ fn captured_transitions() {
     }
     // Drain only after the source has changed repeatedly. Values must be captured,
     // not reread at dispatch time or coalesced into a single readiness bit.
-    assert_eq!(owner.read(&context, A.reference()), StateReadResult::Busy);
+    assert_eq!(owner.read(A.reference()), StateReadResult::Busy);
     owner.process_changes(&context);
     let actual: std::vec::Vec<_> = core::iter::from_fn(super::super::change::take)
         .map(|c| c.value)
         .collect();
     assert_eq!(actual, expected);
     assert_eq!(owner.device().reads(), [0, 0]);
-    assert!(!owner.events.pending(&context));
+    assert!(!owner.events.pending());
     assert_eq!(owner.state_change_overflow(), 0);
     super::super::change::reset();
 }
@@ -211,26 +211,31 @@ fn hardware_event_values() {
 #[test]
 fn transition_capacity() {
     let (context, owner) = initialize();
+    for _ in 0..16 {
+        super::super::work::defer(super::super::work::Priority::Background, &(), |_| {});
+    }
     let input = &owner.device().edge;
     for i in 0..crate::configLATTICE_STATE_CHANGES {
         input.handle(|| Some(i % 2 != 0)).unwrap();
     }
-    assert_eq!(
-        owner.device().value.set(true),
-        Err(StateChangeError::Capacity)
-    );
-    assert_eq!(owner.device().value.get(), None);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        owner.device().value.set(true).unwrap();
+    }))
+    .is_err());
+    // Overflow is a kernel fault after the immediate mutation, never a rejected
+    // operation that firmware is asked to perform again.
+    assert_eq!(owner.device().value.get(), Some(true));
     assert_eq!(owner.state_change_overflow(), 1);
     for i in 0..crate::configLATTICE_STATE_CHANGES {
         let c = owner.events.take(&context).unwrap();
         assert_eq!((c.index, c.value()), (1, Some(Value::boolean(i % 2 != 0))));
     }
     assert!(owner.events.take(&context).is_none());
-    assert_eq!(owner.device().value.set(true), Ok(true));
+    assert_eq!(owner.device().value.set(false), Ok(true));
     owner.process_changes(&context);
     assert_eq!(
         super::super::change::take().unwrap().value,
-        Some(Value::boolean(true))
+        Some(Value::boolean(false))
     );
     super::super::change::reset();
 }
@@ -267,7 +272,7 @@ fn native_admission() {
                 InvokeStatus::ApplianceError,
             ),
         ] {
-            assert_eq!(owner.invoke(&context, handle, args), status);
+            assert_eq!(owner.invoke(handle, args), status);
         }
     }
     owner.process_changes(&context);
@@ -285,7 +290,7 @@ fn native_admission() {
         Some(Value::boolean(true))
     );
     assert_eq!(
-        owner.call(&context, |a| a.set(&context, false)),
+        owner.call(|a| a.set(false)),
         Err(InvokeError::Appliance(()))
     );
     owner.process_changes(&context);
@@ -294,7 +299,7 @@ fn native_admission() {
         Some(Value::boolean(false))
     );
     assert_eq!(
-        owner.read(&context, SET.reference()),
+        owner.read(SET.reference()),
         StateReadResult::UnknownAttribute
     );
     super::super::change::reset();
@@ -324,11 +329,66 @@ fn binding_resolution() {
         let saved = *reference.get_or_insert(handle.reference());
         assert_eq!(saved, handle.reference());
         assert!(
-            matches!(owner.read(&context,saved),StateReadResult::Value{value:Some(v),..} if v==Value::boolean(index==0))
+            matches!(owner.read(saved),StateReadResult::Value{value:Some(v),..} if v==Value::boolean(index==0))
         );
         assert_eq!(
-            owner.read(&context, ptr::from_ref(handle.definition()) as usize as u64),
+            owner.read(ptr::from_ref(handle.definition()) as usize as u64),
             StateReadResult::UnknownAttribute
         );
     }
+}
+
+#[test]
+fn private_setting_policy() {
+    static SETTING: StateHandle<Device> =
+        StateHandle::new("setting", |d: &Device| &d.value).nonvolatile();
+    static DECLARATION: Surface<Device, ()> = Surface {
+        states: &[],
+        transformers: &[],
+        model: None,
+    };
+    crate::port::test_port_reset();
+    super::super::change::reset();
+    let context = unsafe { TaskContext::assume() };
+    static SETTINGS: [&StateHandle<Device>; 1] = [&SETTING];
+    let owner = std::boxed::Box::leak(std::boxed::Box::new(
+        Appliance::new(&DECLARATION).with_settings(&SETTINGS),
+    ));
+    owner.initialize(&context, Device::new([Some(false), None]));
+    crate::kernel::storage::take_settings();
+    owner
+        .restore_setting(
+            SETTING.reference(),
+            crate::ir::Type::Bool,
+            Some(Value::boolean(true)),
+        )
+        .unwrap();
+    assert_eq!(owner.device().value.get(), Some(true));
+    assert!(!owner.events.pending());
+    assert!(!crate::kernel::storage::settings_pending());
+    owner.device().value.set(false).unwrap();
+    let now = ((crate::kernel::tasks::xTaskGetTickCountFromISR() as u64 * 1000)
+        / crate::configTICK_RATE_HZ as u64) as u32;
+    for (elapsed, due) in [(0, false), (999, false), (1000, true)] {
+        assert_eq!(
+            crate::kernel::storage::take_quiet_settings(now.wrapping_add(elapsed)),
+            due
+        );
+    }
+    assert!(!crate::kernel::storage::settings_pending());
+    assert!(!owner.events.pending());
+    let mut values = 0;
+    owner.settings(&mut |key, ty, value| {
+        assert_eq!(
+            (key, ty, value),
+            (
+                SETTING.reference(),
+                crate::ir::Type::Bool,
+                Some(Value::boolean(false))
+            )
+        );
+        values += 1;
+    });
+    assert_eq!(values, 1);
+    assert_eq!(owner.surface.states.len(), 0);
 }
